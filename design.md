@@ -1,0 +1,264 @@
+# Locks for Non-Coherent Shared Memory: Design and Evaluation Spec
+
+This document specifies a family of mutual-exclusion locks for multi-node systems whose shared memory is **not hardware-coherent across nodes**, and a phased plan for evaluating them. It is written as an implementation handoff: decisions are marked **Decided**, items still to be settled are marked **Open**, and anything deferred is listed under Future Work.
+
+---
+
+## 1. System model and assumptions
+
+- **Nodes.** A small number of nodes (target: up to ~16, e.g. hosts sharing a CXL memory device) share a memory region. Design for N ≤ 16 but keep N a parameter.
+- **Coherence.** Memory is cache-coherent *within* a node and **non-coherent across nodes**. Cross-node visibility requires explicit cache writeback (e.g. `clwb`/`clflushopt` + `sfence`) and invalidation before reads, or an uncached mapping.
+- **No cross-node atomics assumed.** Algorithms use only loads and stores across nodes. Node-local coordination may use ordinary atomics (coherent).
+- **Address spaces.** Two options; the memory-access layer should support either:
+  - **Same virtual address on all nodes (preferred where possible).** Every process on every node maps the shared region at one agreed address (e.g. `mmap` with `MAP_FIXED_NOREPLACE`, reserved early at startup before other mappings can collide). Pointers into the region are then valid everywhere and can be stored in shared structures directly. If the reservation fails on any node, fail loudly rather than silently falling back.
+  - **Per-node mapping address.** Anything stored in shared memory that refers to shared memory must be an offset into the region.
+  - Either way, **compact messages use small indices** (e.g. a grant-slot index), because a full 8-byte pointer cannot fit in a single 8-byte message alongside the other fields. Anything a server writes on behalf of a message is still bounds-checked.
+- **Platform.** Real CXL hardware is not required; an emulated setup (e.g. NUMA machine with explicit flushes / uncached remote memory, optionally with injected latency) is acceptable. Keep the memory-access layer abstract so the backend can change.
+
+## 2. Memory layout and access rules (Decided)
+
+Three kinds of shared state, plus node-local state:
+
+| Region | Mapping | Contents |
+|---|---|---|
+| Hot metadata | **Uncached** | Owner fields, base-algorithm variables (Peterson flags/turn, Lamport `x`/`y`/`b[]`), announcement flags, queue slots, grant slots |
+| Read-mostly metadata | Cached, staleness-detected | Lock-to-home map for (c) (refreshed on NACK via version number); static configuration (region layout, node count) |
+| Data | Cached | Data protected by the locks |
+| Node-local (not shared across nodes) | Ordinary coherent memory | Local submutexes, per-acquisition path info (e.g. hybrid fast/tournament), local queue tail counters, local handoff counts |
+
+Rules:
+
+1. **One aligned 8-byte store per message/state update.** Never rely on 64-byte line writes being atomic at the device. Anything a reader must see consistently (e.g. payload + sequence number) fits in one 8-byte word.
+2. **Cached multi-writer variables get their own cache line.** A writeback writes the whole line and can overwrite another node's data. (Applies to anything kept in a cached mapping.)
+3. **Uncached slots may be packed densely only if the device correctly handles partial (sub-line) writes.** **Open:** verify against the device/emulator; default to one slot per line until verified.
+4. **Explicit fences** wherever uncached and cached accesses are mixed, and between a store and a subsequent load that must observe ordering (Dekker-style patterns). Do not rely on memory-type ordering alone.
+5. **Protected data** is written back when the global lock leaves a node and invalidated when it arrives. Support two modes: full writeback/invalidate (conservative) and precise dirty-range hints supplied by the caller (used by the KV store). Write back eagerly, as soon as the lock is known to be leaving the node.
+6. **Read-mostly metadata** (e.g. the lock-to-home map in the lock-server variant) stays cached and is refreshed only when a reply indicates it is stale (NACK with version). Because different nodes may update different entries concurrently, **each entry gets its own cache line**, and the writer issues a writeback + fence after updating it.
+7. **Open:** check whether the device supports hardware coherence (CXL back-invalidation) for any region; if so, metadata could live there.
+
+## 3. Lock architecture
+
+### 3.1 Hierarchy (Decided)
+
+Each global lock has one **node-local submutex** per node. A thread acquires its node's submutex first, so at most one thread per node contends for the global lock and the global algorithm has exactly N participants (indexed by node ID).
+
+- Local submutex: MCS-style (or ticket) lock using coherent atomics. Must support **local-waiter detection** (is there a successor?) for cohort handoff.
+
+### 3.2 Local handoff (cohort passing) (Decided)
+
+On release, if the local submutex has a waiter and the consecutive-local-handoff count is below a cap, pass both the submutex and global ownership to the next local thread without touching global state.
+
+- **Cap** on consecutive local handoffs (parameter; sweep in evaluation) for cross-node fairness.
+- **Thread-oblivious requirement:** global ownership must belong to the node, not the thread. Any per-acquisition state needed at release (e.g. which path the hybrid used) is stored **with the lock in node-local memory**, never in thread-local storage.
+- Before a local handoff, issue a fence so the outgoing thread's uncached stores reach the device before the next thread proceeds.
+
+### 3.3 Cross-node handoff: gate + owner field (Decided)
+
+Applies to variants (a), (b), (d). The base algorithm is **not** held during the critical section. It is a short **gate** protecting a single **owner field** (uncached, 8 bytes): `FREE` or a node ID (optionally with an epoch in the remaining bits).
+
+```
+acquire(L):                      # caller holds node-local submutex
+    announce[L][me] = 1          # Open: announce inside gate (current) or before entering it (see 3.5)
+gate:                            # try to acquire through the gate
+    gate_enter(L)                # base algorithm (a), (b) or (d)
+    o = L.owner
+    if o == FREE or o == me:     # free, or a handoff already arrived
+        L.owner = me             # single 8-byte store
+        gate_exit(L)
+        goto acquired
+    gate_exit(L)
+wait:                            # poll the owner field directly
+    o = L.owner
+    if o == me:   goto acquired  # handoff received
+    if o == FREE: goto gate      # missed announcement: retry through the gate
+    backoff()
+    goto wait
+acquired:
+    announce[L][me] = 0
+    return
+
+release(L):                      # never enters the gate
+    w = pick_waiter(L)           # scan announce[L][*], round-robin from me
+    if w != NONE: L.owner = w    # handoff = one 8-byte store
+    else:         L.owner = FREE
+```
+
+Properties:
+
+- **Safety:** while held, only the owner writes `owner`; gate users read either "held" (wait) or `FREE` (take).
+- **Liveness:** a missed announcement only means the waiter sees `FREE` on a later poll and goes back through the gate. Count these recoveries.
+- Every node only ever writes its own base-algorithm variables (each node enters and exits the gate itself).
+- **No separate handoff flag (Decided).** Waiters poll `owner` directly. Split out per-waiter flags only if measurements show a hotspot on the owner line or a handoff needs a larger payload.
+- `pick_waiter` scans announcements round-robin starting after the releasing node, for fairness.
+
+### 3.4 Phase 1 mode (no handoff)
+
+For Phase 1 of the evaluation, the base algorithm **is** held across the critical section (no gate, no owner field): `acquire = base_lock()`, `release = base_unlock()`. Keep this as a build/runtime mode.
+
+### 3.5 Open items in the handoff design
+
+- **Announce before entering the gate** (instead of inside it) would shorten gate hold time and is safe given the "owner == me means handoff" rule. Evaluate both; current baseline announces inside.
+- Epoch bits in the owner word: useful for debugging and data-writeback versioning; bit allocation TBD.
+
+## 4. Global algorithms
+
+All operate on N node-indexed participants. Every shared variable lives in the uncached metadata region. Insert fences between a store and a later load whose order matters.
+
+### (a) Lamport's fast mutex
+
+Node IDs 1..N; `x`, `y` (0 = empty), `b[1..N]`.
+
+```
+start:
+    b[i] = true                  # store-store order with x = i (free on x86; fence on weaker ISAs)
+    x = i
+    fence                        # (1) x = i must complete before reading y
+    if y != 0:
+        b[i] = false
+        await y == 0
+        goto start
+    y = i
+    fence                        # (2) y = i must complete before reading x
+    if x != i:
+        b[i] = false
+        fence                    # b[i] = false before scanning b[] (slow path)
+        for j in 1..N: await b[j] == false
+        if y != i:
+            await y == 0
+            goto start
+    # critical section (or gate body)
+exit:
+    fence                        # critical-section effects (incl. data writeback) before release
+    y = 0
+    b[i] = false
+```
+
+Uncontended cost ≈ 2 serialized store-fence-load round trips, at fences (1) and (2). Slow path is O(N) and not starvation-free. With uncached mappings on x86 some fences may be redundant; keep them for portability, model checking, and cached-mapping emulation.
+
+### (b) Tournament of Peterson locks
+
+Binary tree over N nodes (depth ⌈log₂N⌉). At each tree node, a two-party Peterson lock with `flag[2]`, `turn`; a participant's side at each level is derived from its node ID.
+
+```
+peterson_lock(t, side):
+    t.flag[side] = true
+    t.turn = side            # "victim" convention
+    fence
+    while t.flag[1-side] and t.turn == side: backoff()
+peterson_unlock(t, side):
+    t.flag[side] = false
+```
+
+Acquire climbs leaf to root; release unlocks root to leaf (release writes can share one fence). Uncontended ≈ log₂N round trips; starvation-free.
+
+### (d) Hybrid (fourth variant, Decided)
+
+Lamport-style fast path; on contention, fall back to the tournament. Construction: the fast-path winner and the tournament winner compete in a final two-party Peterson lock at the top.
+
+- Record in node-local lock state which path was taken (needed at release, and for thread-obliviousness).
+- **Open:** resetting the fast-path variables when the fast path fails without anyone winning it (e.g. `y` left non-zero) needs a careful rule. Specify it, then model-check before benchmarking. *Proposed rule (implemented, not yet model-checked): `docs/hybrid.md`.*
+
+### (c) Lock servers
+
+Each lock has a **home node** whose background server thread grants it.
+
+**Messages toward the server** (requests, releases) go through pairwise node-to-server queues in the metadata region:
+
+- **Multi-producer within a node, single consumer at the server.** Producers reserve a slot with an atomic fetch-and-add on a node-local tail counter (coherent), write the message, and publish it via a per-slot sequence number. Cross-node, each queue line is written only by one node.
+- Each message is **one 8-byte store** containing type, lock ID, request ID / sequence, and grant-slot index. Bit allocation TBD.
+- **Capacity ≥ 2 × (locks homed at that server)**: at most one request and one release per lock per node can be in flight, so producers never need to read the consumer's head.
+- Keep the window between slot reservation and publish tiny; a preempted producer stalls all locks homed at that server.
+
+**Replies** (grant, busy, NACK-with-new-home) are written by the server **directly to a grant slot named in the request** (Decided):
+
+- The request carries a **grant-slot index** (an index rather than a pointer, so it fits in the 8-byte message; see Section 1). The server bounds-checks it before writing.
+- Grant slots are per thread (small reusable pool). Only the server writes them; the waiter polls its slot.
+- The reply word includes the request ID; the waiter accepts only a matching ID, so slots are never cleared and stale replies are ignored.
+- **Late grants:** either do not support abandoning a queued request (trylock gets an immediate busy-or-grant reply), or the node must release any grant for a request it abandoned.
+
+**Handoff:** the server's queue provides handoff naturally. With a fixed home, a cross-node handoff is two hops (holder → server → waiter). Local handoff: the node keeps the grant across its local waiters and notifies the server only when the lock leaves the node.
+
+**Home migration:**
+
+- Migrate when one node dominates recent acquisitions (adaptive policy with hysteresis; high threshold to avoid thrashing under uniform access). If the home moves to the holder, the holder grants directly (one hop).
+- Change the home **only while the lock is held**, bumping a version number. Requests reaching an old home get a NACK with the new home and version; the requester retries.
+- The lock-to-home map is read-mostly: cache it and refresh on NACK. Spread initial homes (e.g. hash of lock ID).
+- Servers poll incoming queues with adaptive backoff. Background poll traffic is O(N²) cluster-wide; measure it.
+
+## 5. Correctness verification
+
+- **Model checking** (e.g. GenMC, or TLA+ with an explicit model of writeback and invalidation): base algorithms under the memory rules; gate + owner field + announcements; hybrid fast-path reset; lock-server queues, grant slots, NACK/migration.
+- **Runtime stress tests:** each lock protects a counter and a checksum over shared data; inject random delays; check invariants after millions of acquisitions. Run per phase.
+
+## 6. Evaluation plan
+
+### 6.1 Workloads (Decided)
+
+- **SPLASH** and **PARSEC** (PARSEC 3.0 bundles SPLASH-2/2x), run unmodified via LiTL-style pthread interposition (https://github.com/multicore-locks/litl). Start with the lock-sensitive subset identified in Guiroux et al., "Multicore Locks: The Case Is Not Closed Yet" (USENIX ATC'16).
+- **Key-value store driven by YCSB.** This one is modifiable, so it provides precise dirty-range hints.
+- **Parameterized microbenchmark.**
+
+Interposition requirements: thread-to-slot mapping; protected-data writeback (interposition cannot scope it, so use full flush or uncached data for these apps and state which); `pthread_mutex_trylock` for every variant; condition-variable support; `pthread_create` interposition fix for glibc ≥ 2.34.
+
+### 6.2 Microbenchmark axes
+
+- Node count N
+- Contention level (arrival rate) and arrival burstiness at fixed rate
+- Access skew: uniform, one dominant node, phased (dominant node changes over time)
+- Critical-section length and data footprint
+- Ratio of shared vs node-local memory accesses inside critical sections
+- Threads per node and how evenly they are spread
+
+**Load-generation modes:**
+
+- **Closed-loop** (each thread: acquire → critical section → release → optional think time → repeat): throughput microbenchmarks. SPLASH/PARSEC are batch jobs measured by completion time or throughput.
+- **Open-loop arrivals** (each thread acquires at scheduled times drawn from an arrival process, e.g. Poisson or temporally clustered bursts; lock latency measured from the scheduled time): required for the arrival-rate and burstiness axes and for latency results, since closed-loop threads set their own rate and back off under contention.
+
+### 6.3 YCSB mapping
+
+- Zipfian vs uniform keys → skew
+- Lock granularity (per-bucket vs coarse) → number of locks, collision rate
+- Workloads A/B/C/F → read/write mix
+- Value size → data footprint
+- **Open-loop** load generation at fixed offered loads, with latency measured from each request's intended start time (YCSB is closed-loop by default; check whether the version in use can correct for this, or use a separate open-loop driver)
+
+### 6.4 Phases
+
+**Phase 1: base algorithms, no handoff.** Local submutex kept; base algorithm held across the critical section (Section 3.4); (c) with a fixed home, no migration, no local passing.
+Look for: the (a)/(b) crossover vs N and burstiness; whether (d) tracks the better of the two; (c) fixed-home latency; degradation under contention.
+
+**Ablation: no local submutex.** Run right after Phase 1, reusing its code. Variants (a), (b), (d) sized for the total thread count. Sweep threads per node at fixed N; microbenchmarks plus one or two lock-sensitive apps. Skip (c) (without a submutex it needs per-thread queues, which is a different design). Purpose: show why the hierarchy is needed.
+
+**Phase 2: with handoff.**
+
+- **2a, local handoff only.** Sweep the local cap, threads per node, placement balance, and data footprint. For (c), the node keeps the grant across local waiters.
+- **2b, local + cross-node handoff.** Gate + owner field. First measure uncontended cost vs Phase 1 (expected ≈ +1 round trip for the owner-field read). Sweep skew and burstiness. Measure release-to-next-start latency vs Phase 1, gate wait time, missed-announcement recoveries, and contention on the owner line.
+- **2c, (c)-specific.** Home migration; sweep the reassignment threshold with phased skew; compare one-hop vs two-hop handoff; check whether local handoff and migration overlap enough that one suffices.
+
+### 6.5 Baselines
+
+- Same locks on a **coherent NUMA** machine (separates algorithm cost from the cost of non-coherence)
+- An **atomic-based lock** (ticket/MCS in device memory), if cross-host atomics are available
+- A **no-lock / single-thread** upper bound
+- **Data-movement cost references:** (i) microbenchmark runs with zero-footprint critical sections, to isolate lock overhead from data movement; (ii) the same microbenchmark with all threads on one node, as an approximate best case for keeping data in one place
+
+### 6.6 Metrics and instrumentation
+
+- Throughput; tail latency (p50/p99/p99.9) at fixed offered load
+- Uncontended round trips and latency per acquire-release pair
+- **Per-acquisition path breakdown:** fast path, local handoff, global handoff, base algorithm, server request, missed-announcement recovery
+- Time split: in lock, in data writeback, in critical section
+- Background interconnect bandwidth from polling
+- CPU time per operation, including server threads
+- If emulating: sweep injected interconnect latency
+
+### 6.7 Parameters to sweep
+
+Local handoff cap; reassignment threshold and migration window for (c); poll backoff caps; N; threads per node; injected latency.
+
+## 7. Future work
+
+- **Reader-writer locks.** E.g. per-node reader counters (single writer per node, so no multi-writer lines); writers take the global lock and scan the counters; readers on a node share the local submutex in read mode; each reading node invalidates protected data on acquire.
+- **Abortable locks.** Timeout/trylock semantics across all variants: withdrawing cleanly from the gate and base algorithms; for (c), handling grants that arrive after a request was abandoned (Section 4c).
+- **Partial failure tolerance.** A node crashing while holding the lock, or while inside the gate or a queue operation, must not block other nodes indefinitely. Likely ingredients: leases or epochs on ownership, failure detection, and recovery of base-algorithm state and in-flight queue slots.
+ **Lease parking of idle global locks.** A node keeps an idle global lock under a short lease so local reacquisition is free. If pursued: all state changes stay on the owner node (node-local states `PARKED`/`HELD`/`RELEASING` via coherent CAS); release is triggered by a per-node timer and/or a poller watching announcements; the releasing agent writes back protected data before releasing.

@@ -1,0 +1,7 @@
+build/
+kmod/*.ko
+kmod/*.o
+kmod/*.mod*
+kmod/.*.cmd
+kmod/Module.symvers
+kmod/modules.order
