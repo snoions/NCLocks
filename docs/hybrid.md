@@ -83,3 +83,53 @@ Confirm under GenMC.
 Uncontended fast path: three serialized store-fence-load round trips (two
 splitter, one top Peterson). Lamport alone needs two. The slow path adds an
 O(P) `fflag` scan in the top wait and, on release, the O(P) `b[]` scan.
+
+## Performance findings (2026-11-09; `uc` backend, 1 host, 8 nodes x 1 thread, 200 ns CS)
+
+**Why the fast path fails.** Counters `hybrid_fail_busy`, `hybrid_fail_lost` and,
+with `-DNCL_DIAG=ON`, `hybrid_fail_busy_stale` show:
+
+| offered | fast | fail: `y != 0` on entry | ...of which stale `y` | fail: lost race |
+|---|---|---|---|---|
+| 250k | 83% | 13.4% | 1.5% | 3.3% |
+| 500k | 67% | 28.1% | 3.4% | 5.4% |
+| 750k | 51% | 43.9% | 3.7% | 5.6% |
+
+The fast path is almost always closed by a **live** fast holder, not by a stale
+splitter. The reset rule is not what limits hybrid. A splitter is a single-slot
+lane by design: while one node holds it, every other arrival takes the slow
+path.
+
+**What it costs.** Two O(P) scans of uncached lines sit on the slow path:
+
+1. *Release reset scan (held).* The original code scanned `b[0..P-1]` in order
+   while holding the lock. The scan now starts at `b[y-1]`, which belongs to the
+   live fast winner in the common case, so one load decides the skip. That gives
+   1.00 load per slow acquisition and raised closed-loop capacity from 0.90M to
+   1.04M req/s at N=8 and from 0.67M to 0.81M at N=16. Safety is unchanged: a
+   reset still requires every `b[j]` to read 0 after the fence, and only the
+   reading order changed.
+2. *Top-lock wait (handoff path).* The slow side must see every `fflag[j] == 0`
+   (or `turn` change) before entering. That is about 9.5 loads per slow
+   acquisition at N=8 and about 15 at N=16. A full P-load scan (8 x 81 ns) lands
+   on every fast-to-slow handoff. **Checking only `fflag[y-1]` is unsafe.** A
+   node that read `y == 0` before the winner wrote `y` can later overwrite `y`
+   with its own ID and then fail, so `y` does not reliably name the winner.
+   Shortening this needs a protocol change plus a proof or model check.
+   Candidates: an epoch-tagged single fast-owner word written only by the
+   current winner, or polling `turn` and rescanning only when it changes
+   (which helps waiting, not the final confirming scan).
+
+Capacity vs N (closed loop, no think time, Mreq/s; hybrid figures are before
+fix 1):
+
+| N | Lamport | Tournament | Hybrid |
+|---|---|---|---|
+| 2 | 1.30 | 1.49 | 1.39 |
+| 4 | 1.33 | 1.61 | 1.12 |
+| 8 | 1.08 | 1.76 | 0.90 (1.04 after fix 1) |
+| 16 | 0.83 | 1.70 | 0.67 (0.81 after fix 1) |
+
+Even after fix 1, hybrid does not track the better of Lamport and tournament
+under contention (design §6.4). It beats Lamport's capacity but stays well below
+tournament's, and its uncontended latency (~500 ns) is between the two.

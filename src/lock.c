@@ -183,7 +183,7 @@ void ncl_acquire(struct ncl_thread *t, int lock)
     L->holder = part;
     L->st.acquires++;
     L->st.path[path]++;
-    L->st.base.lamport_retries += tmp.lamport_retries;
+    ncl_base_stats_add(&L->st.base, &tmp);
 
     /* Global lock arrived at this node: drop stale cached data. */
     if (L->data_len && !cfg.debug_skip_data_inv)
@@ -234,8 +234,6 @@ void ncl_node_stats(struct ncl_node_stats *out)
         out->acquires += s->acquires;
         for (int p = 0; p < NCL_PATH__COUNT; p++)
             out->path[p] += s->path[p];
-        out->base.lamport_retries += s->base.lamport_retries;
-        out->base.hybrid_resets += s->base.hybrid_resets;
-        out->base.hybrid_reset_skips += s->base.hybrid_reset_skips;
+        ncl_base_stats_add(&out->base, &s->base);
     }
 }

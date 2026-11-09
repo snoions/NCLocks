@@ -72,6 +72,7 @@ struct result {
     uint64_t offered;  /* arrivals scheduled in the measured window */
     uint64_t unserved; /* of those, never started before the end */
     uint64_t paths[NCL_PATH__COUNT];
+    struct ncl_base_stats base;
     struct hist h[H__COUNT];
 };
 
@@ -267,6 +268,7 @@ static int node_main(int node, int wfd)
     struct ncl_node_stats st;
     ncl_node_stats(&st);
     memcpy(tot->paths, st.path, sizeof tot->paths);
+    tot->base = st.base;
 
     const char *p = (const char *)tot;
     size_t left = sizeof *tot;
@@ -345,7 +347,7 @@ static void usage(const char *argv0)
 
 #define CSV_HEADER                                                                         \
     "alg,backend,nodes,threads_per_node,locks,cs_ns,think_ns,footprint,dev_lat_ns,"        \
-    "no_submutex,arrival,offered_rps,achieved_rps,unserved_frac,"                          \
+    "no_submutex,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
     "fast_frac,meta_memtype,meta_load_ns"
@@ -453,6 +455,7 @@ int main(int argc, char **argv)
         tot->unserved += nr->unserved;
         for (int p = 0; p < NCL_PATH__COUNT; p++)
             tot->paths[p] += nr->paths[p];
+        ncl_base_stats_add(&tot->base, &nr->base);
         for (int h = 0; h < H__COUNT; h++)
             hist_merge(&tot->h[h], &nr->h[h]);
         close(rfd[n]);
@@ -486,10 +489,10 @@ int main(int argc, char **argv)
         snprintf(arrdesc, sizeof arrdesc, "%s", arr_names[arrival]);
 
     if (csv) {
-        printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%.0f,%.0f,%.5f,"
+        printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%.0f,%.0f,%.0f,%.5f,"
                "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
-               cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, arrdesc, offered,
+               cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, arrdesc, rate, offered,
                achieved, unserved, hist_mean(hl), (unsigned long)hist_pct(hl, 0.5),
                (unsigned long)hist_pct(hl, 0.9), (unsigned long)hist_pct(hl, 0.99),
                (unsigned long)hist_pct(hl, 0.999), (unsigned long)hl->max, hist_mean(hs),
@@ -527,6 +530,21 @@ int main(int argc, char **argv)
                 printf(" %s=%.1f%%", ncl_path_names[p],
                        100.0 * (double)tot->paths[p] / (double)all_paths);
         printf("\n");
+        const struct ncl_base_stats *b = &tot->base;
+        if (cfg.alg == NCL_ALG_HYBRID && all_paths) {
+            double A = (double)all_paths;
+            printf("hybrid: fail_busy=%.1f%% (stale=%.1f%%, needs NCL_DIAG) fail_lost=%.1f%% "
+                   "resets=%lu reset_skips=%lu\n"
+                   "hybrid: per slow acquisition: %.2f b[] loads in release scan (lock held), "
+                   "%.2f fflag[] loads in top wait\n",
+                   100 * (double)b->hybrid_fail_busy / A, 100 * (double)b->hybrid_fail_busy_stale / A,
+                   100 * (double)b->hybrid_fail_lost / A, (unsigned long)b->hybrid_resets,
+                   (unsigned long)b->hybrid_reset_skips,
+                   tot->paths[NCL_PATH_HYBRID_SLOW]
+                       ? (double)b->hybrid_scan_loads / (double)tot->paths[NCL_PATH_HYBRID_SLOW] : 0.0,
+                   tot->paths[NCL_PATH_HYBRID_SLOW]
+                       ? (double)b->hybrid_fflag_loads / (double)tot->paths[NCL_PATH_HYBRID_SLOW] : 0.0);
+        }
     }
     ncl_sys_destroy();
     free(tot);

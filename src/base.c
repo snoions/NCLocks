@@ -171,15 +171,17 @@ static void tournament_unlock_nofence(struct ncl_base *b, int i)
 #define TOP_FFLAG(b, i) (&(b)->top[2 + (i)])
 enum { SIDE_FAST = 0, SIDE_SLOW = 1 };
 
-static int any_fflag(struct ncl_base *b)
+static int any_fflag(struct ncl_base *b, struct ncl_base_stats *st)
 {
-    for (int j = 0; j < b->P; j++)
+    for (int j = 0; j < b->P; j++) {
+        st->hybrid_fflag_loads++;
         if (ncl_uc_load(TOP_FFLAG(b, j)))
             return 1;
+    }
     return 0;
 }
 
-static int hybrid_lock(struct ncl_base *b, int i)
+static int hybrid_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
     const uint64_t me = (uint64_t)i + 1;
     struct ncl_backoff bo;
@@ -189,12 +191,22 @@ static int hybrid_lock(struct ncl_base *b, int i)
     ncl_fence_ss();
     ncl_uc_store(LAM_X(b), me);
     ncl_fence();
-    if (ncl_uc_load(LAM_Y(b)) != 0)
+    uint64_t y = ncl_uc_load(LAM_Y(b));
+    if (y != 0) {
+        st->hybrid_fail_busy++;
+#ifdef NCL_DIAG
+        /* Approximate: b[] can change right after this read. */
+        if (y <= (uint64_t)b->P && ncl_uc_load(LAM_B(b, (int)y - 1)) == 0)
+            st->hybrid_fail_busy_stale++;
+#endif
         goto fail;
+    }
     ncl_uc_store(LAM_Y(b), me);
     ncl_fence();
-    if (ncl_uc_load(LAM_X(b)) != me)
+    if (ncl_uc_load(LAM_X(b)) != me) {
+        st->hybrid_fail_lost++;
         goto fail;
+    }
 
     /* Won the splitter; b[i] stays 1 until release. */
     ncl_uc_store(TOP_FFLAG(b, i), 1);
@@ -215,7 +227,7 @@ fail:
     ncl_uc_store(TOP_TURN(b), SIDE_SLOW);
     ncl_fence();
     ncl_backoff_init(&bo);
-    while (ncl_uc_load(TOP_TURN(b)) == SIDE_SLOW && any_fflag(b))
+    while (ncl_uc_load(TOP_TURN(b)) == SIDE_SLOW && any_fflag(b, st))
         ncl_backoff(&bo);
     ncl_fence();
     return NCL_PATH_HYBRID_SLOW;
@@ -238,12 +250,20 @@ static void hybrid_unlock(struct ncl_base *b, int i, int path, struct ncl_base_s
     /* Slow holder: reset a stale splitter (y set, nobody won it). Safe only
      * if no fast attempt is in flight and no fast winner exists, i.e. every
      * b[j] == 0; otherwise skip and leave it to a later slow holder. */
-    if (ncl_uc_load(LAM_Y(b)) != 0) {
+    uint64_t y = ncl_uc_load(LAM_Y(b));
+    if (y != 0) {
         ncl_fence();
+        /* Start at y's writer: if y belongs to a live fast winner (the common
+         * case) its b[] is set and one load decides the skip. Reading order
+         * does not affect safety: a reset still requires every b[j] == 0. */
+        int first = y <= (uint64_t)b->P ? (int)y - 1 : 0;
         int clear = 1;
-        for (int j = 0; j < b->P && clear; j++)
+        for (int k = 0; k < b->P && clear; k++) {
+            int j = first + k < b->P ? first + k : first + k - b->P;
+            st->hybrid_scan_loads++;
             if (ncl_uc_load(LAM_B(b, j)))
                 clear = 0;
+        }
         if (clear) {
             ncl_fence();
             ncl_uc_store(LAM_Y(b), 0);
@@ -265,7 +285,7 @@ int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     switch (b->alg) {
     case NCL_ALG_LAMPORT: return lamport_lock(b, i, st);
     case NCL_ALG_TOURNAMENT: tournament_lock(b, i); return NCL_PATH_TOURNAMENT;
-    case NCL_ALG_HYBRID: return hybrid_lock(b, i);
+    case NCL_ALG_HYBRID: return hybrid_lock(b, i, st);
     }
     return -1;
 }

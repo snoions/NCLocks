@@ -46,11 +46,28 @@ struct ncl_base {
     ncl_line_t *top;  /* HYBRID: [sflag, turn, fflag[0..P-1]] */
 };
 
+/* All fields are uint64_t counters (merged generically by ncl_base_stats_add). */
 struct ncl_base_stats {
     uint64_t hybrid_resets;       /* stale splitter reset by a slow holder */
     uint64_t hybrid_reset_skips;  /* stale splitter seen but b[] not clear */
     uint64_t lamport_retries;     /* Lamport `goto start` taken */
+    uint64_t hybrid_fail_busy;    /* fast path failed: y != 0 on entry */
+    uint64_t hybrid_fail_lost;    /* fast path failed: lost splitter race (x != me) */
+    uint64_t hybrid_scan_loads;   /* b[] loads in slow-release reset scans (held) */
+    uint64_t hybrid_fflag_loads;  /* fflag[] loads in slow-side top-lock waits */
+    /* NCL_DIAG builds only (one extra uncached load per busy failure): */
+    uint64_t hybrid_fail_busy_stale; /* ...and y's writer had b[] == 0, i.e. no
+                                        fast winner or attempt behind it */
 };
+
+#define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
+static inline void ncl_base_stats_add(struct ncl_base_stats *d, const struct ncl_base_stats *s)
+{
+    uint64_t *dp = (uint64_t *)d;
+    const uint64_t *sp = (const uint64_t *)s;
+    for (size_t k = 0; k < NCL_BASE_STATS_N; k++)
+        dp[k] += sp[k];
+}
 
 size_t ncl_base_nlines(ncl_alg_t alg, int P);
 void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines);

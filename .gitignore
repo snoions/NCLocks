@@ -1,4 +1,4 @@
-build/
+build*/
 kmod/*.ko
 kmod/*.o
 kmod/*.mod*
