@@ -192,6 +192,10 @@ static int map_uc_meta(uintptr_t base)
         }
     }
     ncl_mem.meta_memtype = cm_name(cm);
+    /* UC/UC- and WB stores are ordered among themselves on x86; anything else
+     * (WC, WT/WP, unknown) gets the hardware sfence in ncl_fence_ss. */
+    ncl_mem.meta_store_sfence = !(cm == NCL_UC_CM_UC || cm == NCL_UC_CM_UC_MINUS ||
+                                  cm == NCL_UC_CM_WB);
     if (cm != NCL_UC_CM_UC && cm != NCL_UC_CM_UC_MINUS && !accept_any) {
         fprintf(stderr, "ncl: metadata PTE memory type is %s, not UC; refusing to run "
                         "(set NCL_UC_ACCEPT_ANY_MEMTYPE=1 for deliberate WC/WB runs)\n",
@@ -211,6 +215,7 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
     ncl_mem.memfd = -1;
     ncl_mem.uc_fd = -1;
     ncl_mem.meta_memtype = "WB";
+    ncl_mem.meta_store_sfence = cfg->backend == NCL_BACKEND_CACHED_FLUSH;
 
     calibrate_tsc();
     ncl_mem.lat_cycles = cfg->dev_lat_ns ? ncl_ns_to_cycles(cfg->dev_lat_ns) : 0;

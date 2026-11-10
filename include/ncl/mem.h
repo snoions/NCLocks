@@ -93,6 +93,9 @@ struct ncl_mem {
     int memfd;
     int uc_fd;             /* /dev/ncl_uc (UC backend), else -1 */
     const char *meta_memtype; /* memory type of hot metadata, as verified */
+    int meta_store_sfence; /* ncl_fence_ss must emit sfence: metadata stores are
+                              weakly ordered (cached-flush: clflushopt after each
+                              store; uc: verified PTE type is WC or unknown) */
     double meta_load_ns;   /* measured mean latency of a metadata load */
 };
 
@@ -138,12 +141,17 @@ static inline void ncl_fence(void)
 }
 
 /* Store-store fence: earlier stores become visible before later stores.
- * Free on x86 (compiler barrier only); required on weaker ISAs. */
+ * x86 already keeps ordinary stores in order (SDM 8.2.2), including WB and
+ * UC/UC- stores mixed together, so the hardware sfence is needed only when
+ * metadata stores are weakly ordered: after clflushopt (cached-flush backend)
+ * or on a WC mapping (uc backend run with NCL_UC_ACCEPT_ANY_MEMTYPE). The
+ * C11 release fence is always kept: it is the explicit fence the algorithms
+ * and the data-race argument rely on, and the compiler barrier. */
 static inline void ncl_fence_ss(void)
 {
 #if defined(__x86_64__)
-    if (ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH || ncl_mem.backend == NCL_BACKEND_UC)
-        _mm_sfence(); /* clflushopt is weakly ordered; UC/WB store mix */
+    if (ncl_mem.meta_store_sfence)
+        _mm_sfence();
 #endif
     atomic_thread_fence(memory_order_release);
 }
