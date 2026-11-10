@@ -20,8 +20,19 @@
  *                     any local thread may do the eventual global release.
  *                     Applies to every variant; for SERVER/FASTSRV the node
  *                     keeps the grant and the server hears only the final REL.
- *   NCL_MODE_HANDOFF  Phase 2b: gate + owner field (§3.3) — not implemented
- *                     yet; ncl_sys_create rejects it.
+ *   NCL_MODE_HANDOFF  Phase 2b: local handoff as in NCL_MODE_LOCAL, plus
+ *                     cross-node handoff through a gate + owner field (§3.3).
+ *                     The base algorithm (a)/(b)/(d) is only a short gate
+ *                     around reading/taking the uncached `owner` word (0 =
+ *                     FREE, node+1 = held); it is NOT held across the critical
+ *                     section. A releaser scans announce[] round-robin from
+ *                     itself and hands off with one 8-byte store to `owner`
+ *                     (or stores FREE). Waiters poll `owner`; seeing FREE
+ *                     means a missed announcement, so they go back through the
+ *                     gate. Not for SERVER/FASTSRV (they hand off through the
+ *                     server queue) or the no-submutex ablation.
+ *                     cfg.announce_before selects the §3.5 Open placement:
+ *                     0 = announce inside the gate (baseline), 1 = before it.
  *
  * Precise dirty hints under NCL_MODE_LOCAL: hints from every release in a
  * local run are accumulated (node-local) and all written back when the lock
@@ -62,7 +73,8 @@ struct ncl_sys_cfg {
     int threads_per_node;   /* needed to size participants in ablation */
     int nlocks;
     int no_submutex;        /* ablation: each thread is a global participant */
-    int local_cap;          /* NCL_MODE_LOCAL: max consecutive local handoffs (0 = 64) */
+    int local_cap;          /* LOCAL/HANDOFF: max consecutive local handoffs (0 = 64) */
+    int announce_before;    /* HANDOFF: announce before entering the gate (§3.5); 0 = inside */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
@@ -100,6 +112,20 @@ struct ncl_srv_stats {
     struct ncl_base_stats base; /* FASTSRV: splitter resets done by the server */
 };
 
+/* MODE_HANDOFF counters (all uint64_t; merged generically). */
+struct ncl_handoff_stats {
+    uint64_t gate_entries;    /* passes through the gate (incl. retries) */
+    uint64_t gate_takes;      /* owner was FREE in the gate: taken */
+    uint64_t gate_handoffs;   /* owner == me already when read in the gate */
+    uint64_t wait_handoffs;   /* owner == me seen while polling */
+    uint64_t missed_announce; /* poll saw FREE: back through the gate (recovery) */
+    uint64_t owner_polls;     /* owner loads while waiting */
+    uint64_t handoffs_sent;   /* global releases that named a waiter */
+    uint64_t frees;           /* global releases that stored FREE */
+    uint64_t announce_loads;  /* announce[] loads in pick_waiter */
+};
+#define NCL_HANDOFF_STATS_N (sizeof(struct ncl_handoff_stats) / sizeof(uint64_t))
+
 /* Per-node statistics (node-local, summed over threads; approximate). */
 struct ncl_node_stats {
     uint64_t acquires;          /* all acquisitions, incl. local handoffs */
@@ -108,6 +134,7 @@ struct ncl_node_stats {
     uint64_t path[NCL_PATH__COUNT];
     struct ncl_base_stats base;
     struct ncl_srv_stats srv;
+    struct ncl_handoff_stats ho;
 };
 
 int ncl_sys_create(const struct ncl_sys_cfg *cfg);

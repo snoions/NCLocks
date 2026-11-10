@@ -73,6 +73,29 @@ foreach(alg hybrid fastsrv)
   set_tests_properties(stress_${alg}_uc_fastrel_scan PROPERTIES
     SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
 endforeach()
+# Phase 2b: gate + owner handoff (design §3.3), both announce placements (§3.5),
+# and -K 1 so that almost every release is a cross-node handoff.
+foreach(alg lamport tournament hybrid)
+  foreach(be emu uc)
+    add_test(NAME stress_${alg}_${be}_handoff
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 3 -l 2 -i 10000 -M handoff -H)
+    add_test(NAME stress_${alg}_${be}_handoff_before_cap1
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -G before -K 1)
+    if(be STREQUAL "uc")
+      set_tests_properties(stress_${alg}_uc_handoff stress_${alg}_uc_handoff_before_cap1
+        PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+    endif()
+  endforeach()
+endforeach()
+add_test(NAME emu_detects_missing_writeback_handoff
+  COMMAND ncl_stress -a tournament -b emu -n 4 -t 3 -l 1 -i 5000 -M handoff -K 1 --skip-wb)
+set_tests_properties(emu_detects_missing_writeback_handoff PROPERTIES WILL_FAIL TRUE)
+add_test(NAME emu_detects_missing_invalidate_handoff
+  COMMAND ncl_stress -a hybrid -b emu -n 4 -t 3 -l 1 -i 5000 -M handoff -K 1 --skip-inv)
+set_tests_properties(emu_detects_missing_invalidate_handoff PROPERTIES WILL_FAIL TRUE)
+add_test(NAME handoff_rejects_server
+  COMMAND ncl_stress -a server -b emu -M handoff)
+set_tests_properties(handoff_rejects_server PROPERTIES WILL_FAIL TRUE)
 add_test(NAME emu_detects_missing_writeback_local
   COMMAND ncl_stress -a tournament -b emu -n 4 -t 3 -l 1 -i 5000 -M local --skip-wb)
 set_tests_properties(emu_detects_missing_writeback_local PROPERTIES WILL_FAIL TRUE)

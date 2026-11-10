@@ -75,6 +75,7 @@ struct result {
     uint64_t paths[NCL_PATH__COUNT];
     struct ncl_base_stats base; /* node-side + server-side splitter counters */
     struct ncl_srv_stats srv;
+    struct ncl_handoff_stats ho;
     struct hist h[H__COUNT];
 };
 
@@ -274,6 +275,7 @@ static int node_main(int node, int wfd)
     tot->base = st.base;
     ncl_base_stats_add(&tot->base, &st.srv.base);
     tot->srv = st.srv;
+    tot->ho = st.ho;
 
     const char *p = (const char *)tot;
     size_t left = sizeof *tot;
@@ -348,8 +350,10 @@ static void usage(const char *argv0)
             "  -H          print the CSV header and exit\n"
             "  -P          don't pin threads\n"
             "  -S N        server idle poll backoff cap, pause iterations (server/fastsrv)\n"
-            "  -M MODE     phase1 (default) | local (Phase 2a cohort passing)\n"
-            "  -K CAP      local mode: max consecutive local handoffs (default 64)\n"
+            "  -M MODE     phase1 (default) | local (2a cohort passing) | handoff (2b: local +\n"
+            "              gate/owner cross-node handoff; lamport, tournament, hybrid)\n"
+            "  -K CAP      local/handoff: max consecutive local handoffs (default 64)\n"
+            "  -G PLACE    handoff: announce inside the gate (default) | before it\n"
             "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n"
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
             "              (SMT sibling of node n's first worker)\n"
@@ -363,7 +367,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq"
 
 int main(int argc, char **argv)
 {
@@ -373,7 +377,7 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:mCHPh")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:mCHPh")) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -395,6 +399,16 @@ int main(int argc, char **argv)
         case 'M': if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; } break;
         case 'K': cfg.local_cap = atoi(optarg); break;
         case 'B': ncl_backoff_cap = (unsigned)atoi(optarg); break;
+        case 'G':
+            if (!strcmp(optarg, "inside"))
+                cfg.announce_before = 0;
+            else if (!strcmp(optarg, "before"))
+                cfg.announce_before = 1;
+            else {
+                fprintf(stderr, "-G: inside|before\n");
+                return 2;
+            }
+            break;
         case 'F':
             if (!strcmp(optarg, "scan"))
                 ncl_fast_release = NCL_FASTREL_SCAN;
@@ -496,6 +510,8 @@ int main(int argc, char **argv)
         for (int p = 0; p < NCL_PATH__COUNT; p++)
             tot->paths[p] += nr->paths[p];
         ncl_base_stats_add(&tot->base, &nr->base);
+        for (size_t k = 0; k < NCL_HANDOFF_STATS_N; k++)
+            ((uint64_t *)&tot->ho)[k] += ((const uint64_t *)&nr->ho)[k];
         {
             uint64_t *d = (uint64_t *)&tot->srv;
             const uint64_t *s = (const uint64_t *)&nr->srv;
@@ -536,6 +552,7 @@ int main(int argc, char **argv)
     fast = tot->paths[NCL_PATH_LAMPORT_FAST] + tot->paths[NCL_PATH_HYBRID_FAST] +
            tot->paths[NCL_PATH_FASTSRV_FAST];
     const struct hist *hl = &tot->h[H_LOCK], *hs = &tot->h[H_SERVICE], *hj = &tot->h[H_SOJOURN];
+#define PER(x) (all_paths ? (double)(x) / (double)all_paths : 0.0)
     char arrdesc[64];
     if (arrival == ARR_ONOFF)
         snprintf(arrdesc, sizeof arrdesc, "onoff:%g:%g", onoff_period_us, onoff_frac);
@@ -544,10 +561,10 @@ int main(int argc, char **argv)
 
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
-               cfg.mode == NCL_MODE_LOCAL ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
+               cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
                cfg.server_backoff_cap ? cfg.server_backoff_cap : 1024, arrdesc, rate, offered,
                achieved, unserved, hist_mean(hl), (unsigned long)hist_pct(hl, 0.5),
                (unsigned long)hist_pct(hl, 0.9), (unsigned long)hist_pct(hl, 0.99),
@@ -560,7 +577,11 @@ int main(int argc, char **argv)
                !pin ? "none" : srv_place == NCL_SRV_PIN_SIBLING ? "sibling" : "next",
                all_paths ? (double)tot->base.split_scan_loads / (double)all_paths : 0.0,
                all_paths ? (double)tot->base.lamport_retries / (double)all_paths : 0.0,
-               ncl_fast_release == NCL_FASTREL_HINT ? "hint" : "scan");
+               ncl_fast_release == NCL_FASTREL_HINT ? "hint" : "scan",
+               cfg.mode != NCL_MODE_HANDOFF ? "-" : cfg.announce_before ? "before" : "inside",
+               PER(tot->paths[NCL_PATH_GLOBAL_HANDOFF]), PER(tot->paths[NCL_PATH_LOCAL_HANDOFF]),
+               PER(tot->ho.missed_announce), PER(tot->ho.owner_polls), PER(tot->ho.gate_entries),
+               PER(tot->ho.announce_loads));
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -620,6 +641,19 @@ int main(int argc, char **argv)
                        (unsigned long)v->top_acquires, (unsigned long)v->top_wait_polls,
                        (unsigned long)v->top_yields);
             printf("\n");
+        }
+        if (cfg.mode == NCL_MODE_HANDOFF) {
+            const struct ncl_handoff_stats *o = &tot->ho;
+            printf("handoff (announce %s): gate_entries=%lu takes=%lu gate_handoffs=%lu "
+                   "wait_handoffs=%lu missed_announce=%lu owner_polls/acq=%.2f sent=%lu frees=%lu "
+                   "announce_loads/release=%.2f\n",
+                   cfg.announce_before ? "before" : "inside", (unsigned long)o->gate_entries,
+                   (unsigned long)o->gate_takes, (unsigned long)o->gate_handoffs,
+                   (unsigned long)o->wait_handoffs, (unsigned long)o->missed_announce,
+                   PER(o->owner_polls), (unsigned long)o->handoffs_sent, (unsigned long)o->frees,
+                   o->handoffs_sent + o->frees
+                       ? (double)o->announce_loads / (double)(o->handoffs_sent + o->frees)
+                       : 0.0);
         }
     }
     ncl_sys_destroy();

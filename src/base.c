@@ -15,6 +15,7 @@ const char *const ncl_path_names[NCL_PATH__COUNT] = {
     [NCL_PATH_FASTSRV_FAST] = "fastsrv_fast",
     [NCL_PATH_FASTSRV_SLOW] = "fastsrv_slow",
     [NCL_PATH_LOCAL_HANDOFF] = "local_handoff",
+    [NCL_PATH_GLOBAL_HANDOFF] = "global_handoff",
 };
 
 static int pow2ceil(int n)

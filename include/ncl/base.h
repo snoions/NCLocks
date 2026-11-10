@@ -40,7 +40,8 @@ enum {
     NCL_PATH_SERVER,
     NCL_PATH_FASTSRV_FAST,     /* splitter winner, server not involved */
     NCL_PATH_FASTSRV_SLOW,     /* deflected: request/grant via the server */
-    NCL_PATH_LOCAL_HANDOFF,    /* MODE_LOCAL: submutex + global ownership passed in-node */
+    NCL_PATH_LOCAL_HANDOFF,    /* MODE_LOCAL/HANDOFF: submutex + global ownership passed in-node */
+    NCL_PATH_GLOBAL_HANDOFF,   /* MODE_HANDOFF: owner field handed to this node by the releaser */
     NCL_PATH__COUNT,
 };
 

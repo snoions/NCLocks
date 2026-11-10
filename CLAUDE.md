@@ -32,8 +32,11 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   design.md §4d/§4e. Implementation notes and measurements: `docs/hybrid.md`.
 - Waits that depend on another thread (submutex handoff, server grants) spin and then
   `sched_yield()`, so oversubscribed runs make progress.
-- `include/ncl/lock.h`, `src/lock.c`: two-level lock, Phase 1 mode only. `NCL_MODE_HANDOFF`
-  is rejected for now. Includes the no-submutex ablation and full or precise data writeback.
+- `include/ncl/lock.h`, `src/lock.c`: two-level lock. Modes: Phase 1, Phase 2a local handoff,
+  and Phase 2b `NCL_MODE_HANDOFF` (`-M handoff`): gate + owner field per design §3.3 for
+  (a)/(b)/(d), both §3.5 announce placements (`-G inside|before`); not model-checked; notes and
+  measurements in `docs/handoff.md`. Includes the no-submutex ablation and full or precise data
+  writeback.
 - `tests/stress.c`; `bench/microbench.c`: closed loop (default) or open loop (`-r RATE`, `-A
   poisson|uniform|onoff:PERIOD_US:FRAC`). Open-loop latency is measured from the scheduled
   time, so there is no coordinated omission. Throughput counts completions in the measured
@@ -46,7 +49,7 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   server placement (sibling = SMT sibling of the node's worker; use it when servers must share
   cores, e.g. N=8 on this 10-core host). Always report fairness with
   throughput: Lamport's throughput at the default backoff comes with severe starvation.
-- Not yet implemented: gate + owner handoff (Phase 2b), home migration/NACK (2c), partial-write
+- Not yet implemented: home migration/NACK (2c), partial-write
   stress test (§5), skewed/phased access, LiTL interposition, KV store.
 
 Emulated nodes are forked processes sharing a memfd mapped at a fixed VA

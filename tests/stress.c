@@ -182,6 +182,10 @@ static int node_main(int node)
             printf(" %s=%lu", ncl_path_names[p], (unsigned long)st.path[p]);
     if (st.base.lamport_retries)
         printf(" lamport_retries=%lu", (unsigned long)st.base.lamport_retries);
+    if (st.ho.gate_entries)
+        printf(" gate=%lu missed_announce=%lu sent=%lu frees=%lu", (unsigned long)st.ho.gate_entries,
+               (unsigned long)st.ho.missed_announce, (unsigned long)st.ho.handoffs_sent,
+               (unsigned long)st.ho.frees);
     struct ncl_base_stats sb = st.base;
     ncl_base_stats_add(&sb, &st.srv.base);
     if (sb.split_fail_closed || sb.split_fail_lost)
@@ -216,8 +220,9 @@ static void usage(const char *argv0)
             "  -b BACKEND    coherent|cached-flush|uc|emu (default emu)\n"
             "  -L NS         injected device latency, ns (default 0)\n"
             "  -m            ablation: no local submutex\n"
-            "  -M MODE       phase1|local (default phase1)\n"
-            "  -K CAP        local mode: max consecutive local handoffs (default 64)\n"
+            "  -M MODE       phase1|local|handoff (default phase1)\n"
+            "  -K CAP        local/handoff: max consecutive local handoffs (default 64)\n"
+            "  -G PLACE      handoff: announce inside the gate (default) | before\n"
             "  -F MODE       (d)/(e) fast-release check: hint (default) | scan\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
@@ -240,7 +245,7 @@ int main(int argc, char **argv)
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:mHph", lopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:mHph", lopts, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -260,6 +265,14 @@ int main(int argc, char **argv)
             if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; }
             break;
         case 'K': cfg.local_cap = atoi(optarg); break;
+        case 'G':
+            if (!strcmp(optarg, "before"))
+                cfg.announce_before = 1;
+            else if (strcmp(optarg, "inside")) {
+                usage(argv[0]);
+                return 2;
+            }
+            break;
         case 'F':
             if (!strcmp(optarg, "hint"))
                 ncl_fast_release = NCL_FASTREL_HINT;

@@ -1,6 +1,7 @@
 #include "ncl/lock.h"
 #include "server.h"
 
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,11 +37,13 @@ struct ncl_local_lock {
     struct ncl_base base;
     int path;            /* global path taken when the lock arrived at this node */
     int holder;          /* participant index used for the global acquisition */
-    int global_held;     /* MODE_LOCAL: node owns the global lock (passed locally) */
+    int global_held;     /* LOCAL/HANDOFF: node owns the global lock (passed locally) */
     int handoffs;        /* consecutive local handoffs in the current run */
     void *data;
     size_t data_len;
-    /* MODE_LOCAL precise hints accumulated over a local run */
+    ncl_line_t *owner;    /* HANDOFF: uncached owner word (0 = FREE, node+1) */
+    ncl_line_t *announce; /* HANDOFF: announce[P], one line per node */
+    /* LOCAL/HANDOFF precise hints accumulated over a local run */
     int ndirty, dirty_full;
     struct ncl_range dirty[NCL_DIRTY_MAX];
     struct ncl_node_stats st;
@@ -51,6 +54,15 @@ static struct ncl_sys_cfg cfg;       /* node-local copy */
 static struct ncl_local_lock *local; /* node-local array [nlocks] */
 static int my_node = -1;
 static int is_server(void) { return cfg.alg == NCL_ALG_SERVER || cfg.alg == NCL_ALG_FASTSRV; }
+/* Modes with local cohort passing (Phase 2a and 2b). */
+static int cohort(void) { return cfg.mode == NCL_MODE_LOCAL || cfg.mode == NCL_MODE_HANDOFF; }
+
+/* MODE_HANDOFF lines appended to each lock's base-algorithm block. */
+static size_t handoff_lines(const struct ncl_sys_cfg *c, int P)
+{
+    return c->mode == NCL_MODE_HANDOFF ? 1 + (size_t)P : 0;
+}
+#define OWNER_FREE 0ull
 
 static size_t round_line(size_t n) { return (n + NCL_CACHELINE - 1) & ~(size_t)(NCL_CACHELINE - 1); }
 
@@ -75,12 +87,14 @@ int ncl_mode_parse(const char *s, ncl_mode_t *out)
 
 int ncl_sys_create(const struct ncl_sys_cfg *c)
 {
-    if (c->mode == NCL_MODE_HANDOFF) {
-        fprintf(stderr, "ncl: mode %s not implemented yet\n", ncl_mode_name(c->mode));
+    if ((c->mode == NCL_MODE_LOCAL || c->mode == NCL_MODE_HANDOFF) && c->no_submutex) {
+        fprintf(stderr, "ncl: mode %s needs the submutex (no ablation)\n", ncl_mode_name(c->mode));
         return -1;
     }
-    if (c->mode == NCL_MODE_LOCAL && c->no_submutex) {
-        fprintf(stderr, "ncl: local handoff needs the submutex (no ablation)\n");
+    if (c->mode == NCL_MODE_HANDOFF && (c->alg == NCL_ALG_SERVER || c->alg == NCL_ALG_FASTSRV)) {
+        fprintf(stderr, "ncl: mode handoff (gate + owner, design §3.3) applies to lamport, "
+                        "tournament and hybrid; %s hands off through the lock server (use -M local)\n",
+                ncl_alg_name(c->alg));
         return -1;
     }
     if (c->nnodes < 1 || c->nnodes > NCL_MAX_NODES || c->nlocks < 1) {
@@ -99,7 +113,7 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         return -1;
     }
 
-    size_t lines_per_lock = ncl_base_nlines(c->alg, P);
+    size_t lines_per_lock = ncl_base_nlines(c->alg, P) + handoff_lines(c, P);
     size_t hdr_sz = round_line(sizeof(struct ncl_hdr));
     size_t descs_sz = round_line(sizeof(struct ncl_lock_desc) * (size_t)c->nlocks);
     size_t locks_sz = lines_per_lock * NCL_CACHELINE * (size_t)c->nlocks;
@@ -193,6 +207,12 @@ int ncl_node_attach(int node_id)
         ncl_sub_init(&local[l].sub);
         ncl_base_bind(&local[l].base, cfg.alg, hdr->participants,
                       blocks + (size_t)l * hdr->lines_per_lock);
+        if (cfg.mode == NCL_MODE_HANDOFF) {
+            ncl_line_t *ho = blocks + (size_t)l * hdr->lines_per_lock +
+                             ncl_base_nlines(cfg.alg, hdr->participants);
+            local[l].owner = ho;
+            local[l].announce = ho + 1;
+        }
         local[l].data = d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL;
         local[l].data_len = d[l].data_len;
     }
@@ -222,6 +242,117 @@ void ncl_thread_init(struct ncl_thread *t, int local_idx)
     t->participant = my_node * cfg.threads_per_node + local_idx;
 }
 
+static void check_owner(uint64_t o)
+{
+    if (o > (uint64_t)hdr->participants) {
+        fprintf(stderr, "ncl: corrupt owner word %#llx\n", (unsigned long long)o);
+        abort();
+    }
+}
+
+/* Design §3.3 acquire, caller holds the submutex. Returns the NCL_PATH_*:
+ * the gate's base path if the owner was FREE, else NCL_PATH_GLOBAL_HANDOFF. */
+static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_stats *bst)
+{
+    struct ncl_handoff_stats *h = &L->st.ho;
+    const uint64_t mine = (uint64_t)me + 1;
+    ncl_line_t *ann = &L->announce[me];
+    int path;
+
+    if (cfg.announce_before) {
+        ncl_uc_store(ann, 1);
+        ncl_fence(); /* announce visible before the gate's owner read */
+    }
+    for (;;) {
+        int gpath = ncl_base_lock(&L->base, me, bst);
+        h->gate_entries++;
+        if (!cfg.announce_before)
+            ncl_uc_store(ann, 1);
+        /* Announce (inside variant) before the owner read: a releaser that
+         * misses it must store its FREE/handoff after our read of `owner`
+         * returned "held", so our poll later sees FREE and we retry. */
+        ncl_fence();
+        uint64_t o = ncl_uc_load(L->owner);
+        check_owner(o);
+        if (o == OWNER_FREE || o == mine) {
+            /* Only gate users write a FREE owner, one at a time; a handoff
+             * to us is already ours. Single 8-byte store either way. */
+            ncl_uc_store(L->owner, mine);
+            ncl_fence(); /* owner store before the gate-exit stores */
+            ncl_base_unlock(&L->base, me, gpath, bst);
+            if (o == mine) {
+                h->gate_handoffs++;
+                path = NCL_PATH_GLOBAL_HANDOFF;
+            } else {
+                h->gate_takes++;
+                path = gpath;
+            }
+            break;
+        }
+        ncl_base_unlock(&L->base, me, gpath, bst);
+
+        /* Wait: poll the owner field directly (no separate handoff flag).
+         * Capped backoff paces the uncached polls. This wait depends on
+         * another node's releaser and, after a handoff, on THIS thread
+         * running: a handoff commits the lock to us, so if we spin while the
+         * CPU is oversubscribed we can starve the very thread (ours or the
+         * releaser's) that has to make progress. Hence spin-then-yield, like
+         * the submutex and server waits (measured: 4 concurrent stress runs,
+         * 48 threads on 20 CPUs, 14 s without the yield vs 0.14 s Phase 1). */
+        struct ncl_backoff bo;
+        ncl_backoff_init(&bo);
+        unsigned spun = 0;
+        for (;;) {
+            o = ncl_uc_load(L->owner);
+            h->owner_polls++;
+            check_owner(o);
+            if (o == mine) {
+                h->wait_handoffs++;
+                path = NCL_PATH_GLOBAL_HANDOFF;
+                goto acquired;
+            }
+            if (o == OWNER_FREE) {
+                h->missed_announce++; /* releaser missed us: retry the gate */
+                break;
+            }
+            ncl_backoff(&bo);
+            if (spun < NCL_SPIN_BEFORE_YIELD)
+                spun += bo.cur;
+            else
+                sched_yield();
+        }
+    }
+acquired:
+    ncl_fence(); /* ownership observed before the CS and the clear below */
+    ncl_uc_store(ann, 0);
+    return path;
+}
+
+/* Design §3.3 release: never enters the gate. Data is already written back. */
+static void handoff_release(struct ncl_local_lock *L, int me)
+{
+    struct ncl_handoff_stats *h = &L->st.ho;
+    const int P = hdr->participants;
+    int w = -1;
+    for (int k = 1; k < P; k++) { /* pick_waiter: round-robin after me */
+        int j = (me + k) % P;
+        h->announce_loads++;
+        if (ncl_uc_load(&L->announce[j])) {
+            w = j;
+            break;
+        }
+    }
+    ncl_fence(); /* CS effects, data writeback and the scan before the owner store */
+    if (w >= 0) {
+        ncl_uc_store(L->owner, (uint64_t)w + 1); /* handoff = one 8-byte store */
+        h->handoffs_sent++;
+    } else {
+        ncl_uc_store(L->owner, OWNER_FREE);
+        h->frees++;
+    }
+    ncl_fence_ss(); /* owner store before the submutex unlock */
+}
+
 void ncl_acquire(struct ncl_thread *t, int lock)
 {
     struct ncl_local_lock *L = &local[lock];
@@ -235,7 +366,7 @@ void ncl_acquire(struct ncl_thread *t, int lock)
 
     /* Only meaningful under the submutex: in the ablation a thread gets here
      * holding nothing and could see another thread's global_held. */
-    if (cfg.mode == NCL_MODE_LOCAL && L->global_held) {
+    if (cohort() && L->global_held) {
         /* Local handoff: the previous local holder passed us the submutex
          * with the node still owning the global lock. Data is coherent
          * within the node, so no invalidate. */
@@ -252,6 +383,8 @@ void ncl_acquire(struct ncl_thread *t, int lock)
         path = NCL_PATH_SERVER;
     } else if (cfg.alg == NCL_ALG_FASTSRV) {
         path = ncl_fastsrv_acquire(t, lock, &L->base, &tmp);
+    } else if (cfg.mode == NCL_MODE_HANDOFF) {
+        path = handoff_acquire(L, part, &tmp);
     } else {
         path = ncl_base_lock(&L->base, part, &tmp);
     }
@@ -302,7 +435,7 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
 {
     struct ncl_local_lock *L = &local[lock];
 
-    if (cfg.mode == NCL_MODE_LOCAL) {
+    if (cohort()) {
         accumulate_dirty(L, hints, nhints);
         int cap = cfg.local_cap > 0 ? cfg.local_cap : 64;
         if (ncl_sub_has_waiter(&L->sub)) {
@@ -320,7 +453,7 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
 
     /* Global lock leaving this node: write back eagerly (design §2 rule 5). */
     if (!cfg.debug_skip_data_wb) {
-        if (cfg.mode == NCL_MODE_LOCAL) {
+        if (cohort()) {
             if (L->dirty_full) {
                 if (L->data_len)
                     ncl_data_writeback(L->data, L->data_len);
@@ -345,6 +478,8 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
         ncl_srv_release(lock);
     else if (cfg.alg == NCL_ALG_FASTSRV)
         ncl_fastsrv_release(lock, &L->base, L->path, &L->st.base);
+    else if (cfg.mode == NCL_MODE_HANDOFF)
+        handoff_release(L, L->holder);
     else
         ncl_base_unlock(&L->base, L->holder, L->path, &L->st.base);
     if (!cfg.no_submutex)
@@ -372,6 +507,8 @@ void ncl_node_stats(struct ncl_node_stats *out)
         for (int p = 0; p < NCL_PATH__COUNT; p++)
             out->path[p] += s->path[p];
         ncl_base_stats_add(&out->base, &s->base);
+        for (size_t k = 0; k < NCL_HANDOFF_STATS_N; k++)
+            ((uint64_t *)&out->ho)[k] += ((const uint64_t *)&s->ho)[k];
     }
     if (is_server())
         ncl_srv_stats(&out->srv);
