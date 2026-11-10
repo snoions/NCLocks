@@ -173,3 +173,58 @@ a lone fast release. The fast-path share falls (hybrid 94 -> 91% at 100k and
 82 -> 73% at 300k; (e) 76 -> 49% at 300k, so its p50 rises from 575 ns to
 1.0 us). A cheaper variant would probe only the remembered slot (1 load), at
 the cost of weaker fairness.
+
+## Scaling to N=8 (uc, Phase 1, 8 x 1, 200 ns CS, `-B 16`, 3 reps)
+
+Raw data: `results/scale_closed_uc_n4n8.csv` (closed loop, N=4 and N=8) and
+`results/load_uc_n8_all.csv` (Poisson sweep, N=8). With 10 physical cores, the 8
+workers get one core each, but at least six of the eight (c)/(e) server threads must
+share a core. The sweep therefore uses `-Y sibling`, which puts each node's server on
+the SMT sibling of its own worker so that all nodes are placed alike. At N=8,
+sibling and next-CPU placement give the same capacity. At N=4, sibling placement
+costs (c) 7% (1.40 -> 1.30M) and (e) 3%.
+
+Closed-loop capacity (Mops/s, median; fairness = min/max node completions):
+
+| | N=4 | N=8 | fairness N=8 |
+|---|---|---|---|
+| Tournament | 1.54 | **1.70** | 0.98 |
+| Server (c) | 1.40 (next) / 1.30 (sibling) | 1.13 / 1.16 | 1.00 |
+| Hybrid (d) | 1.13 | 1.11 | 1.00 |
+| Fast-server (e) | 1.09 / 1.06 | 1.03 / 1.04 | 1.00 |
+| Lamport | 0.83 | **0.50** (4.2 retries/acq) | 0.86 |
+
+Open loop at N=8 (acquire p50 / p99; "sat" = offered load not sustained):
+
+| offered | tournament | hybrid (d) | fast-server (e) | server (c) | Lamport |
+|---|---|---|---|---|---|
+| 100k | 575 ns / 1.5 us | **543 ns** / 2.6 us | 543 ns / 33 us | 1.8 / 29 us | 383 ns / 2.0 us |
+| 300k | 607 ns / 2.2 us | 575 ns / 4.6 us | 1.2 / 30 us | 1.0 / 8.2 us | 383 ns / 4.4 us |
+| 600k | 607 ns / 3.3 us | 1.5 / 11 us | 1.9 / 13 us | 1.2 / 6.9 us | sat (20% unserved) |
+| 900k | 0.9 / 5.4 us | 4.6 / 33 us | sat | 3.1 / 35 us | sat |
+| 1.2M | 1.3 / 11 us | sat | sat | sat | sat |
+| 1.5M | 2.8 / 28 us | sat | sat | sat | sat |
+
+- **The tournament improves with N.** Under saturation, the next winner already holds
+  the lower levels of its subtree, so handoffs get shorter. Its uncontended p50 rises
+  415 -> 575 ns (one more level).
+- **Lamport collapses**: below 600k open-loop capacity, with seconds-long tails.
+- **The (d) fast path now beats the tournament on acquire** (543 vs 575 ns at 100k):
+  its cost does not depend on N.
+- **(d)'s release gives that back and more.** Hold time (sojourn p50 - acquire p50)
+  at 100k is about 1024 ns for (d) versus about 416 ns for the tournament. The extra
+  ~600 ns matches the measured 6.56 `present[]` loads per acquisition x ~82 ns: the
+  N-1 = 7-slot scan in `ncl_splitter_open_unless_others` (fairness rule) on a lone
+  fast release. Because it lengthens the hold, it also brings saturation earlier
+  (between 900k and 1.2M, versus > 1.5M for the tournament).
+- When saturated, the scan disappears (0 scan loads per acquisition in closed loop),
+  because the reset pre-check decides with one load. Scans cost the most at light and
+  moderate load, which is exactly where the hybrid is meant to win.
+
+Candidates to cut the release scan:
+1. Probe only the remembered slot on a fast release: 1 load, weaker fairness, no
+   layout change.
+2. Pack `present[]` densely so that one load reads several slots. This requires
+   sub-line writes (design §2 rule 3, Open; §5 partial-write test). Byte packing
+   would also break the one-8-byte-store invariant and introduce mixed-size accesses.
+   Expected saving at N=8: about 500 ns per hold.

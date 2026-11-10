@@ -21,3 +21,10 @@ docs/hybrid.md), so its capacity there is ~0.92M rather than ~1.04M.
   shows fairness 0.00 (fast-path winner starved by the server holding the SLOW side),
   and (d) in local mode shows 0.25 (fast-path monopoly). Both are fixed afterwards (fairness
   1.000); see docs/hybrid.md "Fairness fixes". The (d)/(e) rows predate those fixes.
+- `scale_closed_uc_n4n8.csv`: all five algorithms, closed loop, 4 and 8 nodes x 1 thread,
+  spin backoff 16, 3 interleaved reps, 2 s (0.2 s warmup). (c)/(e) with both server
+  placements (`server_place`: `next` = CPU N+n, `sibling` = SMT sibling of node n's
+  worker). Adds `scan_loads_per_acq` and `lamport_retries_per_acq`.
+- `load_uc_n8_all.csv`: all five algorithms at 8 nodes x 1 thread, Poisson 100k-1.5M
+  req/s, spin backoff 16, servers on SMT siblings, 3 interleaved reps. Workers use CPUs
+  0-7 (one per physical core); every server shares a core with its node's worker.

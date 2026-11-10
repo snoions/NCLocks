@@ -267,14 +267,51 @@ static void poll_trying(void)
     }
 }
 
+/* First SMT sibling of `cpu` other than itself (from sysfs), or -1. */
+static int smt_sibling(int cpu)
+{
+    char path[96], buf[64];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    int ok = fgets(buf, sizeof buf, f) != NULL;
+    fclose(f);
+    if (!ok)
+        return -1;
+    for (char *p = buf; *p;) {
+        char *end;
+        long a = strtol(p, &end, 10), b = a;
+        if (end == p)
+            break;
+        if (*end == '-')
+            b = strtol(end + 1, &end, 10);
+        for (long k = a; k <= b; k++)
+            if (k != cpu)
+                return (int)k;
+        p = *end ? end + 1 : end;
+    }
+    return -1;
+}
+
 static void *server_main(void *arg)
 {
     (void)arg;
     if (S.cfg.server_pin) {
         long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int cpu = (int)((S.N * S.cfg.threads_per_node + S.node) % ncpu);
+        if (S.cfg.server_pin == NCL_SRV_PIN_SIBLING) {
+            int w = (int)((S.node * S.cfg.threads_per_node) % ncpu);
+            int sib = smt_sibling(w);
+            if (sib < 0)
+                fprintf(stderr, "ncl: server %d: CPU %d has no SMT sibling; using CPU %d\n",
+                        S.node, w, cpu);
+            else
+                cpu = sib;
+        }
         cpu_set_t cs;
         CPU_ZERO(&cs);
-        CPU_SET((int)((S.N * S.cfg.threads_per_node + S.node) % ncpu), &cs);
+        CPU_SET(cpu, &cs);
         pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
     }
     struct ncl_backoff bo;

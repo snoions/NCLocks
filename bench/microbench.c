@@ -57,6 +57,7 @@ enum { H_LOCK, H_SERVICE, H_SOJOURN, H__COUNT };
 static const char *const h_names[] = {"lock", "service", "sojourn"};
 
 static int nnodes = 2, nthreads = 1, nlocks = 1, pin = 1, csv = 0;
+static int srv_place = NCL_SRV_PIN_NEXT;
 static double secs = 2.0, warmup = 0.2, rate = 0;
 static int arrival = ARR_CLOSED;
 static double onoff_period_us = 1000, onoff_frac = 0.1;
@@ -349,7 +350,9 @@ static void usage(const char *argv0)
             "  -S N        server idle poll backoff cap, pause iterations (server/fastsrv)\n"
             "  -M MODE     phase1 (default) | local (Phase 2a cohort passing)\n"
             "  -K CAP      local mode: max consecutive local handoffs (default 64)\n"
-            "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n",
+            "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n"
+            "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
+            "              (SMT sibling of node n's first worker)\n",
             argv0);
 }
 
@@ -358,7 +361,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq"
 
 int main(int argc, char **argv)
 {
@@ -368,7 +371,7 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:mCHPh")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:mCHPh")) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -394,6 +397,16 @@ int main(int argc, char **argv)
         case 'H': printf("%s\n", CSV_HEADER); return 0;
         case 'P': pin = 0; break;
         case 'S': cfg.server_backoff_cap = (unsigned)atoi(optarg); break;
+        case 'Y':
+            if (!strcmp(optarg, "next"))
+                srv_place = NCL_SRV_PIN_NEXT;
+            else if (!strcmp(optarg, "sibling"))
+                srv_place = NCL_SRV_PIN_SIBLING;
+            else {
+                fprintf(stderr, "-Y: next|sibling\n");
+                return 2;
+            }
+            break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;
         }
     }
@@ -420,7 +433,7 @@ int main(int argc, char **argv)
     cfg.nlocks = nlocks;
     cfg.data_size = stride * (size_t)nlocks;
     cfg.user_meta_lines = 1;
-    cfg.server_pin = pin;
+    cfg.server_pin = pin ? srv_place : NCL_SRV_PIN_NONE;
     if (ncl_sys_create(&cfg) < 0)
         return 2;
     for (int l = 0; l < nlocks; l++)
@@ -519,7 +532,7 @@ int main(int argc, char **argv)
 
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode == NCL_MODE_LOCAL ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -531,7 +544,10 @@ int main(int argc, char **argv)
                (unsigned long)hist_pct(hs, 0.999), (unsigned long)hist_pct(hj, 0.5),
                (unsigned long)hist_pct(hj, 0.99), (unsigned long)hist_pct(hj, 0.999),
                all_paths ? (double)fast / (double)all_paths : 0.0, ncl_mem.meta_memtype,
-               ncl_mem.meta_load_ns, fair);
+               ncl_mem.meta_load_ns, fair,
+               !pin ? "none" : srv_place == NCL_SRV_PIN_SIBLING ? "sibling" : "next",
+               all_paths ? (double)tot->base.split_scan_loads / (double)all_paths : 0.0,
+               all_paths ? (double)tot->base.lamport_retries / (double)all_paths : 0.0);
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",

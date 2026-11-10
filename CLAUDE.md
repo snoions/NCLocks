@@ -42,7 +42,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   `scripts/sweep_load.sh` sweeps offered load.
 - Phase 2a local handoff: `NCL_MODE_LOCAL` (`-M local`, cap `-K`), for all variants; see
   `docs/local_handoff.md`. `ncl_bench` reports per-node fairness (min/max completions) and
-  takes `-B` for the base algorithms' spin backoff cap. Always report fairness with
+  takes `-B` for the base algorithms' spin backoff cap and `-Y next|sibling` for (c)/(e)
+  server placement (sibling = SMT sibling of the node's worker; use it when servers must share
+  cores, e.g. N=8 on this 10-core host). Always report fairness with
   throughput: Lamport's throughput at the default backoff comes with severe starvation.
 - Not yet implemented: gate + owner handoff (Phase 2b), home migration/NACK (2c), partial-write
   stress test (§5), skewed/phased access, LiTL interposition, KV store.

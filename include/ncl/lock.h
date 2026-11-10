@@ -52,6 +52,8 @@ typedef enum {
     NCL_MODE_LOCAL = 2,
 } ncl_mode_t;
 
+enum { NCL_SRV_PIN_NONE = 0, NCL_SRV_PIN_NEXT = 1, NCL_SRV_PIN_SIBLING = 2 };
+
 struct ncl_sys_cfg {
     ncl_backend_t backend;
     ncl_alg_t alg;
@@ -66,7 +68,9 @@ struct ncl_sys_cfg {
     uint32_t dev_lat_ns;
     uintptr_t base_addr;
     /* SERVER/FASTSRV */
-    int server_pin;              /* pin node n's server to CPU (N*T + n) % ncpu */
+    int server_pin;              /* 0: unpinned; NCL_SRV_PIN_NEXT: node n's server on CPU
+                                    (N*T + n) % ncpu; NCL_SRV_PIN_SIBLING: on the SMT
+                                    sibling of CPU n*T (node n's first worker) */
     unsigned server_backoff_cap; /* idle poll backoff cap, pause iterations (0 = 1024) */
     /* Debug knobs to show the emulator catches protocol bugs. */
     int debug_skip_data_wb;
