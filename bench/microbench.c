@@ -548,9 +548,10 @@ int main(int argc, char **argv)
         if ((cfg.alg == NCL_ALG_HYBRID || cfg.alg == NCL_ALG_FASTSRV) && all_paths) {
             double A = (double)all_paths;
             printf("splitter: deflected door_closed=%.1f%% lost_race=%.1f%%  door_resets=%lu "
-                   "reset_skips=%lu present_loads/reset_check=%.2f\n",
+                   "reset_skips=%lu (precheck %lu) fenced_present_loads/check=%.2f\n",
                    100 * (double)b->split_fail_closed / A, 100 * (double)b->split_fail_lost / A,
                    (unsigned long)b->split_resets, (unsigned long)b->split_reset_skips,
+                   (unsigned long)b->split_precheck_skips,
                    b->split_resets + b->split_reset_skips
                        ? (double)b->split_scan_loads / (double)(b->split_resets + b->split_reset_skips)
                        : 0.0);

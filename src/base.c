@@ -46,6 +46,7 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines)
     b->alg = alg;
     b->P = P;
     b->leaves = pow2ceil(P);
+    b->reset_hint = -1;
     switch (alg) {
     case NCL_ALG_LAMPORT:
         b->lam = lines;
@@ -212,6 +213,19 @@ void ncl_present_clear(struct ncl_base *b, int i) { ncl_uc_store(SP_PRESENT(b, i
 
 void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st)
 {
+    /* Pre-check (optimization only): under contention some other node is
+     * almost always present, typically the one seen last time. One load, no
+     * fence, instead of door load + fence + scan. Skipping is always safe: it
+     * only leaves the fast path closed longer. */
+    int hint = b->reset_hint;
+    if (hint < 0 || hint == skip)
+        hint = skip >= 0 ? (skip + 1) % b->P : 0;
+    if (hint != skip && ncl_uc_load(SP_PRESENT(b, hint))) {
+        st->split_precheck_skips++;
+        st->split_reset_skips++;
+        return;
+    }
+
     if (ncl_uc_load(SP_DOOR(b)) != DOOR_CLOSED)
         return;
     /* door read before present[] reads: a node that read door == OPEN and is
@@ -226,6 +240,7 @@ void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_s
             continue;
         st->split_scan_loads++;
         if (ncl_uc_load(SP_PRESENT(b, j))) {
+            b->reset_hint = j;
             st->split_reset_skips++;
             return;
         }

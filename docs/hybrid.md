@@ -77,3 +77,72 @@ Raw data: `results/load_uc_n4_all.csv`.
   p99 is 590 us versus 12 us for (c). The queue drains and refills often, so
   the server repeatedly releases and reacquires the SLOW side, and grantees
   wait out fast-path holders. Under contention (e) is worse than plain (c) here.
+
+## Rejected: moving (d)'s reset check after `tournament_unlock`
+
+It looks attractive because it would take the check off the slow-to-slow
+handoff path, but it is **unsafe**. The tournament is what serializes
+resetters: with the design's order, a resetter's `door` read cannot be stale
+relative to another resetter's blind `door = OPEN` store. Moving the check
+after the unlock lets two checks overlap:
+
+1. s (slow releaser, tournament already released) reads `door == CLOSED`,
+   scans `present[]` and finds all 0, then stalls before `door = OPEN`.
+2. s2 sets `present[s2]` after s's scan has passed index s2, is deflected
+   (door still CLOSED), takes the tournament and top SLOW side, runs its CS,
+   releases, and starts its own check. It reads `door == CLOSED` (stale), and
+   its scan reads `present[f] == 0`.
+3. s writes `door = OPEN`, then clears `present[s]`.
+4. f sets `present[f]` after s2's scan has passed index f, sees OPEN, closes
+   the door, and wins the splitter.
+5. s2 reads `present[s] == 0`, finds all 0, and writes `door = OPEN` while f is
+   a fast winner.
+6. g sees OPEN, closes the door, and wins the splitter. f and g are now both on
+   the FAST side, which the top Peterson lock does not arbitrate.
+
+Stress testing is unlikely to hit this (it needs two well-placed delays); a
+model check of any reordering is mandatory.
+
+## Optimization: unfenced pre-check before the reset check (implemented)
+
+`ncl_splitter_reset_if_quiet` first reads one `present[]` slot (the one last
+seen set, kept in node-local `struct ncl_base::reset_hint`) with no fence. If it
+is set, the check is skipped. Skipping a reset is always safe: it only leaves
+the fast path closed longer. Otherwise the full check runs unchanged (door
+load, fence, every `present[j]` re-read), so the safety argument is untouched,
+and the check stays before `tournament_unlock`.
+
+A/B against `85e4956` (4 nodes x 1 thread, `uc`, 200 ns CS, interleaved runs):
+
+| | baseline | pre-check |
+|---|---|---|
+| closed-loop capacity (median of 5) | 0.899M [0.896-0.906] | **1.065M** [1.052-1.116] (+18%) |
+| 750k p50 / p99 / p99.9 | 1.2 / 41 / 139 us | 0.9 / **15** / **53** us |
+| 850k p50 / p99 | 5.6 / 147 us | **1.6 / 45** us |
+| 300k, 600k | unchanged | unchanged (p99 at 600k 12.8 -> 8.7 us) |
+
+Pre-check hit rate (checks it ends): ~100% saturated, 74% at 850k, 44% at
+300k. Fast-path share at 850k rose from 17% to 35%: handoffs are faster, so
+contention episodes end, and the door reopens, more often.
+
+**Tail at 800-900k (8 interleaved reps each; `results/precheck_ab_uc_n4.csv`):**
+
+| offered | version | p50 | p99 median [range] | p99.9 median [range] | max (median) | fast |
+|---|---|---|---|---|---|---|
+| 800k | baseline | 2.0 us | 70 us [61-102] | 172 us [139-229] | 284 us | 31% |
+| 800k | pre-check | 1.2 us | 22 us [22-31] | 242 us [61-557] | 587 us | 42% |
+| 850k | baseline | 7.0 us | 217 us [156-721] | 434 us [262-950] | 608 us | 14% |
+| 850k | pre-check | 1.5 us | 29 us [24-43] | 281 us [74-557] | 574 us | 36% |
+| 900k | baseline | 688 us | 57 ms (2.8% unserved: saturated) | 58 ms | 58 ms | 0% |
+| 900k | pre-check | 2.0 us | 44 us [37-55] | 356 us [90-655] | 647 us | 29% |
+
+p50 and p99 improve 2-5x in every run, and at 900k the baseline is saturated
+while the pre-check is not. p99.9 is **not** systematically worse (an earlier
+3-run sample suggested it was). It is better at 850k and 900k and overlaps at
+800k. What is real: the pre-check version has rare stalls of about 0.6 ms
+(max is about 0.6 ms in nearly every run, versus about 0.28 ms for the
+baseline at 800k), which makes its p99.9 bimodal across runs (60-90 us or
+500-650 us). Cause unknown. Candidates are the more frequent fast/slow
+alternation through the top Peterson lock (the fast share is 29-42% versus
+0-31%), or OS noise that now stands out against shorter queues. Next step if
+needed: per-path latency histograms in `ncl_bench`.

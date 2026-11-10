@@ -54,6 +54,9 @@ struct ncl_base {
     ncl_line_t *split; /* HYBRID/FASTSRV: [race, door, present[0..P-1]] */
     ncl_line_t *tree;  /* TOURNAMENT/HYBRID: 3 lines per internal node */
     ncl_line_t *top;   /* HYBRID/FASTSRV: [flag[FAST], flag[SLOW], turn] */
+    int reset_hint;    /* node-local: present[] index last seen set by a reset
+                          check (-1 = none); written only by the lock holder
+                          (or, for FASTSRV, the server) */
 };
 
 /* All fields are uint64_t counters (merged generically by ncl_base_stats_add). */
@@ -63,7 +66,8 @@ struct ncl_base_stats {
     uint64_t split_fail_lost;     /* splitter "down": race overwritten */
     uint64_t split_resets;        /* door reopened by a slow-path releaser */
     uint64_t split_reset_skips;   /* door CLOSED but some present[j] set */
-    uint64_t split_scan_loads;    /* present[] loads in reset checks */
+    uint64_t split_scan_loads;    /* present[] loads in reset checks (after the fence) */
+    uint64_t split_precheck_skips; /* reset checks skipped by the unfenced pre-check */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -94,7 +98,10 @@ int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st);
 /* door = OPEN (fast-path winner's reset). */
 void ncl_splitter_open(struct ncl_base *b);
 /* Reopen the door iff it is CLOSED and every present[j] (j != skip) is 0.
- * skip = -1 checks everyone. */
+ * skip = -1 checks everyone. First an unfenced pre-check of one likely-set
+ * present[] slot: if it is set, give up immediately (skipping a reset is
+ * always safe). Otherwise run the full fenced check, which re-reads every
+ * slot. */
 void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st);
 void ncl_present_clear(struct ncl_base *b, int i);
 
