@@ -36,8 +36,9 @@ static inline void ncl_sub_lock(struct ncl_submutex *m, struct ncl_qnode *q)
     struct ncl_qnode *prev = atomic_exchange_explicit(&m->tail, q, memory_order_acq_rel);
     if (prev) {
         atomic_store_explicit(&prev->next, q, memory_order_release);
+        unsigned spins = 0;
         while (atomic_load_explicit(&q->locked, memory_order_acquire))
-            ncl_cpu_relax();
+            ncl_spin_wait(&spins); /* predecessor may be preempted */
     }
     m->holder = q;
 }

@@ -21,8 +21,15 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
     behaves as uncached. Use it to check correctness.
   - `coherent`: baseline.
 - `include/ncl/submutex.h`: MCS submutex with local-waiter detection.
-- `include/ncl/base.h`, `src/base.c`: Lamport (a), tournament (b), hybrid (d). The hybrid
-  reset rule is in `docs/hybrid.md` and is **not model-checked**.
+- `include/ncl/base.h`, `src/base.c`: Lamport (a), tournament (b), hybrid (d) per design §4d
+  (race/door/present splitter, Aspnes reset), plus splitter and top-lock primitives shared
+  with (e).
+- `src/server.c`: lock servers (c) and fast-path server (e), Phase 1 (fixed home =
+  hash % N). Message and reply bit layouts are in `src/server.h`. Nodes must call
+  `ncl_node_detach()` (an all-nodes barrier) before servers stop. (d) and (e) are **not
+  model-checked**. Implementation notes and measurements: `docs/hybrid.md`.
+- Waits that depend on another thread (submutex handoff, server grants) spin and then
+  `sched_yield()`, so oversubscribed runs make progress.
 - `include/ncl/lock.h`, `src/lock.c`: two-level lock, Phase 1 mode only. `NCL_MODE_HANDOFF`
   is rejected for now. Includes the no-submutex ablation and full or precise data writeback.
 - `tests/stress.c`; `bench/microbench.c`: closed loop (default) or open loop (`-r RATE`, `-A
@@ -31,8 +38,8 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   window, and arrivals that never started are reported as `unserved` (= saturated).
   `bench/hist.h` is a log-linear histogram (<=6.25% overestimate). `-C`/`-H` give CSV, and
   `scripts/sweep_load.sh` sweeps offered load.
-- Not yet implemented: lock servers (c), gate + owner handoff (Phase 2), skewed/phased
-  access, LiTL interposition, KV store.
+- Not yet implemented: gate + owner handoff (Phase 2), home migration/NACK (2c), partial-write
+  stress test (§5), skewed/phased access, LiTL interposition, KV store.
 
 Emulated nodes are forked processes sharing a memfd mapped at a fixed VA
 (`MAP_FIXED_NOREPLACE`). Process-private memory is node-local memory.

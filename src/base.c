@@ -10,6 +10,9 @@ const char *const ncl_path_names[NCL_PATH__COUNT] = {
     [NCL_PATH_TOURNAMENT] = "tournament",
     [NCL_PATH_HYBRID_FAST] = "hybrid_fast",
     [NCL_PATH_HYBRID_SLOW] = "hybrid_slow",
+    [NCL_PATH_SERVER] = "server",
+    [NCL_PATH_FASTSRV_FAST] = "fastsrv_fast",
+    [NCL_PATH_FASTSRV_SLOW] = "fastsrv_slow",
 };
 
 static int pow2ceil(int n)
@@ -21,15 +24,18 @@ static int pow2ceil(int n)
 }
 
 static size_t lam_lines(int P) { return 2 + (size_t)P; }
+static size_t split_lines(int P) { return 2 + (size_t)P; }
 static size_t tree_lines(int P) { return 3 * (size_t)(pow2ceil(P) - 1); }
-static size_t top_lines(int P) { return 2 + (size_t)P; }
+static size_t top_lines(void) { return 3; }
 
 size_t ncl_base_nlines(ncl_alg_t alg, int P)
 {
     switch (alg) {
     case NCL_ALG_LAMPORT: return lam_lines(P);
     case NCL_ALG_TOURNAMENT: return tree_lines(P) ? tree_lines(P) : 1;
-    case NCL_ALG_HYBRID: return lam_lines(P) + tree_lines(P) + top_lines(P);
+    case NCL_ALG_HYBRID: return split_lines(P) + tree_lines(P) + top_lines();
+    case NCL_ALG_SERVER: return 0;
+    case NCL_ALG_FASTSRV: return split_lines(P) + top_lines();
     }
     return 0;
 }
@@ -48,18 +54,18 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines)
         b->tree = lines;
         break;
     case NCL_ALG_HYBRID:
-        b->lam = lines;
-        b->tree = lines + lam_lines(P);
+        b->split = lines;
+        b->tree = lines + split_lines(P);
         b->top = b->tree + tree_lines(P);
+        break;
+    case NCL_ALG_SERVER:
+        break;
+    case NCL_ALG_FASTSRV:
+        b->split = lines;
+        b->top = lines + split_lines(P);
         break;
     }
 }
-
-/* ---- (a) Lamport's fast mutex ------------------------------------------ */
-
-#define LAM_X(b) (&(b)->lam[0])
-#define LAM_Y(b) (&(b)->lam[1])
-#define LAM_B(b, i) (&(b)->lam[2 + (i)])
 
 static void await_eq(ncl_line_t *l, uint64_t v)
 {
@@ -68,6 +74,12 @@ static void await_eq(ncl_line_t *l, uint64_t v)
     while (ncl_uc_load(l) != v)
         ncl_backoff(&bo);
 }
+
+/* ---- (a) Lamport's fast mutex ------------------------------------------ */
+
+#define LAM_X(b) (&(b)->lam[0])
+#define LAM_Y(b) (&(b)->lam[1])
+#define LAM_B(b, i) (&(b)->lam[2 + (i)])
 
 static int lamport_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
@@ -116,16 +128,26 @@ static void lamport_unlock(struct ncl_base *b, int i)
 #define T_FLAG(b, k, s) (&(b)->tree[3 * ((k) - 1) + (s)])
 #define T_TURN(b, k) (&(b)->tree[3 * ((k) - 1) + 2])
 
-static void peterson_lock(ncl_line_t *flag_me, ncl_line_t *flag_other, ncl_line_t *turn,
-                          uint64_t side)
+static void peterson_announce(ncl_line_t *flag_me, ncl_line_t *turn, uint64_t side)
 {
     ncl_uc_store(flag_me, 1);
     ncl_fence_ss();
     ncl_uc_store(turn, side); /* "victim" convention */
     ncl_fence();
+}
+
+static int peterson_may_enter(ncl_line_t *flag_other, ncl_line_t *turn, uint64_t side)
+{
+    return !(ncl_uc_load(flag_other) && ncl_uc_load(turn) == side);
+}
+
+static void peterson_lock(ncl_line_t *flag_me, ncl_line_t *flag_other, ncl_line_t *turn,
+                          uint64_t side)
+{
+    peterson_announce(flag_me, turn, side);
     struct ncl_backoff bo;
     ncl_backoff_init(&bo);
-    while (ncl_uc_load(flag_other) && ncl_uc_load(turn) == side)
+    while (!peterson_may_enter(flag_other, turn, side))
         ncl_backoff(&bo);
 }
 
@@ -153,129 +175,115 @@ static void tournament_unlock_nofence(struct ncl_base *b, int i)
     }
 }
 
-/* ---- (d) Hybrid --------------------------------------------------------
- *
- * See docs/hybrid.md for the protocol and the (not yet model-checked)
- * argument for the splitter reset rule. Summary:
- *
- *   fast:  b[i]=1; x=i; F; y!=0 -> fail; y=i; F; x!=i -> fail
- *          winner: top Peterson side FAST, flag = fflag[i] (per participant)
- *   slow:  tournament, then top Peterson side SLOW (flag = sflag)
- *   fast release (holding top): y=0; b[i]=0; fflag[i]=0
- *   slow release (holding top): if y!=0 and all b[]==0 then y=0;
- *          sflag=0; tournament unlock
- */
+/* ---- splitter + top lock (shared by (d) and (e)) -------------------------
+ * Design §4d. race: 0 = none, else participant+1. door: OPEN = 0 (the
+ * zeroed initial state), CLOSED = 1. */
 
-#define TOP_SFLAG(b) (&(b)->top[0])
-#define TOP_TURN(b) (&(b)->top[1])
-#define TOP_FFLAG(b, i) (&(b)->top[2 + (i)])
-enum { SIDE_FAST = 0, SIDE_SLOW = 1 };
+#define SP_RACE(b) (&(b)->split[0])
+#define SP_DOOR(b) (&(b)->split[1])
+#define SP_PRESENT(b, i) (&(b)->split[2 + (i)])
+#define TOP_FLAG(b, s) (&(b)->top[(s)])
+#define TOP_TURN(b) (&(b)->top[2])
+enum { DOOR_OPEN = 0, DOOR_CLOSED = 1 };
 
-static int any_fflag(struct ncl_base *b, struct ncl_base_stats *st)
+int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
-    for (int j = 0; j < b->P; j++) {
-        st->hybrid_fflag_loads++;
-        if (ncl_uc_load(TOP_FFLAG(b, j)))
-            return 1;
+    const uint64_t me = (uint64_t)i + 1;
+    ncl_uc_store(SP_PRESENT(b, i), 1); /* visible before touching the splitter */
+    ncl_fence_ss();
+    ncl_uc_store(SP_RACE(b), me);
+    ncl_fence(); /* (1) */
+    if (ncl_uc_load(SP_DOOR(b)) == DOOR_CLOSED) {
+        st->split_fail_closed++; /* "right" */
+        return 0;
     }
-    return 0;
+    ncl_uc_store(SP_DOOR(b), DOOR_CLOSED);
+    ncl_fence(); /* (2) */
+    if (ncl_uc_load(SP_RACE(b)) != me) {
+        st->split_fail_lost++; /* "down" */
+        return 0;
+    }
+    return 1; /* "stop" */
 }
+
+void ncl_splitter_open(struct ncl_base *b) { ncl_uc_store(SP_DOOR(b), DOOR_OPEN); }
+
+void ncl_present_clear(struct ncl_base *b, int i) { ncl_uc_store(SP_PRESENT(b, i), 0); }
+
+void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st)
+{
+    if (ncl_uc_load(SP_DOOR(b)) != DOOR_CLOSED)
+        return;
+    /* door read before present[] reads: a node that read door == OPEN and is
+     * about to close it set present[] before its fence (1), so we see it. */
+    ncl_fence();
+    /* Start after `skip` so the scan spreads over nodes; early exit on the
+     * first set flag. Order doesn't affect safety: a reset requires all 0. */
+    int start = skip >= 0 ? skip + 1 : 0;
+    for (int k = 0; k < b->P; k++) {
+        int j = (start + k) % b->P;
+        if (j == skip)
+            continue;
+        st->split_scan_loads++;
+        if (ncl_uc_load(SP_PRESENT(b, j))) {
+            st->split_reset_skips++;
+            return;
+        }
+    }
+    ncl_fence();
+    ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
+    st->split_resets++;
+}
+
+void ncl_top_announce(struct ncl_base *b, int side)
+{
+    peterson_announce(TOP_FLAG(b, side), TOP_TURN(b), (uint64_t)side);
+}
+
+int ncl_top_may_enter(struct ncl_base *b, int side)
+{
+    return peterson_may_enter(TOP_FLAG(b, 1 - side), TOP_TURN(b), (uint64_t)side);
+}
+
+void ncl_top_lock(struct ncl_base *b, int side)
+{
+    peterson_lock(TOP_FLAG(b, side), TOP_FLAG(b, 1 - side), TOP_TURN(b), (uint64_t)side);
+    ncl_fence();
+}
+
+void ncl_top_unlock(struct ncl_base *b, int side) { ncl_uc_store(TOP_FLAG(b, side), 0); }
+
+/* ---- (d) Hybrid: splitter + tournament + top Peterson (design §4d) ------- */
 
 static int hybrid_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
-    const uint64_t me = (uint64_t)i + 1;
-    struct ncl_backoff bo;
-
-    /* Splitter fast path. */
-    ncl_uc_store(LAM_B(b, i), 1);
-    ncl_fence_ss();
-    ncl_uc_store(LAM_X(b), me);
-    ncl_fence();
-    uint64_t y = ncl_uc_load(LAM_Y(b));
-    if (y != 0) {
-        st->hybrid_fail_busy++;
-#ifdef NCL_DIAG
-        /* Approximate: b[] can change right after this read. */
-        if (y <= (uint64_t)b->P && ncl_uc_load(LAM_B(b, (int)y - 1)) == 0)
-            st->hybrid_fail_busy_stale++;
-#endif
-        goto fail;
+    if (ncl_splitter_enter(b, i, st)) {
+        ncl_top_lock(b, NCL_SIDE_FAST);
+        return NCL_PATH_HYBRID_FAST;
     }
-    ncl_uc_store(LAM_Y(b), me);
-    ncl_fence();
-    if (ncl_uc_load(LAM_X(b)) != me) {
-        st->hybrid_fail_lost++;
-        goto fail;
-    }
-
-    /* Won the splitter; b[i] stays 1 until release. */
-    ncl_uc_store(TOP_FFLAG(b, i), 1);
-    ncl_fence_ss();
-    ncl_uc_store(TOP_TURN(b), SIDE_FAST);
-    ncl_fence();
-    ncl_backoff_init(&bo);
-    while (ncl_uc_load(TOP_SFLAG(b)) && ncl_uc_load(TOP_TURN(b)) == SIDE_FAST)
-        ncl_backoff(&bo);
-    ncl_fence();
-    return NCL_PATH_HYBRID_FAST;
-
-fail:
-    ncl_uc_store(LAM_B(b, i), 0);
     tournament_lock(b, i);
-    ncl_uc_store(TOP_SFLAG(b), 1);
-    ncl_fence_ss();
-    ncl_uc_store(TOP_TURN(b), SIDE_SLOW);
-    ncl_fence();
-    ncl_backoff_init(&bo);
-    while (ncl_uc_load(TOP_TURN(b)) == SIDE_SLOW && any_fflag(b, st))
-        ncl_backoff(&bo);
-    ncl_fence();
+    ncl_top_lock(b, NCL_SIDE_SLOW);
     return NCL_PATH_HYBRID_SLOW;
 }
 
+/* Order follows design §4d exactly (Open: confirm against Aspnes §18.5.2 and
+ * model-check). */
 static void hybrid_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats *st)
 {
     ncl_fence();
     if (path == NCL_PATH_HYBRID_FAST) {
-        /* Clear splitter state while still holding the top lock, so no slow
-         * holder can run its reset concurrently. */
-        ncl_uc_store(LAM_Y(b), 0);
+        ncl_top_unlock(b, NCL_SIDE_FAST);
         ncl_fence_ss();
-        ncl_uc_store(LAM_B(b, i), 0);
-        ncl_fence_ss();
-        ncl_uc_store(TOP_FFLAG(b, i), 0);
-        return;
-    }
-
-    /* Slow holder: reset a stale splitter (y set, nobody won it). Safe only
-     * if no fast attempt is in flight and no fast winner exists, i.e. every
-     * b[j] == 0; otherwise skip and leave it to a later slow holder. */
-    uint64_t y = ncl_uc_load(LAM_Y(b));
-    if (y != 0) {
+        ncl_splitter_open(b); /* fast-path winner resets the splitter */
+    } else {
+        ncl_top_unlock(b, NCL_SIDE_SLOW);
         ncl_fence();
-        /* Start at y's writer: if y belongs to a live fast winner (the common
-         * case) its b[] is set and one load decides the skip. Reading order
-         * does not affect safety: a reset still requires every b[j] == 0. */
-        int first = y <= (uint64_t)b->P ? (int)y - 1 : 0;
-        int clear = 1;
-        for (int k = 0; k < b->P && clear; k++) {
-            int j = first + k < b->P ? first + k : first + k - b->P;
-            st->hybrid_scan_loads++;
-            if (ncl_uc_load(LAM_B(b, j)))
-                clear = 0;
-        }
-        if (clear) {
-            ncl_fence();
-            ncl_uc_store(LAM_Y(b), 0);
-            st->hybrid_resets++;
-        } else {
-            st->hybrid_reset_skips++;
-        }
+        ncl_splitter_reset_if_quiet(b, i, st); /* door CLOSED && all other present == 0 */
+        ncl_fence_ss();
+        tournament_unlock_nofence(b, i);
     }
     ncl_fence_ss();
-    ncl_uc_store(TOP_SFLAG(b), 0);
-    ncl_fence_ss();
-    tournament_unlock_nofence(b, i);
+    ncl_present_clear(b, i);
 }
 
 /* ---- dispatch ----------------------------------------------------------- */
@@ -286,6 +294,8 @@ int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     case NCL_ALG_LAMPORT: return lamport_lock(b, i, st);
     case NCL_ALG_TOURNAMENT: tournament_lock(b, i); return NCL_PATH_TOURNAMENT;
     case NCL_ALG_HYBRID: return hybrid_lock(b, i, st);
+    case NCL_ALG_SERVER:
+    case NCL_ALG_FASTSRV: break; /* handled in src/server.c */
     }
     return -1;
 }
@@ -296,6 +306,8 @@ void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats 
     case NCL_ALG_LAMPORT: lamport_unlock(b, i); break;
     case NCL_ALG_TOURNAMENT: ncl_fence(); tournament_unlock_nofence(b, i); break;
     case NCL_ALG_HYBRID: hybrid_unlock(b, i, path, st); break;
+    case NCL_ALG_SERVER:
+    case NCL_ALG_FASTSRV: break;
     }
 }
 
@@ -305,6 +317,8 @@ const char *ncl_alg_name(ncl_alg_t a)
     case NCL_ALG_LAMPORT: return "lamport";
     case NCL_ALG_TOURNAMENT: return "tournament";
     case NCL_ALG_HYBRID: return "hybrid";
+    case NCL_ALG_SERVER: return "server";
+    case NCL_ALG_FASTSRV: return "fastsrv";
     }
     return "?";
 }
@@ -314,6 +328,8 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out)
     if (!strcmp(s, "lamport") || !strcmp(s, "a")) *out = NCL_ALG_LAMPORT;
     else if (!strcmp(s, "tournament") || !strcmp(s, "b")) *out = NCL_ALG_TOURNAMENT;
     else if (!strcmp(s, "hybrid") || !strcmp(s, "d")) *out = NCL_ALG_HYBRID;
+    else if (!strcmp(s, "server") || !strcmp(s, "c")) *out = NCL_ALG_SERVER;
+    else if (!strcmp(s, "fastsrv") || !strcmp(s, "e")) *out = NCL_ALG_FASTSRV;
     else return -1;
     return 0;
 }

@@ -30,7 +30,7 @@ Rules:
 
 1. **One aligned 8-byte store per message/state update.** Never rely on 64-byte line writes being atomic at the device. Anything a reader must see consistently (e.g. payload + sequence number) fits in one 8-byte word.
 2. **Cached multi-writer variables get their own cache line.** A writeback writes the whole line and can overwrite another node's data. (Applies to anything kept in a cached mapping.)
-3. **Uncached slots may be packed densely only if the device correctly handles partial (sub-line) writes.** **Open:** verify against the device/emulator; default to one slot per line until verified.
+3. **Uncached slots may be packed densely only if the device correctly handles partial (sub-line) writes.** **Open:** verify against the device/emulator with the partial-write stress test (Section 5); default to one slot per line until verified. If packed, no node may map those lines as cacheable.
 4. **Explicit fences** wherever uncached and cached accesses are mixed, and between a store and a subsequent load that must observe ordering (Dekker-style patterns). Do not rely on memory-type ordering alone.
 5. **Protected data** is written back when the global lock leaves a node and invalidated when it arrives. Support two modes: full writeback/invalidate (conservative) and precise dirty-range hints supplied by the caller (used by the KV store). Write back eagerly, as soon as the lock is known to be leaving the node.
 6. **Read-mostly metadata** (e.g. the lock-to-home map in the lock-server variant) stays cached and is refreshed only when a reply indicates it is stale (NACK with version). Because different nodes may update different entries concurrently, **each entry gets its own cache line**, and the writer issues a writeback + fence after updating it.
@@ -153,10 +153,64 @@ Acquire climbs leaf to root; release unlocks root to leaf (release writes can sh
 
 ### (d) Hybrid (fourth variant, Decided)
 
-Lamport-style fast path; on contention, fall back to the tournament. Construction: the fast-path winner and the tournament winner compete in a final two-party Peterson lock at the top.
+A splitter fast path, a tournament slow path, and a final two-party Peterson lock between them. This is the standard fast-path composition from the mutual-exclusion literature, with the splitter-reset rule taken from Aspnes, *Notes on Theory of Distributed Systems*, §18.5.2 (arXiv:2001.04235).
+
+**Components (all variables in the uncached metadata region):**
+
+- Splitter: `race` (node ID or none) and `door` (`OPEN`/`CLOSED`, initially `OPEN`).
+- `present[1..N]`: each node's presence flag, written only by that node.
+- Tournament over N nodes (Section 4b).
+- Top lock: two-party Peterson lock with a `FAST` side and a `SLOW` side.
+
+```
+acquire(i):
+    present[i] = 1
+    race = i
+    fence                              # (1)
+    if door == CLOSED: goto slow       # splitter: "right"
+    door = CLOSED
+    fence                              # (2)
+    if race != i: goto slow            # splitter: "down"
+    path = FAST                        # splitter: "stop" (at most one node)
+    peterson_lock(top, FAST)
+    goto cs
+slow:
+    path = SLOW
+    tournament_lock(i)
+    peterson_lock(top, SLOW)
+cs:
+    # critical section (or gate body)
+
+release(i):
+    fence
+    if path == FAST:
+        peterson_unlock(top, FAST)
+        door = OPEN                    # fast-path winner resets the splitter
+    else:
+        peterson_unlock(top, SLOW)
+        # Reset the splitter only if no node can be on the fast path:
+        # door is CLOSED and every other present[j] is 0.
+        if door == CLOSED and all(present[j] == 0 for j != i):
+            door = OPEN
+        tournament_unlock(i)
+    present[i] = 0
+```
+
+- **Why the top lock is needed:** the splitter admits at most one fast-path winner and the tournament admits at most one slow-path winner, but nothing else stops one of each from entering together.
+- **Why the reset rule is needed:** if every splitter contender is deflected, nobody wins the fast path, so no fast-path winner exists to reopen `door`. A slow-path node may reopen it only when it can be sure no node is on, or about to take, the fast path. Every node sets `present[i]` before touching the splitter, so a node that is about to take the fast path is visible. Under sustained contention the fast path stays closed (by design); the last slow-path node to leave reopens it.
+- **No restarts anywhere:** every node either wins the splitter once or goes to the tournament, so starvation-freedom follows from the tournament and the top Peterson lock.
+- **Open:** the exact order of the reset check relative to `tournament_unlock` and clearing `present[i]` must follow the source precisely; model-check it under the memory rules.
+- **Cost:** uncontended fast path ≈ 3 round trips (splitter fences (1) and (2), plus the top Peterson lock). Slow path ≈ tournament (⌈log₂N⌉) + 1 for the top lock. Slow-path release adds a scan of `present[]`, whose cost depends on layout:
+
+| `present[]` layout | Lines | Scan cost |
+|---|---|---|
+| Uncached, one slot per line (default) | N | ~N serialized round trips (uncached loads don't overlap) |
+| Cached, one slot per line (each writer writes back + fences after updating its own line) | N | ~1 round trip + N invalidates (loads overlap) |
+| Uncached, densely packed, e.g. one byte per node (only if partial writes are verified, Section 2 rule 3) | 1 | ~1–2 reads |
 
 - Record in node-local lock state which path was taken (needed at release, and for thread-obliviousness).
-- **Open:** resetting the fast-path variables when the fast path fails without anyone winning it (e.g. `y` left non-zero) needs a careful rule. Specify it, then model-check before benchmarking. *Proposed rule (implemented, not yet model-checked): `docs/hybrid.md`.*
+- **Possible optimization (Open, only if measurements warrant):** overlap the top-lock writes with the splitter's second fence so the fast path costs ≈ 2 round trips. The fast side of the top lock must stay owned by the unique splitter winner; a deflected node must never touch it.
+- **Further reading if the slow-path release scan matters:** Anderson & Kim, "A new fast-path mechanism for mutual exclusion" (Distributed Computing, 2001), which keeps O(1) contention-free cost and O(log N) under contention; and Anderson, Kim & Herman, "Shared-memory mutual exclusion: major research trends since 1986" (survey, https://www.cs.unc.edu/~anderson/papers/survey.pdf).
 
 ### (c) Lock servers
 
@@ -185,10 +239,57 @@ Each lock has a **home node** whose background server thread grants it.
 - The lock-to-home map is read-mostly: cache it and refresh on NACK. Spread initial homes (e.g. hash of lock ID).
 - Servers poll incoming queues with adaptive backoff. Background poll traffic is O(N²) cluster-wide; measure it.
 
+### (e) Fast-path + lock-server hybrid (fifth variant)
+
+Same composition as (d), with the lock server of (c) replacing the tournament as the slow path.
+
+**Components:**
+
+- Splitter (`race`, `door`) and `present[1..N]`, as in (d).
+- Lock server, queues, and grant slots, as in (c).
+- Top lock: two-party Peterson lock with a `FAST` side and a `SLOW` side. **The `SLOW` side is held by the lock's server thread**, not by individual grantees, so only the server writes the slow side's variables.
+
+**Fast path (node i):** `present[i] = 1`; run the splitter as in (d); if it wins (`stop`), acquire the top lock's `FAST` side and enter. The server is not involved. On release: unlock the `FAST` side, set `door = OPEN`, clear `present[i]`.
+
+**Slow path (node i):** if the splitter deflects it, send a request to the lock's home server and wait for a grant in its grant slot (Section 4c). On release, clear `present[i]`, fence, then send the release message to the server. (If `present[i]` were cleared after the release message, the server's reset check could still see it set and leave the fast path closed until the next contended episode.)
+
+**Server:**
+
+```
+on request(r):
+    enqueue r
+    if not holding_slow:
+        peterson_lock(top, SLOW)       # waits out a fast-path holder, if any
+        holding_slow = true
+    if lock is free: grant(dequeue())
+
+on release:
+    if queue not empty:
+        grant(dequeue())               # contended handoff: no top-lock traffic
+    else:
+        peterson_unlock(top, SLOW)
+        holding_slow = false
+        # splitter reset: reopen the fast path only if no node can be on it
+        if door == CLOSED and all(present[j] == 0):
+            door = OPEN
+```
+
+- **Why the server owns the slow side:** contended handoffs go grantee to grantee through the server's queue without touching the top lock. The top lock is acquired once when contention starts and released once when the queue empties. The splitter-reset scan moves off the releasing node's critical path onto the server.
+- **Benefit over (c):** uncontended acquisitions bypass the server (≈ 3 round trips, no polling delay), so the server's poll backoff only affects contended acquisitions. The server can back off aggressively when idle, cutting background poll traffic and CPU.
+- **Benefit over (d):** contended behavior is (c)'s queue-based handoff with no tournament.
+- **When the fast path is not cheaper:** a request/grant to a busy, aggressively polling server (≈ 1 round trip + polling delays) can beat the fast path's ≈ 3 round trips. The fast path wins when the server is idle or backed off, i.e. the uncontended case.
+- **Overlap with home migration:** both make uncontended reacquisition cheap; migration is cheaper still when the home is local. Evaluate whether (e) still needs migration (Phase 2c).
+- **Open (unverified design, model-check before benchmarking):**
+  - the server acquiring and releasing the top lock's `SLOW` side while grantees come and go;
+  - the splitter-reset ordering relative to grantees clearing `present[i]` (a deflected node must stay visible in `present[]` until it no longer needs the slow path);
+  - NACK and home migration while the server holds the `SLOW` side (the side must move with, or be released before, a home change);
+  - interaction with local handoff (a node keeping a grant across its local waiters keeps the server's queue non-empty from the server's point of view).
+
 ## 5. Correctness verification
 
-- **Model checking** (e.g. GenMC, or TLA+ with an explicit model of writeback and invalidation): base algorithms under the memory rules; gate + owner field + announcements; hybrid fast-path reset; lock-server queues, grant slots, NACK/migration.
+- **Model checking** (e.g. GenMC, or TLA+ with an explicit model of writeback and invalidation): base algorithms under the memory rules; gate + owner field + announcements; hybrid (splitter + tournament + top Peterson, including the splitter-reset rule and its ordering); lock-server queues, grant slots, NACK/migration; (e) server ownership of the top lock's slow side and its splitter reset.
 - **Runtime stress tests:** each lock protects a counter and a checksum over shared data; inject random delays; check invariants after millions of acquisitions. Run per phase.
+- **Partial-write stress test:** nodes repeatedly write their own bytes/words within a shared uncached line while checking the other nodes' values. Gates the use of dense packing (Section 2 rule 3).
 
 ## 6. Evaluation plan
 
@@ -224,16 +325,16 @@ Interposition requirements: thread-to-slot mapping; protected-data writeback (in
 
 ### 6.4 Phases
 
-**Phase 1: base algorithms, no handoff.** Local submutex kept; base algorithm held across the critical section (Section 3.4); (c) with a fixed home, no migration, no local passing.
-Look for: the (a)/(b) crossover vs N and burstiness; whether (d) tracks the better of the two; (c) fixed-home latency; degradation under contention.
+**Phase 1: base algorithms, no handoff.** Local submutex kept; base algorithm held across the critical section (Section 3.4); (c) and (e) with a fixed home, no migration, no local passing.
+Look for: the (a)/(b) crossover vs N and burstiness; whether (d) tracks the better of the two; (c) fixed-home latency; (e) vs (c) uncontended latency and poll traffic as the server's poll backoff varies; degradation under contention.
 
-**Ablation: no local submutex.** Run right after Phase 1, reusing its code. Variants (a), (b), (d) sized for the total thread count. Sweep threads per node at fixed N; microbenchmarks plus one or two lock-sensitive apps. Skip (c) (without a submutex it needs per-thread queues, which is a different design). Purpose: show why the hierarchy is needed.
+**Ablation: no local submutex.** Run right after Phase 1, reusing its code. Variants (a), (b), (d) sized for the total thread count. Sweep threads per node at fixed N; microbenchmarks plus one or two lock-sensitive apps. Skip (c) and (e) (without a submutex they need per-thread queues, which is a different design). Purpose: show why the hierarchy is needed.
 
 **Phase 2: with handoff.**
 
-- **2a, local handoff only.** Sweep the local cap, threads per node, placement balance, and data footprint. For (c), the node keeps the grant across local waiters.
+- **2a, local handoff only.** Sweep the local cap, threads per node, placement balance, and data footprint. For (c) and (e), the node keeps the grant across local waiters.
 - **2b, local + cross-node handoff.** Gate + owner field. First measure uncontended cost vs Phase 1 (expected ≈ +1 round trip for the owner-field read). Sweep skew and burstiness. Measure release-to-next-start latency vs Phase 1, gate wait time, missed-announcement recoveries, and contention on the owner line.
-- **2c, (c)-specific.** Home migration; sweep the reassignment threshold with phased skew; compare one-hop vs two-hop handoff; check whether local handoff and migration overlap enough that one suffices.
+- **2c, (c)/(e)-specific.** Home migration; sweep the reassignment threshold with phased skew; compare one-hop vs two-hop handoff; check whether local handoff and migration overlap enough that one suffices; check whether (e)'s fast path makes migration unnecessary; sweep the server's idle poll backoff.
 
 ### 6.5 Baselines
 
@@ -254,11 +355,11 @@ Look for: the (a)/(b) crossover vs N and burstiness; whether (d) tracks the bett
 
 ### 6.7 Parameters to sweep
 
-Local handoff cap; reassignment threshold and migration window for (c); poll backoff caps; N; threads per node; injected latency.
+Local handoff cap; reassignment threshold and migration window for (c)/(e); server idle poll backoff for (c)/(e); poll backoff caps; N; threads per node; injected latency.
 
 ## 7. Future work
 
 - **Reader-writer locks.** E.g. per-node reader counters (single writer per node, so no multi-writer lines); writers take the global lock and scan the counters; readers on a node share the local submutex in read mode; each reading node invalidates protected data on acquire.
 - **Abortable locks.** Timeout/trylock semantics across all variants: withdrawing cleanly from the gate and base algorithms; for (c), handling grants that arrive after a request was abandoned (Section 4c).
 - **Partial failure tolerance.** A node crashing while holding the lock, or while inside the gate or a queue operation, must not block other nodes indefinitely. Likely ingredients: leases or epochs on ownership, failure detection, and recovery of base-algorithm state and in-flight queue slots.
- **Lease parking of idle global locks.** A node keeps an idle global lock under a short lease so local reacquisition is free. If pursued: all state changes stay on the owner node (node-local states `PARKED`/`HELD`/`RELEASING` via coherent CAS); release is triggered by a per-node timer and/or a poller watching announcements; the releasing agent writes back protected data before releasing.
+- **Lease parking of idle global locks.** A node keeps an idle global lock under a short lease so local reacquisition is free. If pursued: all state changes stay on the owner node (node-local states `PARKED`/`HELD`/`RELEASING` via coherent CAS); release is triggered by a per-node timer and/or a poller watching announcements; the releasing agent writes back protected data before releasing.

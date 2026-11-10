@@ -1,135 +1,79 @@
-# Hybrid (d): fast-path reset rule
+# Hybrid (d) and fast-path server (e): implementation notes
 
-Status: **Proposed, implemented in `src/base.c`, NOT model-checked.** Runtime
-stress passes. A mutant that resets the splitter without the `b[]` scan fails
-the stress test immediately, but that only shows the scan is necessary, not
-that the rule is sufficient. Model-check it before benchmarking (design §4d, §5).
+The protocols are specified in `design.md` §4d and §4e. That is the source of
+truth, and this file only records implementation choices and measurements.
+**Neither protocol is model-checked yet** (design §5).
 
-## Variables (all hot metadata, one per line)
+## History
 
-Participants `i = 0..P-1`, ids `me = i+1` (0 = empty).
+The first implementation of (d) (commit `ad9f252`..`4c6b0b6`) used a
+Lamport-style `x`/`y`/`b[]` splitter, a per-node `fflag[]` on the top lock's
+fast side, and a home-grown reset rule. On 2026-11-09 the design replaced it
+with the race/door/present splitter and the Aspnes §18.5.2 reset rule, and the
+code now follows the design. The old code and its measurements remain in git
+history. The main lesson carries over: in the old version, O(P) uncached scans
+on the slow path, especially one done while holding the lock, cost up to 50% of
+capacity at N=16.
 
-- Splitter: `x`, `y`, `b[i]`
-- Tournament: Peterson `flag[2]`, `turn` per internal tree node
-- Top two-party Peterson: `sflag` (slow side), `turn`, and **per-participant
-  `fflag[i]`** for the fast side. The fast side's "flag" is `OR_j fflag[j]`.
+## Implementation choices
 
-## Protocol
+- **Shared primitives** (`include/ncl/base.h`): `ncl_splitter_enter`,
+  `ncl_splitter_open`, `ncl_splitter_reset_if_quiet`, `ncl_present_clear` and
+  the top Peterson lock split into `announce` / `may_enter` / `unlock`. (d) and
+  (e) use the same code.
+- **Encoding:** `race` is 0 (none) or node+1. `door` is OPEN = 0, so the zeroed
+  metadata is the initial state, and CLOSED = 1. Each variable is on its own
+  uncached line (design §2 rule 3; dense packing awaits the partial-write test).
+- **Reset check:** `door` is read, then a fence, then `present[]`. A node that
+  read `door == OPEN` and is about to close it set `present[i]` before its
+  fence (1), so the check sees it. The scan starts after the caller's index and
+  stops at the first set flag. Reading order does not affect safety.
+- **(d) release order** follows the design pseudocode exactly. Fast path:
+  top unlock, `door = OPEN`, `present = 0`. Slow path: top unlock, reset
+  check, tournament unlock, `present = 0`. *Open:* confirm the order against
+  Aspnes and model-check it.
+- **(e) server's SLOW side** (`src/server.c`, `advance()`): the server
+  announces when a lock's queue becomes non-empty, then checks the Peterson
+  condition once per server round instead of spinning inline. That is the same
+  protocol, but a fast-path holder of one lock never stalls the server's other
+  locks. The server grants only while it holds the SLOW side. When a release
+  finds the queue empty, the server unlocks, fences, and runs the reset check
+  over all `present[]`, since the releaser cleared its own before sending REL.
 
-```
-acquire(i):
-    b[i]=1; ss; x=me; F
-    if y != 0:            goto slow
-    y=me; F
-    if x != me:           goto slow
-    # splitter won: b[i] stays 1 until release
-    fflag[i]=1; ss; turn=FAST; F
-    await !(sflag && turn==FAST)
-    path=FAST
-  slow:
-    b[i]=0
-    tournament_lock(i)
-    sflag=1; ss; turn=SLOW; F
-    await !(turn==SLOW && OR_j fflag[j])
-    path=SLOW
+## Measurements (4 nodes x 1 thread, `uc`, 200 ns CS, Poisson, 3 reps)
 
-release(i):                       # path read from node-local lock state
-  FAST:  F; y=0; ss; b[i]=0; ss; fflag[i]=0
-  SLOW:  F
-         if y != 0:                       # possibly stale splitter
-             F; if all b[j]==0: F; y=0    # reset; else skip
-         ss; sflag=0; ss; tournament_unlock(i)   # root to leaf
-```
+Raw data: `results/load_uc_n4_all.csv`.
 
-## Why each choice
-
-1. **Stale `y`.** A splitter round can end with nobody winning (`y != 0`, all
-   contenders failed `x == me`). Until `y` returns to 0 every fast attempt fails.
-   That is a liveness problem only.
-2. **Fast winner clears `y` and `b[i]` *before* `fflag[i]`.** While `fflag[i]=1`
-   it still holds the top lock, so no slow holder can run the reset at the same
-   time. If `y=0` were written after leaving the top lock, a slow holder could
-   read the old `y`, see `b[]` clear, and then blindly write `y=0` over a new
-   winner's `y`. That allows two simultaneous fast winners.
-3. **Per-participant `fflag`.** After the old winner writes `y=0`, a new fast
-   winner may arrive at the top lock before the old winner clears its flag.
-   With a single shared fast flag, the old winner's `flag=0` would erase the new
-   winner's `flag=1`. Separate flags avoid that. The slow side waits on their
-   OR, so Peterson's argument still holds: at most one fast-side process is ever
-   trying or in the CS, because the old one is only clearing state.
-4. **Reset only if every `b[j]==0`.** A fast winner keeps `b=1` until its
-   release, and an in-flight attempt has `b=1` from before it writes `x` until it
-   fails. So "all clear" means no winner exists and no attempt is between "read
-   `y==0`" and "write `y`". While `y` is stale, no new attempt can read `y==0`,
-   and the only other writers of `y=0` are fast releases (excluded by point 2)
-   and other slow resets (excluded because they need the top lock). So the
-   blind `y=0` store cannot overwrite a live value.
-5. **Skip, don't wait.** If some `b[j]` is set, the reset is skipped and a later
-   slow holder retries. Release never blocks on other nodes. Skips are counted
-   (`reset_skips`). In stress runs about 97% of stale-`y` observations skip,
-   because new attempts keep `b[j]` set briefly. If benchmarks show the fast
-   path staying disabled, revisit this.
-
-## Ordering assumption to verify
-
-Point 4 needs the RC11 fence pattern below to be forbidden. A delayed attempt
-`k` does `St b[k]=1; F; Ld y→0`. Later the reset sees the newer `y` in
-`Ld y→stale; F; Ld b[k]`. It must not then read `b[k]→0`. SC fences forbid this
-(psc includes `F; hb; fr; rf; hb; F`), and on x86 TSO it holds with `mfence`.
-Confirm under GenMC.
-
-## Cost
-
-Uncontended fast path: three serialized store-fence-load round trips (two
-splitter, one top Peterson). Lamport alone needs two. The slow path adds an
-O(P) `fflag` scan in the top wait and, on release, the O(P) `b[]` scan.
-
-## Performance findings (2026-11-09; `uc` backend, 1 host, 8 nodes x 1 thread, 200 ns CS)
-
-**Why the fast path fails.** Counters `hybrid_fail_busy`, `hybrid_fail_lost` and,
-with `-DNCL_DIAG=ON`, `hybrid_fail_busy_stale` show:
-
-| offered | fast | fail: `y != 0` on entry | ...of which stale `y` | fail: lost race |
-|---|---|---|---|---|
-| 250k | 83% | 13.4% | 1.5% | 3.3% |
-| 500k | 67% | 28.1% | 3.4% | 5.4% |
-| 750k | 51% | 43.9% | 3.7% | 5.6% |
-
-The fast path is almost always closed by a **live** fast holder, not by a stale
-splitter. The reset rule is not what limits hybrid. A splitter is a single-slot
-lane by design: while one node holds it, every other arrival takes the slow
-path.
-
-**What it costs.** Two O(P) scans of uncached lines sit on the slow path:
-
-1. *Release reset scan (held).* The original code scanned `b[0..P-1]` in order
-   while holding the lock. The scan now starts at `b[y-1]`, which belongs to the
-   live fast winner in the common case, so one load decides the skip. That gives
-   1.00 load per slow acquisition and raised closed-loop capacity from 0.90M to
-   1.04M req/s at N=8 and from 0.67M to 0.81M at N=16. Safety is unchanged: a
-   reset still requires every `b[j]` to read 0 after the fence, and only the
-   reading order changed.
-2. *Top-lock wait (handoff path).* The slow side must see every `fflag[j] == 0`
-   (or `turn` change) before entering. That is about 9.5 loads per slow
-   acquisition at N=8 and about 15 at N=16. A full P-load scan (8 x 81 ns) lands
-   on every fast-to-slow handoff. **Checking only `fflag[y-1]` is unsafe.** A
-   node that read `y == 0` before the winner wrote `y` can later overwrite `y`
-   with its own ID and then fail, so `y` does not reliably name the winner.
-   Shortening this needs a protocol change plus a proof or model check.
-   Candidates: an epoch-tagged single fast-owner word written only by the
-   current winner, or polling `turn` and rescanning only when it changes
-   (which helps waiting, not the final confirming scan).
-
-Capacity vs N (closed loop, no think time, Mreq/s; hybrid figures are before
-fix 1):
-
-| N | Lamport | Tournament | Hybrid |
+| | uncontended p50 (100k) | capacity | notes |
 |---|---|---|---|
-| 2 | 1.30 | 1.49 | 1.39 |
-| 4 | 1.33 | 1.61 | 1.12 |
-| 8 | 1.08 | 1.76 | 0.90 (1.04 after fix 1) |
-| 16 | 0.83 | 1.70 | 0.67 (0.81 after fix 1) |
+| Lamport | 383 ns | ~1.15M | huge tail near saturation |
+| Tournament | 431 ns | ~1.54M | best capacity |
+| Hybrid (d) | 543 ns | ~0.90M | fast path 0% at saturation |
+| Server (c) | 2.3 us (backoff 1024) | ~1.35M | p50 depends on server backoff |
+| Fast-server (e) | 543 ns | ~1.23M | p50 independent of server backoff |
 
-Even after fix 1, hybrid does not track the better of Lamport and tournament
-under contention (design §6.4). It beats Lamport's capacity but stays well below
-tournament's, and its uncontended latency (~500 ns) is between the two.
+- **(d) under contention** is slower than the tournament alone (0.90M vs
+  1.54M). Once contended, the door stays CLOSED (by design) and every
+  acquisition pays tournament + top lock + reset check. The reset check (a door
+  load, a fence, and at least one `present[]` load) runs *between* the top
+  unlock and the tournament unlock, so it lands on every slow-to-slow handoff.
+  Moving it after `tournament_unlock` would take it off the critical path, but
+  that is exactly the ordering the design marks Open, so it needs the model
+  check first.
+- **(e) vs (c), server idle backoff** (`-S`, 100k req/s):
+
+  | cap | (c) p50 / p99 | (e) p50 / p99 | (c) polls/s | (e) polls/s |
+  |---|---|---|---|---|
+  | 1 | 607 ns / 1.9 us | 543 ns / 1.7 us | 34.3M | 34.3M |
+  | 128 | 1.6 us / 5.4 us | 543 ns / 4.9 us | 6.3M | 3.8M |
+  | 1024 | 2.3 us / 30 us | 543 ns / 29 us | 3.4M | 0.76M |
+  | 8192 | 2.3 us / 31 us | 543 ns / 197 us | 3.1M | 0.37M |
+
+  This confirms the design's claim: (e)'s median does not depend on the
+  server's backoff, so its server can back off hard (4.5x less poll traffic at
+  the default cap). The cost lands on the ~7% of deflected acquisitions, which
+  meet a backed-off server, and shows up in p99.
+- **(e) at moderate contention** (1M req/s): the fast path is down to 8%, and
+  p99 is 590 us versus 12 us for (c). The queue drains and refills often, so
+  the server repeatedly releases and reacquires the SLOW side, and grantees
+  wait out fast-path holders. Under contention (e) is worse than plain (c) here.

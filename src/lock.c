@@ -1,4 +1,5 @@
 #include "ncl/lock.h"
+#include "server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,8 @@ struct ncl_hdr {
     ncl_off_t locks_off;  /* meta offset of first lock block */
     ncl_off_t user_off;   /* meta offset of user lines */
     ncl_off_t descs_off;  /* meta offset of struct ncl_lock_desc[nlocks] */
+    ncl_off_t done_off;   /* meta offset of per-node "done" lines (detach barrier) */
+    struct ncl_srv_layout srv; /* SERVER/FASTSRV queues and grant slots */
 };
 
 struct ncl_lock_desc {
@@ -40,6 +43,7 @@ static struct ncl_hdr *hdr;          /* in shared meta */
 static struct ncl_sys_cfg cfg;       /* node-local copy */
 static struct ncl_local_lock *local; /* node-local array [nlocks] */
 static int my_node = -1;
+static int is_server(void) { return cfg.alg == NCL_ALG_SERVER || cfg.alg == NCL_ALG_FASTSRV; }
 
 static size_t round_line(size_t n) { return (n + NCL_CACHELINE - 1) & ~(size_t)(NCL_CACHELINE - 1); }
 
@@ -58,6 +62,11 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         fprintf(stderr, "ncl: bad nnodes=%d / nlocks=%d\n", c->nnodes, c->nlocks);
         return -1;
     }
+    int server = c->alg == NCL_ALG_SERVER || c->alg == NCL_ALG_FASTSRV;
+    if (server && c->no_submutex) {
+        fprintf(stderr, "ncl: %s needs the local submutex (no ablation)\n", ncl_alg_name(c->alg));
+        return -1;
+    }
     int P = c->no_submutex ? c->nnodes * c->threads_per_node : c->nnodes;
     if (P < 1 || P > NCL_MAX_PARTICIPANTS) {
         fprintf(stderr, "ncl: %d participants exceeds NCL_MAX_PARTICIPANTS=%d\n", P,
@@ -70,10 +79,17 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     size_t descs_sz = round_line(sizeof(struct ncl_lock_desc) * (size_t)c->nlocks);
     size_t locks_sz = lines_per_lock * NCL_CACHELINE * (size_t)c->nlocks;
     size_t user_sz = c->user_meta_lines * NCL_CACHELINE;
+    size_t done_sz = (size_t)c->nnodes * NCL_CACHELINE;
+    ncl_off_t srv_off = hdr_sz + descs_sz + locks_sz + user_sz + done_sz;
+    struct ncl_srv_layout srv;
+    memset(&srv, 0, sizeof srv);
+    size_t srv_sz = 0;
+    if (server && !(srv_sz = ncl_srv_layout(c, &srv, srv_off)))
+        return -1;
 
     struct ncl_mem_cfg mc = {
         .backend = c->backend,
-        .meta_size = hdr_sz + descs_sz + locks_sz + user_sz,
+        .meta_size = srv_off + srv_sz,
         .data_size = c->data_size,
         .base_addr = c->base_addr,
         .dev_lat_ns = c->dev_lat_ns,
@@ -89,6 +105,8 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     hdr->descs_off = hdr_sz;
     hdr->locks_off = hdr_sz + descs_sz;
     hdr->user_off = hdr_sz + descs_sz + locks_sz;
+    hdr->done_off = hdr->user_off + user_sz;
+    hdr->srv = srv;
     ncl_fence();
     hdr->magic = NCL_MAGIC;
     ncl_fence();
@@ -153,7 +171,22 @@ int ncl_node_attach(int node_id)
         local[l].data = d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL;
         local[l].data_len = d[l].data_len;
     }
+    if (is_server() && ncl_srv_node_start(&cfg, &hdr->srv, node_id, blocks, hdr->lines_per_lock) < 0)
+        return -1;
     return 0;
+}
+
+static ncl_line_t *done_line(int n) { return (ncl_line_t *)ncl_meta_ptr(hdr->done_off) + n; }
+
+void ncl_node_detach(void)
+{
+    ncl_uc_store(done_line(my_node), 1);
+    ncl_fence();
+    for (int n = 0; n < cfg.nnodes; n++)
+        while (!ncl_uc_load(done_line(n)))
+            ncl_cpu_relax();
+    if (is_server())
+        ncl_srv_node_stop();
 }
 
 void ncl_thread_init(struct ncl_thread *t, int local_idx)
@@ -176,7 +209,15 @@ void ncl_acquire(struct ncl_thread *t, int lock)
     }
 
     struct ncl_base_stats tmp = {0};
-    int path = ncl_base_lock(&L->base, part, &tmp);
+    int path;
+    if (cfg.alg == NCL_ALG_SERVER) {
+        ncl_srv_acquire(t, lock);
+        path = NCL_PATH_SERVER;
+    } else if (cfg.alg == NCL_ALG_FASTSRV) {
+        path = ncl_fastsrv_acquire(t, lock, &L->base, &tmp);
+    } else {
+        path = ncl_base_lock(&L->base, part, &tmp);
+    }
 
     /* Global lock held: holder-only fields below. */
     L->path = path;
@@ -211,7 +252,12 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
         }
     }
 
-    ncl_base_unlock(&L->base, L->holder, L->path, &L->st.base);
+    if (cfg.alg == NCL_ALG_SERVER)
+        ncl_srv_release(lock);
+    else if (cfg.alg == NCL_ALG_FASTSRV)
+        ncl_fastsrv_release(lock, &L->base, L->path);
+    else
+        ncl_base_unlock(&L->base, L->holder, L->path, &L->st.base);
     if (!cfg.no_submutex)
         ncl_sub_unlock(&L->sub);
 }
@@ -236,4 +282,6 @@ void ncl_node_stats(struct ncl_node_stats *out)
             out->path[p] += s->path[p];
         ncl_base_stats_add(&out->base, &s->base);
     }
+    if (is_server())
+        ncl_srv_stats(&out->srv);
 }

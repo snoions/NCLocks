@@ -5,3 +5,4 @@ kmod/*.mod*
 kmod/.*.cmd
 kmod/Module.symvers
 kmod/modules.order
+*.swp

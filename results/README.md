@@ -8,3 +8,5 @@ docs/hybrid.md), so its capacity there is ~0.92M rather than ~1.04M.
 
 - `load_uc_n8_poisson.csv`: Poisson, 250k-1.75M req/s, 5 interleaved reps, 2 s (0.3 s warmup)
 - `burst_uc_n8.csv`: mean 250k/500k; poisson vs onoff 1 ms period, FRAC 0.5/0.25/0.1; 3 reps
+- `load_uc_n4_all.csv`: 4 nodes, all five algorithms (new (d) per design §4d, (c), (e));
+  Poisson 100k-2.5M req/s, 3 reps, 1.5 s (0.3 s warmup). Servers pinned to CPUs 4-7.

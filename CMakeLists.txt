@@ -9,7 +9,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(NCL_SANITIZE "Build with -fsanitize=address,undefined" OFF)
-option(NCL_DIAG "Extra diagnostic counters (adds uncached loads on slow paths)" OFF)
 set(NCL_MAX_NODES 16 CACHE STRING "Max nodes")
 set(NCL_MAX_PARTICIPANTS 256 CACHE STRING "Max global-algorithm participants")
 
@@ -24,14 +23,11 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(ncl STATIC src/mem.c src/base.c src/lock.c)
+add_library(ncl STATIC src/mem.c src/base.c src/lock.c src/server.c)
 target_include_directories(ncl PUBLIC include)
 target_compile_definitions(ncl PUBLIC
   NCL_MAX_NODES=${NCL_MAX_NODES} NCL_MAX_PARTICIPANTS=${NCL_MAX_PARTICIPANTS})
 target_link_libraries(ncl PUBLIC Threads::Threads)
-if(NCL_DIAG)
-  target_compile_definitions(ncl PRIVATE NCL_DIAG=1)
-endif()
 
 add_executable(ncl_stress tests/stress.c)
 target_link_libraries(ncl_stress ncl)
@@ -40,7 +36,7 @@ add_executable(ncl_bench bench/microbench.c)
 target_link_libraries(ncl_bench ncl m)
 
 enable_testing()
-foreach(alg lamport tournament hybrid)
+foreach(alg lamport tournament hybrid server fastsrv)
   foreach(be emu cached-flush coherent uc)
     add_test(NAME stress_${alg}_${be}
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 3 -i 20000)
@@ -51,8 +47,10 @@ foreach(alg lamport tournament hybrid)
       set_tests_properties(stress_${alg}_${be} PROPERTIES RESOURCE_LOCK ncl_uc_device)
     endif()
   endforeach()
-  add_test(NAME stress_${alg}_emu_nosub
-    COMMAND ncl_stress -a ${alg} -b emu -n 3 -t 3 -l 2 -i 10000 -m)
+  if(NOT alg MATCHES "server|fastsrv")  # (c)/(e) require the submutex
+    add_test(NAME stress_${alg}_emu_nosub
+      COMMAND ncl_stress -a ${alg} -b emu -n 3 -t 3 -l 2 -i 10000 -m)
+  endif()
   add_test(NAME stress_${alg}_emu_precise
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 2 -l 3 -i 20000 -H)
 endforeach()

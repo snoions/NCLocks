@@ -72,7 +72,8 @@ struct result {
     uint64_t offered;  /* arrivals scheduled in the measured window */
     uint64_t unserved; /* of those, never started before the end */
     uint64_t paths[NCL_PATH__COUNT];
-    struct ncl_base_stats base;
+    struct ncl_base_stats base; /* node-side + server-side splitter counters */
+    struct ncl_srv_stats srv;
     struct hist h[H__COUNT];
 };
 
@@ -265,10 +266,13 @@ static int node_main(int node, int wfd)
         for (int h = 0; h < H__COUNT; h++)
             hist_merge(&tot->h[h], &ws[i].r.h[h]);
     }
+    ncl_node_detach(); /* all nodes done; servers stopped */
     struct ncl_node_stats st;
     ncl_node_stats(&st);
     memcpy(tot->paths, st.path, sizeof tot->paths);
     tot->base = st.base;
+    ncl_base_stats_add(&tot->base, &st.srv.base);
+    tot->srv = st.srv;
 
     const char *p = (const char *)tot;
     size_t left = sizeof *tot;
@@ -331,7 +335,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [options]\n"
             "  -n N        nodes (default 2)            -t T   threads per node (default 1)\n"
-            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid\n"
+            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv\n"
             "  -b BACKEND  coherent|cached-flush|uc|emu (default cached-flush)\n"
             "  -L NS       injected device latency      -m     no submutex (ablation)\n"
             "  -s SECS     duration (default 2)         -W SECS warmup, not recorded (0.2)\n"
@@ -341,7 +345,8 @@ static void usage(const char *argv0)
             "  -A PROC     arrivals: poisson (default) | uniform | onoff:PERIOD_US:FRAC\n"
             "  -C          print one CSV row (see -H for the header)\n"
             "  -H          print the CSV header and exit\n"
-            "  -P          don't pin threads\n",
+            "  -P          don't pin threads\n"
+            "  -S N        server idle poll backoff cap, pause iterations (server/fastsrv)\n",
             argv0);
 }
 
@@ -360,7 +365,7 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:mCHPh")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:mCHPh")) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -382,6 +387,7 @@ int main(int argc, char **argv)
         case 'C': csv = 1; break;
         case 'H': printf("%s\n", CSV_HEADER); return 0;
         case 'P': pin = 0; break;
+        case 'S': cfg.server_backoff_cap = (unsigned)atoi(optarg); break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;
         }
     }
@@ -408,6 +414,7 @@ int main(int argc, char **argv)
     cfg.nlocks = nlocks;
     cfg.data_size = stride * (size_t)nlocks;
     cfg.user_meta_lines = 1;
+    cfg.server_pin = pin;
     if (ncl_sys_create(&cfg) < 0)
         return 2;
     for (int l = 0; l < nlocks; l++)
@@ -456,6 +463,12 @@ int main(int argc, char **argv)
         for (int p = 0; p < NCL_PATH__COUNT; p++)
             tot->paths[p] += nr->paths[p];
         ncl_base_stats_add(&tot->base, &nr->base);
+        {
+            uint64_t *d = (uint64_t *)&tot->srv;
+            const uint64_t *s = (const uint64_t *)&nr->srv;
+            for (size_t k = 0; k < sizeof tot->srv / sizeof(uint64_t); k++)
+                d[k] += s[k];
+        }
         for (int h = 0; h < H__COUNT; h++)
             hist_merge(&tot->h[h], &nr->h[h]);
         close(rfd[n]);
@@ -480,7 +493,8 @@ int main(int argc, char **argv)
     uint64_t all_paths = 0, fast = 0;
     for (int p = 0; p < NCL_PATH__COUNT; p++)
         all_paths += tot->paths[p];
-    fast = tot->paths[NCL_PATH_LAMPORT_FAST] + tot->paths[NCL_PATH_HYBRID_FAST];
+    fast = tot->paths[NCL_PATH_LAMPORT_FAST] + tot->paths[NCL_PATH_HYBRID_FAST] +
+           tot->paths[NCL_PATH_FASTSRV_FAST];
     const struct hist *hl = &tot->h[H_LOCK], *hs = &tot->h[H_SERVICE], *hj = &tot->h[H_SOJOURN];
     char arrdesc[64];
     if (arrival == ARR_ONOFF)
@@ -531,19 +545,29 @@ int main(int argc, char **argv)
                        100.0 * (double)tot->paths[p] / (double)all_paths);
         printf("\n");
         const struct ncl_base_stats *b = &tot->base;
-        if (cfg.alg == NCL_ALG_HYBRID && all_paths) {
+        if ((cfg.alg == NCL_ALG_HYBRID || cfg.alg == NCL_ALG_FASTSRV) && all_paths) {
             double A = (double)all_paths;
-            printf("hybrid: fail_busy=%.1f%% (stale=%.1f%%, needs NCL_DIAG) fail_lost=%.1f%% "
-                   "resets=%lu reset_skips=%lu\n"
-                   "hybrid: per slow acquisition: %.2f b[] loads in release scan (lock held), "
-                   "%.2f fflag[] loads in top wait\n",
-                   100 * (double)b->hybrid_fail_busy / A, 100 * (double)b->hybrid_fail_busy_stale / A,
-                   100 * (double)b->hybrid_fail_lost / A, (unsigned long)b->hybrid_resets,
-                   (unsigned long)b->hybrid_reset_skips,
-                   tot->paths[NCL_PATH_HYBRID_SLOW]
-                       ? (double)b->hybrid_scan_loads / (double)tot->paths[NCL_PATH_HYBRID_SLOW] : 0.0,
-                   tot->paths[NCL_PATH_HYBRID_SLOW]
-                       ? (double)b->hybrid_fflag_loads / (double)tot->paths[NCL_PATH_HYBRID_SLOW] : 0.0);
+            printf("splitter: deflected door_closed=%.1f%% lost_race=%.1f%%  door_resets=%lu "
+                   "reset_skips=%lu present_loads/reset_check=%.2f\n",
+                   100 * (double)b->split_fail_closed / A, 100 * (double)b->split_fail_lost / A,
+                   (unsigned long)b->split_resets, (unsigned long)b->split_reset_skips,
+                   b->split_resets + b->split_reset_skips
+                       ? (double)b->split_scan_loads / (double)(b->split_resets + b->split_reset_skips)
+                       : 0.0);
+        }
+        const struct ncl_srv_stats *v = &tot->srv;
+        if (cfg.alg == NCL_ALG_SERVER || cfg.alg == NCL_ALG_FASTSRV) {
+            /* each server round = one uncached load per source queue */
+            printf("servers: msgs=%lu grants=%lu queued=%lu errors=%lu  poll_rounds/s=%.0f "
+                   "(idle %.0f%%) queue_loads/s=%.0f",
+                   (unsigned long)v->msgs, (unsigned long)v->grants, (unsigned long)v->queued,
+                   (unsigned long)v->errors, (double)v->rounds / secs,
+                   v->rounds ? 100.0 * (double)v->idle_rounds / (double)v->rounds : 0.0,
+                   (double)v->rounds * nnodes / secs);
+            if (cfg.alg == NCL_ALG_FASTSRV)
+                printf("  top_slow_acquires=%lu top_polls=%lu", (unsigned long)v->top_acquires,
+                       (unsigned long)v->top_wait_polls);
+            printf("\n");
         }
     }
     ncl_sys_destroy();

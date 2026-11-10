@@ -166,13 +166,15 @@ static int node_main(int node)
         viol += ws[i].viol;
         ck += ws[i].cksum_err;
     }
+    ncl_node_detach(); /* all nodes done; servers stopped */
+    struct ncl_node_stats st;
+    ncl_node_stats(&st);
+    viol += st.srv.errors; /* server-detected protocol violations */
     ncl_uc_store(res_line(node, RES_ACQ), acq);
     ncl_uc_store(res_line(node, RES_VIOL), viol);
     ncl_uc_store(res_line(node, RES_CKSUM), ck);
     ncl_fence();
 
-    struct ncl_node_stats st;
-    ncl_node_stats(&st);
     printf("node %2d: acq=%lu viol=%lu cksum_err=%lu", node, (unsigned long)acq,
            (unsigned long)viol, (unsigned long)ck);
     for (int p = 0; p < NCL_PATH__COUNT; p++)
@@ -180,9 +182,17 @@ static int node_main(int node)
             printf(" %s=%lu", ncl_path_names[p], (unsigned long)st.path[p]);
     if (st.base.lamport_retries)
         printf(" lamport_retries=%lu", (unsigned long)st.base.lamport_retries);
-    if (st.base.hybrid_resets || st.base.hybrid_reset_skips)
-        printf(" hybrid_resets=%lu reset_skips=%lu", (unsigned long)st.base.hybrid_resets,
-               (unsigned long)st.base.hybrid_reset_skips);
+    struct ncl_base_stats sb = st.base;
+    ncl_base_stats_add(&sb, &st.srv.base);
+    if (sb.split_fail_closed || sb.split_fail_lost)
+        printf(" split_closed=%lu split_lost=%lu", (unsigned long)sb.split_fail_closed,
+               (unsigned long)sb.split_fail_lost);
+    if (sb.split_resets || sb.split_reset_skips)
+        printf(" door_resets=%lu reset_skips=%lu", (unsigned long)sb.split_resets,
+               (unsigned long)sb.split_reset_skips);
+    if (st.srv.msgs)
+        printf(" srv_msgs=%lu srv_errors=%lu top_acq=%lu", (unsigned long)st.srv.msgs,
+               (unsigned long)st.srv.errors, (unsigned long)st.srv.top_acquires);
     printf("\n");
     fflush(stdout);
     free(ws);
@@ -199,7 +209,7 @@ static void usage(const char *argv0)
             "  -i I          iterations per thread (default 100000)\n"
             "  -w W          data words per lock (default 16)\n"
             "  -d NS         max random delay in/out of CS, ns (default 200)\n"
-            "  -a ALG        lamport|tournament|hybrid (default lamport)\n"
+            "  -a ALG        lamport|tournament|hybrid|server|fastsrv (default lamport)\n"
             "  -b BACKEND    coherent|cached-flush|uc|emu (default emu)\n"
             "  -L NS         injected device latency, ns (default 0)\n"
             "  -m            ablation: no local submutex\n"
@@ -241,7 +251,7 @@ int main(int argc, char **argv)
         case 'L': cfg.dev_lat_ns = (uint32_t)atoi(optarg); break;
         case 'm': cfg.no_submutex = 1; break;
         case 'H': precise = 1; break;
-        case 'p': pin = 1; break;
+        case 'p': pin = 1; cfg.server_pin = 1; break;
         case 1: cfg.debug_skip_data_wb = 1; break;
         case 2: cfg.debug_skip_data_inv = 1; break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;

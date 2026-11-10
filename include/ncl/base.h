@@ -5,9 +5,13 @@
  *
  *   (a) LAMPORT     Lamport's fast mutex.
  *   (b) TOURNAMENT  Binary tree of two-party Peterson locks.
- *   (d) HYBRID      Splitter fast path + tournament fallback, joined by a top
- *                   two-party Peterson lock. The fast-path reset rule is
- *                   specified in docs/hybrid.md and is NOT yet model-checked.
+ *   (d) HYBRID      Splitter (race/door + present[]) fast path, tournament slow
+ *                   path, top two-party Peterson lock; splitter reset per
+ *                   design §4d (Aspnes §18.5.2). NOT yet model-checked.
+ *   (c) SERVER      Lock servers (src/server.c); no base-algorithm lines.
+ *   (e) FASTSRV     Splitter fast path + lock-server slow path; the server
+ *                   holds the top lock's SLOW side (src/server.c). NOT yet
+ *                   model-checked.
  *
  * Every variable is its own ncl_line_t. The per-lock block of lines is laid
  * out by ncl_base_nlines()/ncl_base_bind(); callers place it in the metadata
@@ -22,15 +26,20 @@ typedef enum {
     NCL_ALG_LAMPORT = 0,
     NCL_ALG_TOURNAMENT = 1,
     NCL_ALG_HYBRID = 2,
+    NCL_ALG_SERVER = 3,
+    NCL_ALG_FASTSRV = 4,
 } ncl_alg_t;
 
-/* Path taken by an acquisition (for stats and, for HYBRID, needed at release). */
+/* Path taken by an acquisition (stats; for HYBRID/FASTSRV also needed at release). */
 enum {
     NCL_PATH_LAMPORT_FAST = 0,
     NCL_PATH_LAMPORT_SLOW,     /* went through the b[] scan */
     NCL_PATH_TOURNAMENT,
     NCL_PATH_HYBRID_FAST,
     NCL_PATH_HYBRID_SLOW,
+    NCL_PATH_SERVER,
+    NCL_PATH_FASTSRV_FAST,     /* splitter winner, server not involved */
+    NCL_PATH_FASTSRV_SLOW,     /* deflected: request/grant via the server */
     NCL_PATH__COUNT,
 };
 
@@ -39,25 +48,22 @@ extern const char *const ncl_path_names[NCL_PATH__COUNT];
 /* Process-local view of one lock's base-algorithm state. */
 struct ncl_base {
     ncl_alg_t alg;
-    int P;          /* participants */
-    int leaves;     /* tournament leaves: next power of two >= P */
-    ncl_line_t *lam;  /* LAMPORT/HYBRID: [x, y, b[0..P-1]] */
-    ncl_line_t *tree; /* TOURNAMENT/HYBRID: 3 lines per internal node */
-    ncl_line_t *top;  /* HYBRID: [sflag, turn, fflag[0..P-1]] */
+    int P;             /* participants */
+    int leaves;        /* tournament leaves: next power of two >= P */
+    ncl_line_t *lam;   /* LAMPORT: [x, y, b[0..P-1]] */
+    ncl_line_t *split; /* HYBRID/FASTSRV: [race, door, present[0..P-1]] */
+    ncl_line_t *tree;  /* TOURNAMENT/HYBRID: 3 lines per internal node */
+    ncl_line_t *top;   /* HYBRID/FASTSRV: [flag[FAST], flag[SLOW], turn] */
 };
 
 /* All fields are uint64_t counters (merged generically by ncl_base_stats_add). */
 struct ncl_base_stats {
-    uint64_t hybrid_resets;       /* stale splitter reset by a slow holder */
-    uint64_t hybrid_reset_skips;  /* stale splitter seen but b[] not clear */
     uint64_t lamport_retries;     /* Lamport `goto start` taken */
-    uint64_t hybrid_fail_busy;    /* fast path failed: y != 0 on entry */
-    uint64_t hybrid_fail_lost;    /* fast path failed: lost splitter race (x != me) */
-    uint64_t hybrid_scan_loads;   /* b[] loads in slow-release reset scans (held) */
-    uint64_t hybrid_fflag_loads;  /* fflag[] loads in slow-side top-lock waits */
-    /* NCL_DIAG builds only (one extra uncached load per busy failure): */
-    uint64_t hybrid_fail_busy_stale; /* ...and y's writer had b[] == 0, i.e. no
-                                        fast winner or attempt behind it */
+    uint64_t split_fail_closed;   /* splitter "right": door already CLOSED */
+    uint64_t split_fail_lost;     /* splitter "down": race overwritten */
+    uint64_t split_resets;        /* door reopened by a slow-path releaser */
+    uint64_t split_reset_skips;   /* door CLOSED but some present[j] set */
+    uint64_t split_scan_loads;    /* present[] loads in reset checks */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -72,10 +78,31 @@ static inline void ncl_base_stats_add(struct ncl_base_stats *d, const struct ncl
 size_t ncl_base_nlines(ncl_alg_t alg, int P);
 void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines);
 
-/* Acquire as participant i; returns the NCL_PATH_* taken. */
+/* LAMPORT/TOURNAMENT/HYBRID only. Acquire as participant i; returns the
+ * NCL_PATH_* taken. Release with the value ncl_base_lock returned. */
 int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st);
-/* Release as participant i; `path` is the value returned by ncl_base_lock. */
 void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats *st);
+
+/* ---- primitives shared by HYBRID and FASTSRV ----------------------------- */
+
+enum { NCL_SIDE_FAST = 0, NCL_SIDE_SLOW = 1 };
+
+/* present[i] = 1, then run the splitter. Returns 1 on "stop" (at most one
+ * winner), 0 if deflected. present[i] stays set either way; the caller
+ * clears it at release. */
+int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st);
+/* door = OPEN (fast-path winner's reset). */
+void ncl_splitter_open(struct ncl_base *b);
+/* Reopen the door iff it is CLOSED and every present[j] (j != skip) is 0.
+ * skip = -1 checks everyone. */
+void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st);
+void ncl_present_clear(struct ncl_base *b, int i);
+
+/* Top two-party Peterson lock, split so a polling server can run it. */
+void ncl_top_announce(struct ncl_base *b, int side); /* flag[side]=1; turn=side; fence */
+int ncl_top_may_enter(struct ncl_base *b, int side); /* !(flag[other] && turn == side) */
+void ncl_top_lock(struct ncl_base *b, int side);     /* announce + wait */
+void ncl_top_unlock(struct ncl_base *b, int side);   /* flag[side]=0 */
 
 const char *ncl_alg_name(ncl_alg_t a);
 int ncl_alg_parse(const char *s, ncl_alg_t *out);
@@ -85,12 +112,13 @@ extern unsigned ncl_backoff_cap;
 
 struct ncl_backoff { unsigned cur; };
 static inline void ncl_backoff_init(struct ncl_backoff *bo) { bo->cur = 1; }
-static inline void ncl_backoff(struct ncl_backoff *bo)
+static inline void ncl_backoff_capped(struct ncl_backoff *bo, unsigned cap)
 {
     for (unsigned k = 0; k < bo->cur; k++)
         ncl_cpu_relax();
-    if (bo->cur < ncl_backoff_cap)
+    if (bo->cur < cap)
         bo->cur <<= 1;
 }
+static inline void ncl_backoff(struct ncl_backoff *bo) { ncl_backoff_capped(bo, ncl_backoff_cap); }
 
 #endif

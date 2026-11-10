@@ -33,4 +33,24 @@ static inline void ncl_cpu_relax(void)
 #endif
 }
 
+/* Spin-then-yield for waits that depend on ANOTHER thread making progress
+ * (submutex handoff, lock-server grants). Pure spinning starves that thread
+ * when CPUs are oversubscribed (e.g. a server thread needed for every grant
+ * gets a CFS timeslice only every few ms). sched_yield() returns immediately
+ * when nothing else is runnable. */
+#ifndef NCL_SPIN_BEFORE_YIELD
+#define NCL_SPIN_BEFORE_YIELD 1024 /* pause iterations, ~40 us on recent x86 */
+#endif
+
+#include <sched.h>
+static inline void ncl_spin_wait(unsigned *n)
+{
+    if (*n < NCL_SPIN_BEFORE_YIELD) {
+        (*n)++;
+        ncl_cpu_relax();
+    } else {
+        sched_yield();
+    }
+}
+
 #endif
