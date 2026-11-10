@@ -29,13 +29,20 @@ struct ncl_lock_desc {
 /* Node-local per-lock state (ordinary coherent memory, design §2 table).
  * Fields other than `sub` are written only by the current holder, so the
  * state needed at release lives with the lock, not in the thread. */
+#define NCL_DIRTY_MAX 16
+
 struct ncl_local_lock {
     struct ncl_submutex sub;
     struct ncl_base base;
-    int path;            /* path taken by the current holder */
-    int holder;          /* participant index of the current holder */
+    int path;            /* global path taken when the lock arrived at this node */
+    int holder;          /* participant index used for the global acquisition */
+    int global_held;     /* MODE_LOCAL: node owns the global lock (passed locally) */
+    int handoffs;        /* consecutive local handoffs in the current run */
     void *data;
     size_t data_len;
+    /* MODE_LOCAL precise hints accumulated over a local run */
+    int ndirty, dirty_full;
+    struct ncl_range dirty[NCL_DIRTY_MAX];
     struct ncl_node_stats st;
 } NCL_ALIGNED(NCL_CACHELINE);
 
@@ -49,13 +56,31 @@ static size_t round_line(size_t n) { return (n + NCL_CACHELINE - 1) & ~(size_t)(
 
 const char *ncl_mode_name(ncl_mode_t m)
 {
-    return m == NCL_MODE_PHASE1 ? "phase1" : m == NCL_MODE_HANDOFF ? "handoff" : "?";
+    switch (m) {
+    case NCL_MODE_PHASE1: return "phase1";
+    case NCL_MODE_LOCAL: return "local";
+    case NCL_MODE_HANDOFF: return "handoff";
+    }
+    return "?";
+}
+
+int ncl_mode_parse(const char *s, ncl_mode_t *out)
+{
+    if (!strcmp(s, "phase1")) *out = NCL_MODE_PHASE1;
+    else if (!strcmp(s, "local")) *out = NCL_MODE_LOCAL;
+    else if (!strcmp(s, "handoff")) *out = NCL_MODE_HANDOFF;
+    else return -1;
+    return 0;
 }
 
 int ncl_sys_create(const struct ncl_sys_cfg *c)
 {
-    if (c->mode != NCL_MODE_PHASE1) {
+    if (c->mode == NCL_MODE_HANDOFF) {
         fprintf(stderr, "ncl: mode %s not implemented yet\n", ncl_mode_name(c->mode));
+        return -1;
+    }
+    if (c->mode == NCL_MODE_LOCAL && c->no_submutex) {
+        fprintf(stderr, "ncl: local handoff needs the submutex (no ablation)\n");
         return -1;
     }
     if (c->nnodes < 1 || c->nnodes > NCL_MAX_NODES || c->nlocks < 1) {
@@ -208,6 +233,18 @@ void ncl_acquire(struct ncl_thread *t, int lock)
         part = my_node;
     }
 
+    /* Only meaningful under the submutex: in the ablation a thread gets here
+     * holding nothing and could see another thread's global_held. */
+    if (cfg.mode == NCL_MODE_LOCAL && L->global_held) {
+        /* Local handoff: the previous local holder passed us the submutex
+         * with the node still owning the global lock. Data is coherent
+         * within the node, so no invalidate. */
+        ncl_fence();
+        L->st.acquires++;
+        L->st.path[NCL_PATH_LOCAL_HANDOFF]++;
+        return;
+    }
+
     struct ncl_base_stats tmp = {0};
     int path;
     if (cfg.alg == NCL_ALG_SERVER) {
@@ -219,9 +256,14 @@ void ncl_acquire(struct ncl_thread *t, int lock)
         path = ncl_base_lock(&L->base, part, &tmp);
     }
 
-    /* Global lock held: holder-only fields below. */
+    /* Global lock held: holder-only fields below (they stay with the lock,
+     * not the thread, so any local thread can do the global release). */
     L->path = path;
     L->holder = part;
+    L->global_held = 1;
+    L->handoffs = 0;
+    L->ndirty = 0;
+    L->dirty_full = 0;
     L->st.acquires++;
     L->st.path[path]++;
     ncl_base_stats_add(&L->st.base, &tmp);
@@ -231,31 +273,78 @@ void ncl_acquire(struct ncl_thread *t, int lock)
         ncl_data_invalidate(L->data, L->data_len);
 }
 
+static void check_hint(const struct ncl_range *h)
+{
+    const char *p = h->p;
+    if (p < ncl_mem.data || p + h->len > ncl_mem.data + ncl_mem.data_size) {
+        fprintf(stderr, "ncl: dirty hint outside data region\n");
+        abort();
+    }
+}
+
+/* Remember this release's dirty ranges for the eventual global release. */
+static void accumulate_dirty(struct ncl_local_lock *L, const struct ncl_range *hints, int nhints)
+{
+    if (!hints) {
+        L->dirty_full = 1;
+        return;
+    }
+    for (int k = 0; k < nhints && !L->dirty_full; k++) {
+        check_hint(&hints[k]);
+        if (L->ndirty == NCL_DIRTY_MAX)
+            L->dirty_full = 1;
+        else
+            L->dirty[L->ndirty++] = hints[k];
+    }
+}
+
 void ncl_release(int lock, const struct ncl_range *hints, int nhints)
 {
     struct ncl_local_lock *L = &local[lock];
 
+    if (cfg.mode == NCL_MODE_LOCAL) {
+        accumulate_dirty(L, hints, nhints);
+        int cap = cfg.local_cap > 0 ? cfg.local_cap : 64;
+        if (ncl_sub_has_waiter(&L->sub)) {
+            if (L->handoffs < cap) {
+                /* Cohort pass: keep global ownership in the node. Fence so
+                 * this thread's uncached stores reach the device first. */
+                L->handoffs++;
+                ncl_fence();
+                ncl_sub_unlock(&L->sub);
+                return;
+            }
+            L->st.cap_releases++;
+        }
+    }
+
     /* Global lock leaving this node: write back eagerly (design §2 rule 5). */
     if (!cfg.debug_skip_data_wb) {
-        if (!hints) {
+        if (cfg.mode == NCL_MODE_LOCAL) {
+            if (L->dirty_full) {
+                if (L->data_len)
+                    ncl_data_writeback(L->data, L->data_len);
+            } else {
+                for (int k = 0; k < L->ndirty; k++)
+                    ncl_data_writeback(L->dirty[k].p, L->dirty[k].len);
+            }
+        } else if (!hints) {
             if (L->data_len)
                 ncl_data_writeback(L->data, L->data_len);
         } else {
             for (int k = 0; k < nhints; k++) {
-                const char *p = hints[k].p;
-                if (p < ncl_mem.data || p + hints[k].len > ncl_mem.data + ncl_mem.data_size) {
-                    fprintf(stderr, "ncl: dirty hint outside data region\n");
-                    abort();
-                }
-                ncl_data_writeback(p, hints[k].len);
+                check_hint(&hints[k]);
+                ncl_data_writeback(hints[k].p, hints[k].len);
             }
         }
     }
 
+    L->global_held = 0;
+    L->st.global_releases++;
     if (cfg.alg == NCL_ALG_SERVER)
         ncl_srv_release(lock);
     else if (cfg.alg == NCL_ALG_FASTSRV)
-        ncl_fastsrv_release(lock, &L->base, L->path);
+        ncl_fastsrv_release(lock, &L->base, L->path, &L->st.base);
     else
         ncl_base_unlock(&L->base, L->holder, L->path, &L->st.base);
     if (!cfg.no_submutex)
@@ -278,6 +367,8 @@ void ncl_node_stats(struct ncl_node_stats *out)
     for (int l = 0; l < cfg.nlocks; l++) {
         const struct ncl_node_stats *s = &local[l].st;
         out->acquires += s->acquires;
+        out->global_releases += s->global_releases;
+        out->cap_releases += s->cap_releases;
         for (int p = 0; p < NCL_PATH__COUNT; p++)
             out->path[p] += s->path[p];
         ncl_base_stats_add(&out->base, &s->base);

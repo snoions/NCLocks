@@ -190,6 +190,9 @@ static int node_main(int node)
     if (sb.split_resets || sb.split_reset_skips)
         printf(" door_resets=%lu reset_skips=%lu", (unsigned long)sb.split_resets,
                (unsigned long)sb.split_reset_skips);
+    if (st.global_releases != st.acquires)
+        printf(" global_releases=%lu cap_releases=%lu", (unsigned long)st.global_releases,
+               (unsigned long)st.cap_releases);
     if (st.srv.msgs)
         printf(" srv_msgs=%lu srv_errors=%lu top_acq=%lu", (unsigned long)st.srv.msgs,
                (unsigned long)st.srv.errors, (unsigned long)st.srv.top_acquires);
@@ -213,6 +216,8 @@ static void usage(const char *argv0)
             "  -b BACKEND    coherent|cached-flush|uc|emu (default emu)\n"
             "  -L NS         injected device latency, ns (default 0)\n"
             "  -m            ablation: no local submutex\n"
+            "  -M MODE       phase1|local (default phase1)\n"
+            "  -K CAP        local mode: max consecutive local handoffs (default 64)\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
             "  --skip-wb     DEBUG: skip data writeback (emu must fail)\n"
@@ -234,7 +239,7 @@ int main(int argc, char **argv)
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:mHph", lopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:mHph", lopts, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -250,6 +255,10 @@ int main(int argc, char **argv)
             break;
         case 'L': cfg.dev_lat_ns = (uint32_t)atoi(optarg); break;
         case 'm': cfg.no_submutex = 1; break;
+        case 'M':
+            if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; }
+            break;
+        case 'K': cfg.local_cap = atoi(optarg); break;
         case 'H': precise = 1; break;
         case 'p': pin = 1; cfg.server_pin = 1; break;
         case 1: cfg.debug_skip_data_wb = 1; break;

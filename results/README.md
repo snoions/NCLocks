@@ -12,3 +12,12 @@ docs/hybrid.md), so its capacity there is ~0.92M rather than ~1.04M.
   Poisson 100k-2.5M req/s, 3 reps, 1.5 s (0.3 s warmup). Servers pinned to CPUs 4-7.
 - `precheck_ab_uc_n4.csv`: hybrid (d) baseline (`85e4956`, ver=old) vs reset pre-check
   (ver=new), 4 nodes, Poisson 800k/850k/900k, 8 interleaved reps, 2 s (0.3 s warmup).
+- `local_uc_n4t2.csv`: Phase 1 vs Phase 2a local handoff (cap 64), all five algorithms,
+  4 nodes x 2 threads, closed loop + Poisson 1M/2M, 3 reps, default spin backoff (1024).
+  Predates the fairness column. Lamport numbers here are unfair (see docs/local_handoff.md).
+- `rebaseline_uc_n4.csv`: all five algorithms with fairness (`node_min_max_ratio`), spin
+  backoff 16 vs 1024; Phase 1 at 4x1 and local (cap 64) at 4x2; closed loop + Poisson
+  100k/1M; 3 reps. Fairness is meaningful only for saturated (closed-loop) rows. (e)
+  shows fairness 0.00 (fast-path winner starved by the server holding the SLOW side),
+  and (d) in local mode shows 0.25 (fast-path monopoly). Both are fixed afterwards (fairness
+  1.000); see docs/hybrid.md "Fairness fixes". The (d)/(e) rows predate those fixes.

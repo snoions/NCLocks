@@ -11,8 +11,22 @@
  *
  * Modes:
  *   NCL_MODE_PHASE1   base algorithm held across the critical section (§3.4).
- *   NCL_MODE_HANDOFF  gate + owner field + cohort passing (§3.2/3.3) — not
- *                     implemented yet; ncl_sys_create rejects it.
+ *   NCL_MODE_LOCAL    Phase 2a: Phase 1 plus local handoff (cohort passing,
+ *                     §3.2). On release, if another local thread is queued on
+ *                     the submutex and fewer than local_cap consecutive local
+ *                     handoffs have happened, the submutex AND global
+ *                     ownership pass to it: no global traffic, no data
+ *                     writeback/invalidate. Ownership belongs to the node, so
+ *                     any local thread may do the eventual global release.
+ *                     Applies to every variant; for SERVER/FASTSRV the node
+ *                     keeps the grant and the server hears only the final REL.
+ *   NCL_MODE_HANDOFF  Phase 2b: gate + owner field (§3.3) — not implemented
+ *                     yet; ncl_sys_create rejects it.
+ *
+ * Precise dirty hints under NCL_MODE_LOCAL: hints from every release in a
+ * local run are accumulated (node-local) and all written back when the lock
+ * leaves the node; overflow, or any release without hints, falls back to a
+ * full writeback of the lock's range.
  *
  * Ablation (cfg.no_submutex): no local submutex; the global algorithm is sized
  * for every thread and each thread is its own participant (§6.4). Not
@@ -35,6 +49,7 @@
 typedef enum {
     NCL_MODE_PHASE1 = 0,
     NCL_MODE_HANDOFF = 1,
+    NCL_MODE_LOCAL = 2,
 } ncl_mode_t;
 
 struct ncl_sys_cfg {
@@ -45,6 +60,7 @@ struct ncl_sys_cfg {
     int threads_per_node;   /* needed to size participants in ablation */
     int nlocks;
     int no_submutex;        /* ablation: each thread is a global participant */
+    int local_cap;          /* NCL_MODE_LOCAL: max consecutive local handoffs (0 = 64) */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
@@ -76,12 +92,15 @@ struct ncl_srv_stats {
     uint64_t msgs, rounds, idle_rounds, grants, queued, errors;
     uint64_t top_acquires;   /* FASTSRV: SLOW side of the top lock taken */
     uint64_t top_wait_polls; /* FASTSRV: polls of the top-lock condition */
+    uint64_t top_yields;     /* FASTSRV: SLOW side yielded to a waiting fast winner */
     struct ncl_base_stats base; /* FASTSRV: splitter resets done by the server */
 };
 
 /* Per-node statistics (node-local, summed over threads; approximate). */
 struct ncl_node_stats {
-    uint64_t acquires;
+    uint64_t acquires;          /* all acquisitions, incl. local handoffs */
+    uint64_t global_releases;   /* releases that let the lock leave the node */
+    uint64_t cap_releases;      /* ...of which forced by local_cap despite a waiter */
     uint64_t path[NCL_PATH__COUNT];
     struct ncl_base_stats base;
     struct ncl_srv_stats srv;
@@ -115,5 +134,6 @@ ncl_line_t *ncl_user_line(size_t i);
 void ncl_node_stats(struct ncl_node_stats *out);
 
 const char *ncl_mode_name(ncl_mode_t m);
+int ncl_mode_parse(const char *s, ncl_mode_t *out);
 
 #endif

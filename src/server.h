@@ -31,6 +31,12 @@
  * it homes, from when its queue becomes non-empty until it drains. The
  * Peterson wait is polled across server rounds rather than spun inline, so a
  * fast-path holder of one lock never stalls the server's other locks.
+ * Starvation fix (not in design §4e as first written): after at least one
+ * grant in the current hold, a release that leaves the queue non-empty while
+ * the FAST flag is set makes the server yield the SLOW side (unlock and
+ * re-announce) instead of granting, so a waiting fast winner gets its turn.
+ * Without this, sustained slow-path contention keeps the queue non-empty
+ * forever and the fast winner never enters.
  */
 #ifndef NCL_SERVER_H
 #define NCL_SERVER_H
@@ -65,7 +71,7 @@ void ncl_srv_release(int lock);
 /* (e): returns NCL_PATH_FASTSRV_FAST or _SLOW; release with that path. */
 int ncl_fastsrv_acquire(struct ncl_thread *t, int lock, struct ncl_base *b,
                         struct ncl_base_stats *st);
-void ncl_fastsrv_release(int lock, struct ncl_base *b, int path);
+void ncl_fastsrv_release(int lock, struct ncl_base *b, int path, struct ncl_base_stats *st);
 
 void ncl_srv_stats(struct ncl_srv_stats *out);
 

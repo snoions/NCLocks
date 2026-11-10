@@ -54,6 +54,19 @@ foreach(alg lamport tournament hybrid server fastsrv)
   add_test(NAME stress_${alg}_emu_precise
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 2 -l 3 -i 20000 -H)
 endforeach()
+# Phase 2a local handoff: precise-hint accumulation (-K 4 -H), overflow
+# fallback (-H), and cap-forced releases (-K 1).
+foreach(alg lamport tournament hybrid server fastsrv)
+  add_test(NAME stress_${alg}_emu_local
+    COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -H)
+  add_test(NAME stress_${alg}_emu_local_cap4
+    COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -K 4 -H)
+  add_test(NAME stress_${alg}_emu_local_cap1
+    COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -K 1)
+endforeach()
+add_test(NAME emu_detects_missing_writeback_local
+  COMMAND ncl_stress -a tournament -b emu -n 4 -t 3 -l 1 -i 5000 -M local --skip-wb)
+set_tests_properties(emu_detects_missing_writeback_local PROPERTIES WILL_FAIL TRUE)
 # The emulator must catch missing cache maintenance.
 add_test(NAME emu_detects_missing_writeback
   COMMAND ncl_stress -a lamport -b emu -n 4 -t 1 -l 1 -i 5000 --skip-wb)

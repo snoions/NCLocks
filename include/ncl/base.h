@@ -40,6 +40,7 @@ enum {
     NCL_PATH_SERVER,
     NCL_PATH_FASTSRV_FAST,     /* splitter winner, server not involved */
     NCL_PATH_FASTSRV_SLOW,     /* deflected: request/grant via the server */
+    NCL_PATH_LOCAL_HANDOFF,    /* MODE_LOCAL: submutex + global ownership passed in-node */
     NCL_PATH__COUNT,
 };
 
@@ -68,6 +69,7 @@ struct ncl_base_stats {
     uint64_t split_reset_skips;   /* door CLOSED but some present[j] set */
     uint64_t split_scan_loads;    /* present[] loads in reset checks (after the fence) */
     uint64_t split_precheck_skips; /* reset checks skipped by the unfenced pre-check */
+    uint64_t split_fast_keep_closed; /* fast winner left door CLOSED: others present */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -95,8 +97,15 @@ enum { NCL_SIDE_FAST = 0, NCL_SIDE_SLOW = 1 };
  * winner), 0 if deflected. present[i] stays set either way; the caller
  * clears it at release. */
 int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st);
-/* door = OPEN (fast-path winner's reset). */
+/* door = OPEN (the design's unconditional fast-winner reset; kept for reference). */
 void ncl_splitter_open(struct ncl_base *b);
+/* Fast-path winner i at release (fairness rule, see docs/hybrid.md): reopen
+ * the door only if no other node is present. Otherwise leave it CLOSED so the
+ * winner's node cannot immediately re-win while others wait on the slow path;
+ * the last slow-path releaser reopens it via ncl_splitter_reset_if_quiet.
+ * Skipping a reopen is always safe, and no other resetter can act while
+ * present[i] is still set, so this needs no door read. */
+void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_stats *st);
 /* Reopen the door iff it is CLOSED and every present[j] (j != skip) is 0.
  * skip = -1 checks everyone. First an unfenced pre-check of one likely-set
  * present[] slot: if it is set, give up immediately (skipping a reset is
@@ -110,6 +119,7 @@ void ncl_top_announce(struct ncl_base *b, int side); /* flag[side]=1; turn=side;
 int ncl_top_may_enter(struct ncl_base *b, int side); /* !(flag[other] && turn == side) */
 void ncl_top_lock(struct ncl_base *b, int side);     /* announce + wait */
 void ncl_top_unlock(struct ncl_base *b, int side);   /* flag[side]=0 */
+int ncl_top_other_flag(struct ncl_base *b, int side); /* flag[1-side] (one load) */
 
 const char *ncl_alg_name(ncl_alg_t a);
 int ncl_alg_parse(const char *s, ncl_alg_t *out);

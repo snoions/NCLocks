@@ -9,7 +9,7 @@ import argparse, csv, statistics, sys
 from collections import OrderedDict
 
 CONFIG = ["alg", "backend", "nodes", "threads_per_node", "locks", "cs_ns", "think_ns",
-          "footprint", "dev_lat_ns", "no_submutex", "arrival", "target_rps"]
+          "footprint", "dev_lat_ns", "no_submutex", "mode", "local_cap", "spin_backoff", "server_backoff", "arrival", "target_rps"]
 
 def fmt_ns(v):
     if v >= 1e6: return f"{v/1e6:.1f}ms"

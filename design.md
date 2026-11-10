@@ -185,7 +185,8 @@ release(i):
     fence
     if path == FAST:
         peterson_unlock(top, FAST)
-        door = OPEN                    # fast-path winner resets the splitter
+        if all(present[j] == 0 for j != i):   # fairness rule (see below); was: unconditional
+            door = OPEN                # fast-path winner resets the splitter
     else:
         peterson_unlock(top, SLOW)
         # Reset the splitter only if no node can be on the fast path:
@@ -199,6 +200,7 @@ release(i):
 - **Why the top lock is needed:** the splitter admits at most one fast-path winner and the tournament admits at most one slow-path winner, but nothing else stops one of each from entering together.
 - **Why the reset rule is needed:** if every splitter contender is deflected, nobody wins the fast path, so no fast-path winner exists to reopen `door`. A slow-path node may reopen it only when it can be sure no node is on, or about to take, the fast path. Every node sets `present[i]` before touching the splitter, so a node that is about to take the fast path is visible. Under sustained contention the fast path stays closed (by design); the last slow-path node to leave reopens it.
 - **No restarts anywhere:** every node either wins the splitter once or goes to the tournament, so starvation-freedom follows from the tournament and the top Peterson lock.
+- **Fairness rule for the fast-path winner's reset (added after measurement; model-check):** with an unconditional `door = OPEN`, the winner's node re-wins the splitter immediately (its next local thread, or the same thread in a closed loop), while deflected nodes wait on the slow path and never retry the splitter. The top Peterson lock alternates FAST and SLOW, so one node gets about 50% of all acquisitions (measured 4:2:1:1 at 4 nodes with local handoff). The winner therefore reopens only if no other node is present; otherwise the last slow-path releaser reopens it via the normal reset rule. Skipping a reopen is always safe, and no other resetter can act while `present[i]` is still set, so the check needs no `door` read. Cost: up to N−1 `present[]` loads on an uncontended fast release.
 - **Open:** the exact order of the reset check relative to `tournament_unlock` and clearing `present[i]` must follow the source precisely; model-check it under the memory rules.
 - **Cost:** uncontended fast path ≈ 3 round trips (splitter fences (1) and (2), plus the top Peterson lock). Slow path ≈ tournament (⌈log₂N⌉) + 1 for the top lock. Slow-path release adds a scan of `present[]`, whose cost depends on layout:
 
@@ -264,6 +266,9 @@ on request(r):
     if lock is free: grant(dequeue())
 
 on release:
+    if queue not empty and granted_since_acquire > 0 and flag[FAST]:
+        peterson_unlock(top, SLOW)     # starvation fix (see below): let the
+        peterson_lock(top, SLOW)       # waiting fast winner in, then resume
     if queue not empty:
         grant(dequeue())               # contended handoff: no top-lock traffic
     else:
@@ -274,6 +279,7 @@ on release:
             door = OPEN
 ```
 
+- **Starvation fix (added after measurement; model-check):** as first written, the server released the SLOW side only when its queue emptied. Under sustained slow-path contention the queue never empties, so a fast-path winner waiting at the top lock starved (measured: one node with zero completions). The server now yields the SLOW side between grants whenever `flag[FAST]` is set, after granting at least once in the current hold, so a stream of fast winners cannot starve the queue either.
 - **Why the server owns the slow side:** contended handoffs go grantee to grantee through the server's queue without touching the top lock. The top lock is acquired once when contention starts and released once when the queue empties. The splitter-reset scan moves off the releasing node's critical path onto the server.
 - **Benefit over (c):** uncontended acquisitions bypass the server (≈ 3 round trips, no polling delay), so the server's poll backoff only affects contended acquisitions. The server can back off aggressively when idle, cutting background poll traffic and CPU.
 - **Benefit over (d):** contended behavior is (c)'s queue-based handoff with no tournament.

@@ -346,16 +346,19 @@ static void usage(const char *argv0)
             "  -C          print one CSV row (see -H for the header)\n"
             "  -H          print the CSV header and exit\n"
             "  -P          don't pin threads\n"
-            "  -S N        server idle poll backoff cap, pause iterations (server/fastsrv)\n",
+            "  -S N        server idle poll backoff cap, pause iterations (server/fastsrv)\n"
+            "  -M MODE     phase1 (default) | local (Phase 2a cohort passing)\n"
+            "  -K CAP      local mode: max consecutive local handoffs (default 64)\n"
+            "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n",
             argv0);
 }
 
 #define CSV_HEADER                                                                         \
     "alg,backend,nodes,threads_per_node,locks,cs_ns,think_ns,footprint,dev_lat_ns,"        \
-    "no_submutex,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
+    "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio"
 
 int main(int argc, char **argv)
 {
@@ -365,7 +368,7 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:mCHPh")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:mCHPh")) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -384,6 +387,9 @@ int main(int argc, char **argv)
             arrival_given = 1;
             break;
         case 'm': cfg.no_submutex = 1; break;
+        case 'M': if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; } break;
+        case 'K': cfg.local_cap = atoi(optarg); break;
+        case 'B': ncl_backoff_cap = (unsigned)atoi(optarg); break;
         case 'C': csv = 1; break;
         case 'H': printf("%s\n", CSV_HEADER); return 0;
         case 'P': pin = 0; break;
@@ -449,6 +455,7 @@ int main(int argc, char **argv)
     ncl_fence();
 
     struct result *tot = calloc(1, sizeof *tot), *nr = malloc(sizeof *nr);
+    uint64_t node_done[NCL_MAX_NODES] = {0}; /* per-node completions: fairness */
     int bad = 0;
     for (int n = 0; n < nnodes; n++) {
         if (read_full(rfd[n], nr, sizeof *nr) < 0) {
@@ -458,6 +465,7 @@ int main(int argc, char **argv)
         }
         tot->ops += nr->ops;
         tot->completed += nr->completed;
+        node_done[n] = nr->completed;
         tot->offered += nr->offered;
         tot->unserved += nr->unserved;
         for (int p = 0; p < NCL_PATH__COUNT; p++)
@@ -490,6 +498,13 @@ int main(int argc, char **argv)
     double achieved = (double)tot->completed / window;
     double offered = arrival == ARR_CLOSED ? achieved : (double)tot->offered / window;
     double unserved = tot->offered ? (double)tot->unserved / (double)tot->offered : 0;
+    uint64_t nmin = UINT64_MAX, nmax = 0;
+    for (int n = 0; n < nnodes; n++) {
+        if (node_done[n] < nmin) nmin = node_done[n];
+        if (node_done[n] > nmax) nmax = node_done[n];
+    }
+    /* 1.0 = perfectly even across nodes; 0 = some node starved */
+    double fair = nmax ? (double)nmin / (double)nmax : 1.0;
     uint64_t all_paths = 0, fast = 0;
     for (int p = 0; p < NCL_PATH__COUNT; p++)
         all_paths += tot->paths[p];
@@ -503,10 +518,12 @@ int main(int argc, char **argv)
         snprintf(arrdesc, sizeof arrdesc, "%s", arr_names[arrival]);
 
     if (csv) {
-        printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f\n",
+        printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
-               cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, arrdesc, rate, offered,
+               cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
+               cfg.mode == NCL_MODE_LOCAL ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
+               cfg.server_backoff_cap ? cfg.server_backoff_cap : 1024, arrdesc, rate, offered,
                achieved, unserved, hist_mean(hl), (unsigned long)hist_pct(hl, 0.5),
                (unsigned long)hist_pct(hl, 0.9), (unsigned long)hist_pct(hl, 0.99),
                (unsigned long)hist_pct(hl, 0.999), (unsigned long)hl->max, hist_mean(hs),
@@ -514,11 +531,11 @@ int main(int argc, char **argv)
                (unsigned long)hist_pct(hs, 0.999), (unsigned long)hist_pct(hj, 0.5),
                (unsigned long)hist_pct(hj, 0.99), (unsigned long)hist_pct(hj, 0.999),
                all_paths ? (double)fast / (double)all_paths : 0.0, ncl_mem.meta_memtype,
-               ncl_mem.meta_load_ns);
+               ncl_mem.meta_load_ns, fair);
     } else {
-        printf("alg=%s backend=%s mode=phase1%s nodes=%d threads/node=%d locks=%d cs=%uns "
+        printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
-               ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend),
+               ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), ncl_mode_name(cfg.mode),
                cfg.no_submutex ? "+no_submutex" : "", nnodes, nthreads, nlocks, cs_ns, footprint,
                cfg.dev_lat_ns, secs, warmup);
         printf("mem: %s\n", ncl_mem_describe());
@@ -538,6 +555,10 @@ int main(int argc, char **argv)
                    (unsigned long)hist_pct(x, 0.99), (unsigned long)hist_pct(x, 0.999),
                    (unsigned long)x->max);
         }
+        printf("per-node completions (min/max = %.3f):", fair);
+        for (int n = 0; n < nnodes; n++)
+            printf(" %lu", (unsigned long)node_done[n]);
+        printf("\n");
         printf("paths:");
         for (int p = 0; p < NCL_PATH__COUNT; p++)
             if (tot->paths[p])
@@ -548,10 +569,10 @@ int main(int argc, char **argv)
         if ((cfg.alg == NCL_ALG_HYBRID || cfg.alg == NCL_ALG_FASTSRV) && all_paths) {
             double A = (double)all_paths;
             printf("splitter: deflected door_closed=%.1f%% lost_race=%.1f%%  door_resets=%lu "
-                   "reset_skips=%lu (precheck %lu) fenced_present_loads/check=%.2f\n",
+                   "reset_skips=%lu (precheck %lu) fast_kept_closed=%lu present_loads/check=%.2f\n",
                    100 * (double)b->split_fail_closed / A, 100 * (double)b->split_fail_lost / A,
                    (unsigned long)b->split_resets, (unsigned long)b->split_reset_skips,
-                   (unsigned long)b->split_precheck_skips,
+                   (unsigned long)b->split_precheck_skips, (unsigned long)b->split_fast_keep_closed,
                    b->split_resets + b->split_reset_skips
                        ? (double)b->split_scan_loads / (double)(b->split_resets + b->split_reset_skips)
                        : 0.0);
@@ -566,8 +587,9 @@ int main(int argc, char **argv)
                    v->rounds ? 100.0 * (double)v->idle_rounds / (double)v->rounds : 0.0,
                    (double)v->rounds * nnodes / secs);
             if (cfg.alg == NCL_ALG_FASTSRV)
-                printf("  top_slow_acquires=%lu top_polls=%lu", (unsigned long)v->top_acquires,
-                       (unsigned long)v->top_wait_polls);
+                printf("  top_slow_acquires=%lu top_polls=%lu top_yields=%lu",
+                       (unsigned long)v->top_acquires, (unsigned long)v->top_wait_polls,
+                       (unsigned long)v->top_yields);
             printf("\n");
         }
     }

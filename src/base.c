@@ -13,6 +13,7 @@ const char *const ncl_path_names[NCL_PATH__COUNT] = {
     [NCL_PATH_SERVER] = "server",
     [NCL_PATH_FASTSRV_FAST] = "fastsrv_fast",
     [NCL_PATH_FASTSRV_SLOW] = "fastsrv_slow",
+    [NCL_PATH_LOCAL_HANDOFF] = "local_handoff",
 };
 
 static int pow2ceil(int n)
@@ -209,6 +210,25 @@ int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st)
 
 void ncl_splitter_open(struct ncl_base *b) { ncl_uc_store(SP_DOOR(b), DOOR_OPEN); }
 
+void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    /* Start at the slot last seen set: under contention one load decides. */
+    int start = b->reset_hint >= 0 && b->reset_hint != i ? b->reset_hint : (i + 1) % b->P;
+    for (int k = 0; k < b->P; k++) {
+        int j = (start + k) % b->P;
+        if (j == i)
+            continue;
+        st->split_scan_loads++;
+        if (ncl_uc_load(SP_PRESENT(b, j))) {
+            b->reset_hint = j;
+            st->split_fast_keep_closed++;
+            return; /* leave CLOSED: someone is on the slow path */
+        }
+    }
+    ncl_fence(); /* scan before the store (load->store order, explicit) */
+    ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
+}
+
 void ncl_present_clear(struct ncl_base *b, int i) { ncl_uc_store(SP_PRESENT(b, i), 0); }
 
 void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st)
@@ -268,6 +288,8 @@ void ncl_top_lock(struct ncl_base *b, int side)
 
 void ncl_top_unlock(struct ncl_base *b, int side) { ncl_uc_store(TOP_FLAG(b, side), 0); }
 
+int ncl_top_other_flag(struct ncl_base *b, int side) { return ncl_uc_load(TOP_FLAG(b, 1 - side)) != 0; }
+
 /* ---- (d) Hybrid: splitter + tournament + top Peterson (design §4d) ------- */
 
 static int hybrid_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
@@ -288,8 +310,8 @@ static void hybrid_unlock(struct ncl_base *b, int i, int path, struct ncl_base_s
     ncl_fence();
     if (path == NCL_PATH_HYBRID_FAST) {
         ncl_top_unlock(b, NCL_SIDE_FAST);
-        ncl_fence_ss();
-        ncl_splitter_open(b); /* fast-path winner resets the splitter */
+        ncl_fence();
+        ncl_splitter_open_unless_others(b, i, st); /* fairness rule (was: unconditional) */
     } else {
         ncl_top_unlock(b, NCL_SIDE_SLOW);
         ncl_fence();

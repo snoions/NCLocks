@@ -100,6 +100,7 @@ struct srv_lock {
     struct waiter q[NCL_MAX_NODES];
     /* (e) only */
     int slow;    /* SLOW_*: state of the top lock's SLOW side */
+    int grants_this_hold; /* grants since the SLOW side was last acquired */
     int in_trying;
     struct ncl_base b;
 };
@@ -154,6 +155,7 @@ static void grant_next(struct srv_lock *sl)
     sl->qn--;
     sl->held = 1;
     sl->holder = wt.node;
+    sl->grants_this_hold++;
     ncl_fence(); /* the message(s) / top-lock reads that allow this grant come first */
     ncl_uc_store(grant_slot(wt.node, wt.gslot), reply_encode(sl->lock, REPLY_GRANT, wt.reqid));
     S.st.grants++;
@@ -181,7 +183,24 @@ static void advance(struct srv_lock *sl)
                 return;
             }
             sl->slow = SLOW_HOLDING;
+            sl->grants_this_hold = 0;
             S.st.top_acquires++;
+        }
+        /* Starvation fix: yield to a waiting fast winner between grants, but
+         * only after granting at least once in this hold (else a stream of
+         * fast winners could starve the queue instead). */
+        if (sl->slow == SLOW_HOLDING && !sl->held && sl->qn && sl->grants_this_hold > 0 &&
+            ncl_top_other_flag(&sl->b, NCL_SIDE_SLOW)) {
+            ncl_fence();
+            ncl_top_unlock(&sl->b, NCL_SIDE_SLOW);
+            S.st.top_yields++;
+            ncl_top_announce(&sl->b, NCL_SIDE_SLOW); /* turn = SLOW: fast goes first */
+            sl->slow = SLOW_TRYING;
+            if (!sl->in_trying) {
+                sl->in_trying = 1;
+                S.trying[S.ntrying++] = (int)(sl - S.slocks);
+            }
+            return;
         }
     }
     if (!sl->held && sl->qn) {
@@ -375,13 +394,13 @@ int ncl_fastsrv_acquire(struct ncl_thread *t, int lock, struct ncl_base *b,
     return NCL_PATH_FASTSRV_SLOW;
 }
 
-void ncl_fastsrv_release(int lock, struct ncl_base *b, int path)
+void ncl_fastsrv_release(int lock, struct ncl_base *b, int path, struct ncl_base_stats *st)
 {
     ncl_fence();
     if (path == NCL_PATH_FASTSRV_FAST) {
         ncl_top_unlock(b, NCL_SIDE_FAST);
-        ncl_fence_ss();
-        ncl_splitter_open(b);
+        ncl_fence();
+        ncl_splitter_open_unless_others(b, S.node, st); /* fairness rule */
         ncl_fence_ss();
         ncl_present_clear(b, S.node);
     } else {

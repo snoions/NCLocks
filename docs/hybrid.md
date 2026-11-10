@@ -146,3 +146,30 @@ baseline at 800k), which makes its p99.9 bimodal across runs (60-90 us or
 alternation through the top Peterson lock (the fast share is 29-42% versus
 0-31%), or OS noise that now stands out against shorter queues. Next step if
 needed: per-path latency histograms in `ncl_bench`.
+
+## Fairness fixes (implemented; design §4d/§4e updated; not model-checked)
+
+The re-baseline with per-node fairness (`results/rebaseline_uc_n4.csv`) found:
+
+1. **(e) starvation.** The server held the top lock's SLOW side until its queue
+   emptied, which never happens under sustained contention, so a node that had
+   won the splitter waited forever (closed loop: one node with 0
+   completions). Fix (`src/server.c`, `advance()`): between grants, if
+   `flag[FAST]` is set and at least one grant was made in this hold, unlock
+   and re-announce the SLOW side (turn = SLOW, so the fast winner goes first).
+   Exercised in open loop: 247 yields at 500k and 553 at 900k, with max
+   latency 51-66 us (before: p99 590 us at 1M).
+2. **(d)/(e) fast-path monopoly.** The fast winner reopened the door
+   unconditionally, so its own node re-won while everyone else sat on the slow
+   path. Top-Peterson alternation gave that node about 50%, and its absence
+   from the tournament gave its leaf sibling 25%: completions split 4:2:1:1.
+   Fix: `ncl_splitter_open_unless_others` reopens only if no other
+   `present[j]` is set. After both fixes, fairness is 1.000 for (d) and (e) in
+   both modes.
+
+Cost of fix 2 (uc, 4 nodes, versus `45a3225`): acquire p50 is unchanged
+(543 ns). Hold time (sojourn p50) is +250-320 ns from the N−1 = 3 extra loads on
+a lone fast release. The fast-path share falls (hybrid 94 -> 91% at 100k and
+82 -> 73% at 300k; (e) 76 -> 49% at 300k, so its p50 rises from 575 ns to
+1.0 us). A cheaper variant would probe only the remembered slot (1 load), at
+the cost of weaker fairness.
