@@ -352,7 +352,9 @@ static void usage(const char *argv0)
             "  -K CAP      local mode: max consecutive local handoffs (default 64)\n"
             "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n"
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
-            "              (SMT sibling of node n's first worker)\n",
+            "              (SMT sibling of node n's first worker)\n"
+            "  -F MODE     (d)/(e) fast-release reopen check: hint (only the slot last seen\n"
+            "              set, default) | scan (all present[])\n",
             argv0);
 }
 
@@ -361,7 +363,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release"
 
 int main(int argc, char **argv)
 {
@@ -371,7 +373,7 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:mCHPh")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:mCHPh")) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -393,6 +395,16 @@ int main(int argc, char **argv)
         case 'M': if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; } break;
         case 'K': cfg.local_cap = atoi(optarg); break;
         case 'B': ncl_backoff_cap = (unsigned)atoi(optarg); break;
+        case 'F':
+            if (!strcmp(optarg, "scan"))
+                ncl_fast_release = NCL_FASTREL_SCAN;
+            else if (!strcmp(optarg, "hint"))
+                ncl_fast_release = NCL_FASTREL_HINT;
+            else {
+                fprintf(stderr, "-F: scan|hint\n");
+                return 2;
+            }
+            break;
         case 'C': csv = 1; break;
         case 'H': printf("%s\n", CSV_HEADER); return 0;
         case 'P': pin = 0; break;
@@ -532,7 +544,7 @@ int main(int argc, char **argv)
 
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode == NCL_MODE_LOCAL ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -547,7 +559,8 @@ int main(int argc, char **argv)
                ncl_mem.meta_load_ns, fair,
                !pin ? "none" : srv_place == NCL_SRV_PIN_SIBLING ? "sibling" : "next",
                all_paths ? (double)tot->base.split_scan_loads / (double)all_paths : 0.0,
-               all_paths ? (double)tot->base.lamport_retries / (double)all_paths : 0.0);
+               all_paths ? (double)tot->base.lamport_retries / (double)all_paths : 0.0,
+               ncl_fast_release == NCL_FASTREL_HINT ? "hint" : "scan");
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",

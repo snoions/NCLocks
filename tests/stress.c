@@ -218,6 +218,7 @@ static void usage(const char *argv0)
             "  -m            ablation: no local submutex\n"
             "  -M MODE       phase1|local (default phase1)\n"
             "  -K CAP        local mode: max consecutive local handoffs (default 64)\n"
+            "  -F MODE       (d)/(e) fast-release check: hint (default) | scan\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
             "  --skip-wb     DEBUG: skip data writeback (emu must fail)\n"
@@ -239,7 +240,7 @@ int main(int argc, char **argv)
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:mHph", lopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:mHph", lopts, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -259,6 +260,16 @@ int main(int argc, char **argv)
             if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; }
             break;
         case 'K': cfg.local_cap = atoi(optarg); break;
+        case 'F':
+            if (!strcmp(optarg, "hint"))
+                ncl_fast_release = NCL_FASTREL_HINT;
+            else if (!strcmp(optarg, "scan"))
+                ncl_fast_release = NCL_FASTREL_SCAN;
+            else {
+                usage(argv[0]);
+                return 2;
+            }
+            break;
         case 'H': precise = 1; break;
         case 'p': pin = 1; cfg.server_pin = 1; break;
         case 1: cfg.debug_skip_data_wb = 1; break;

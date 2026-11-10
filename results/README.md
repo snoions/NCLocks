@@ -28,3 +28,7 @@ docs/hybrid.md), so its capacity there is ~0.92M rather than ~1.04M.
 - `load_uc_n8_all.csv`: all five algorithms at 8 nodes x 1 thread, Poisson 100k-1.5M
   req/s, spin backoff 16, servers on SMT siblings, 3 interleaved reps. Workers use CPUs
   0-7 (one per physical core); every server shares a core with its node's worker.
+- `fastrel_ab_uc.csv`: (d)/(e) fast-release reopen check, `fast_release` = scan (all
+  other `present[]`) vs hint (remembered slot only; now the default). 4x1, 8x1 (servers
+  `-Y sibling`) and 4x2 local; closed loop + Poisson 100k-1M; spin backoff 16;
+  3 interleaved reps with alternating A/B order.

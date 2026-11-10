@@ -64,6 +64,15 @@ foreach(alg lamport tournament hybrid server fastsrv)
   add_test(NAME stress_${alg}_emu_local_cap1
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -K 1)
 endforeach()
+# (d)/(e) with the strict all-slots fast-release check (-F scan; default is hint).
+foreach(alg hybrid fastsrv)
+  add_test(NAME stress_${alg}_emu_fastrel_scan
+    COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 2 -l 3 -i 20000 -F scan)
+  add_test(NAME stress_${alg}_uc_fastrel_scan
+    COMMAND ncl_stress -a ${alg} -b uc -n 4 -t 2 -l 3 -i 20000 -F scan)
+  set_tests_properties(stress_${alg}_uc_fastrel_scan PROPERTIES
+    SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+endforeach()
 add_test(NAME emu_detects_missing_writeback_local
   COMMAND ncl_stress -a tournament -b emu -n 4 -t 3 -l 1 -i 5000 -M local --skip-wb)
 set_tests_properties(emu_detects_missing_writeback_local PROPERTIES WILL_FAIL TRUE)

@@ -228,3 +228,48 @@ Candidates to cut the release scan:
    sub-line writes (design §2 rule 3, Open; §5 partial-write test). Byte packing
    would also break the one-8-byte-store invariant and introduce mixed-size accesses.
    Expected saving at N=8: about 500 ns per hold.
+
+## Fast-release check: hint (default) vs scan
+
+The fairness rule's scan of every other `present[]` slot is the ~600 ns hold-time cost
+found at N=8. The default (`-F hint`, `ncl_fast_release = NCL_FASTREL_HINT`) now
+probes only the slot last seen set (`reset_hint`, kept current by reset checks and by
+this rule). If that slot is set the door stays CLOSED; otherwise it reopens. A miss
+can reopen while some other node waits, which is exactly the design's original
+unconditional reopen, so safety is unaffected. Only fairness is weaker in principle.
+`-F scan` keeps the strict rule. The ctests `stress_{hybrid,fastsrv}_{emu,uc}_fastrel_scan`
+cover it.
+
+A/B (uc, 200 ns CS, `-B 16`, 3 interleaved reps; `results/fastrel_ab_uc.csv`).
+Hold time is sojourn p50 minus acquire p50:
+
+| | scan: hold, loads/acq | hint: hold, loads/acq |
+|---|---|---|
+| (d) N=8, 100k | ~990 ns, 6.57 | **~545 ns**, 1.09 |
+| (d) N=8, 300k | ~1025 ns, 5.66 | **~545 ns**, 1.35 |
+| (d) N=4, 100k | ~670 ns, 2.90 | ~545 ns, 1.02 |
+| (e) N=8, 100k | ~990 ns, 5.84 | **~545 ns**, 1.13 |
+
+With hint, (d)'s hold time at N=8 is close to the tournament's (~416 ns). Shorter
+holds end contention episodes sooner, so the fast path is used more:
+
+| N=8 | scan: p50, fast share | hint: p50, fast share |
+|---|---|---|
+| (d) 300k | 575 ns, 62% | 543 ns, 75% |
+| (d) 600k | 1.47 us, 26% | **927 ns**, 44% |
+| (e) 300k | 1.22 us, 44% | **575 ns**, 62% |
+| (e) 600k | 1.86 us, 18% | 1.66 us, 33% |
+
+- **Capacity unchanged** (closed loop, scan vs hint): (d) 4x1 1.150 / 1.128M, 8x1
+  1.121 / 1.126M, 4x2 local 2.459 / 2.438M; (e) 4x1 1.105 / 1.105M, 8x1 0.998 /
+  1.018M, 4x2 local 1.781 / 1.780M. When saturated the fast path is almost never used.
+- **Fairness 1.00 in every closed-loop configuration** (minimum across reps 1.00),
+  including 4x2 local, where the unconditional reopen gave 4:2:1:1. Under contention
+  the remembered node is almost always still present.
+- **Tails inconclusive.** At N=8, 600k, the median p99.9 is worse with hint ((d) 18 ->
+  31 us, (e) 25 -> 221 us). At N=4, 1M, it is better ((d) 295 -> 147 us). Both
+  variants show the bimodal ~0.85 ms stalls, and the spread within a variant (e.g.
+  (e) 600k p99.9 per rep: scan 25/172/25 us, hint 557/31/221 us) exceeds the
+  difference between variants. In open loop, weaker fairness would show up as tail
+  latency rather than as uneven completions, so a real cost could be hiding here.
+  Settling it needs more reps or per-path latency histograms.

@@ -3,6 +3,7 @@
 #include <string.h>
 
 unsigned ncl_backoff_cap = 1024;
+int ncl_fast_release = NCL_FASTREL_HINT;
 
 const char *const ncl_path_names[NCL_PATH__COUNT] = {
     [NCL_PATH_LAMPORT_FAST] = "lamport_fast",
@@ -214,6 +215,21 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
 {
     /* Start at the slot last seen set: under contention one load decides. */
     int start = b->reset_hint >= 0 && b->reset_hint != i ? b->reset_hint : (i + 1) % b->P;
+    if (ncl_fast_release == NCL_FASTREL_HINT) {
+        /* Cheap variant: probe only the remembered slot. A miss reopens even
+         * if some other node is present (the design's original unconditional
+         * reopen, so still safe); fairness is weaker. */
+        if (start != i) {
+            st->split_scan_loads++;
+            if (ncl_uc_load(SP_PRESENT(b, start))) {
+                st->split_fast_keep_closed++;
+                return;
+            }
+        }
+        ncl_fence();
+        ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
+        return;
+    }
     for (int k = 0; k < b->P; k++) {
         int j = (start + k) % b->P;
         if (j == i)

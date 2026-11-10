@@ -28,7 +28,7 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   hash % N). Message and reply bit layouts are in `src/server.h`. Nodes must call
   `ncl_node_detach()` (an all-nodes barrier) before servers stop. (d) and (e) are **not
   model-checked**, including two fairness fixes added after measurement (fast winner reopens
-  only if alone; the (e) server yields the SLOW side to a waiting fast winner). See
+  only if the node last seen present has left, `-F hint`, default; or only if alone, `-F scan`; the (e) server yields the SLOW side to a waiting fast winner). See
   design.md §4d/§4e. Implementation notes and measurements: `docs/hybrid.md`.
 - Waits that depend on another thread (submutex handoff, server grants) spin and then
   `sched_yield()`, so oversubscribed runs make progress.

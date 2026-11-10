@@ -100,12 +100,19 @@ int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st);
 /* door = OPEN (the design's unconditional fast-winner reset; kept for reference). */
 void ncl_splitter_open(struct ncl_base *b);
 /* Fast-path winner i at release (fairness rule, see docs/hybrid.md): reopen
- * the door only if no other node is present. Otherwise leave it CLOSED so the
+ * the door only if no other node is present (SCAN) or, by default (HINT),
+ * unless the node last seen present still is. Otherwise leave it CLOSED so the
  * winner's node cannot immediately re-win while others wait on the slow path;
  * the last slow-path releaser reopens it via ncl_splitter_reset_if_quiet.
  * Skipping a reopen is always safe, and no other resetter can act while
  * present[i] is still set, so this needs no door read. */
 void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_stats *st);
+/* How the fast winner's release decides (global, set before nodes start):
+ * HINT (default) = probe only the slot last seen set, 1 load; a miss reopens,
+ * as the original design did. SCAN = every other present[], up to N-1 loads,
+ * the strict "reopen only if alone" rule. Both measured fairness 1.00. */
+enum { NCL_FASTREL_SCAN = 0, NCL_FASTREL_HINT = 1 };
+extern int ncl_fast_release;
 /* Reopen the door iff it is CLOSED and every present[j] (j != skip) is 0.
  * skip = -1 checks everyone. First an unfenced pre-check of one likely-set
  * present[] slot: if it is set, give up immediately (skipping a reset is
