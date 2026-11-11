@@ -45,6 +45,7 @@ struct ncl_local_lock {
     ncl_line_t *announce; /* HANDOFF: announce[P], one line per node */
     int pw_next;          /* HANDOFF, pick_policy: next announce[] slot to probe */
     int acq_contended;    /* HANDOFF: this global acquisition waited or got a handoff */
+    uint64_t srv_grant;   /* SERVER in HANDOFF: grant word (seq + hint) for the release */
     /* LOCAL/HANDOFF precise hints accumulated over a local run */
     int ndirty, dirty_full;
     struct ncl_range dirty[NCL_DIRTY_MAX];
@@ -62,7 +63,11 @@ static int cohort(void) { return cfg.mode == NCL_MODE_LOCAL || cfg.mode == NCL_M
 /* MODE_HANDOFF lines appended to each lock's base-algorithm block. */
 static size_t handoff_lines(const struct ncl_sys_cfg *c, int P)
 {
-    return c->mode == NCL_MODE_HANDOFF ? 1 + (size_t)P : 0;
+    if (c->mode != NCL_MODE_HANDOFF)
+        return 0;
+    if (c->alg == NCL_ALG_SERVER)
+        return ncl_srv_chain_lines(c); /* succ[] ring */
+    return 1 + (size_t)P;
 }
 #define OWNER_FREE 0ull
 
@@ -93,10 +98,19 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         fprintf(stderr, "ncl: mode %s needs the submutex (no ablation)\n", ncl_mode_name(c->mode));
         return -1;
     }
-    if (c->mode == NCL_MODE_HANDOFF && (c->alg == NCL_ALG_SERVER || c->alg == NCL_ALG_FASTSRV)) {
-        fprintf(stderr, "ncl: mode handoff (gate + owner, design §3.3) applies to lamport, "
-                        "tournament and hybrid; %s hands off through the lock server (use -M local)\n",
-                ncl_alg_name(c->alg));
+    if (c->mode == NCL_MODE_HANDOFF && c->alg == NCL_ALG_FASTSRV) {
+        fprintf(stderr, "ncl: mode handoff applies to lamport, tournament, hybrid (gate + "
+                        "owner) and server (holder-to-waiter chain); not fastsrv (use -M local)\n");
+        return -1;
+    }
+    if (c->chain_lines && (c->chain_lines < 2 || c->chain_lines > NCL_SRV_CHAIN_MAX ||
+                           (c->chain_lines & (c->chain_lines - 1)))) {
+        fprintf(stderr, "ncl: chain window must be a power of two in [2, %d]\n", NCL_SRV_CHAIN_MAX);
+        return -1;
+    }
+    if (c->mode == NCL_MODE_HANDOFF && c->alg == NCL_ALG_SERVER && c->pick_policy == NCL_PICK_PROBE) {
+        fprintf(stderr, "ncl: server handoff: pick policy is adaptive (follow the hint) or scan "
+                        "(always read succ[])\n");
         return -1;
     }
     if (c->nnodes < 1 || c->nnodes > NCL_MAX_NODES || c->nlocks < 1) {
@@ -209,7 +223,7 @@ int ncl_node_attach(int node_id)
         ncl_sub_init(&local[l].sub);
         ncl_base_bind(&local[l].base, cfg.alg, hdr->participants,
                       blocks + (size_t)l * hdr->lines_per_lock);
-        if (cfg.mode == NCL_MODE_HANDOFF) {
+        if (cfg.mode == NCL_MODE_HANDOFF && !is_server()) {
             ncl_line_t *ho = blocks + (size_t)l * hdr->lines_per_lock +
                              ncl_base_nlines(cfg.alg, hdr->participants);
             local[l].owner = ho;
@@ -417,8 +431,15 @@ void ncl_acquire(struct ncl_thread *t, int lock)
     struct ncl_base_stats tmp = {0};
     int path;
     if (cfg.alg == NCL_ALG_SERVER) {
-        ncl_srv_acquire(t, lock);
+        uint64_t g = ncl_srv_acquire(t, lock);
         path = NCL_PATH_SERVER;
+        if (cfg.mode == NCL_MODE_HANDOFF) {
+            L->srv_grant = g;
+            if (ncl_srv_grant_passed(g)) {
+                path = NCL_PATH_GLOBAL_HANDOFF;
+                L->st.ho.wait_handoffs++;
+            }
+        }
     } else if (cfg.alg == NCL_ALG_FASTSRV) {
         path = ncl_fastsrv_acquire(t, lock, &L->base, &tmp);
     } else if (cfg.mode == NCL_MODE_HANDOFF) {
@@ -512,7 +533,9 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
 
     L->global_held = 0;
     L->st.global_releases++;
-    if (cfg.alg == NCL_ALG_SERVER)
+    if (cfg.alg == NCL_ALG_SERVER && cfg.mode == NCL_MODE_HANDOFF)
+        ncl_srv_chain_release(lock, L->srv_grant, cfg.pick_policy == NCL_PICK_SCAN, &L->st.ho);
+    else if (cfg.alg == NCL_ALG_SERVER)
         ncl_srv_release(lock);
     else if (cfg.alg == NCL_ALG_FASTSRV)
         ncl_fastsrv_release(lock, &L->base, L->path, &L->st.base);
@@ -525,6 +548,10 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
 }
 
 const struct ncl_sys_cfg *ncl_sys_cfg(void) { return &cfg; }
+int ncl_chain_window(void)
+{
+    return cfg.alg == NCL_ALG_SERVER && cfg.mode == NCL_MODE_HANDOFF ? (int)ncl_srv_chain_lines(&cfg) : 0;
+}
 int ncl_participants(void) { return hdr ? hdr->participants : 0; }
 
 ncl_line_t *ncl_user_line(size_t i)

@@ -30,6 +30,41 @@ static inline uint64_t reply_encode(uint32_t lock, unsigned status, uint32_t req
     return ((uint64_t)lock << 16) | ((uint64_t)status << 14) | (reqid & MASK(NCL_SRV_REQID_BITS));
 }
 
+/* MODE_HANDOFF (chain) extras in the reply word, above the bits a waiter matches. */
+#define R_MATCH_MASK MASK(36)
+#define R_SEQ_SHIFT 36
+#define R_HINT (1ull << 50)   /* holder should read succ[] at release */
+#define R_PASSED (1ull << 51) /* written by the previous holder, not the server */
+#define SEQ_MASK MASK(NCL_SRV_REQID_BITS) /* REL carries seq in the reqid field */
+
+static inline uint64_t chain_reply(uint32_t lock, uint32_t reqid, uint32_t seq, int hint, int passed)
+{
+    return reply_encode(lock, REPLY_GRANT, reqid) | ((uint64_t)(seq & SEQ_MASK) << R_SEQ_SHIFT) |
+           (hint ? R_HINT : 0) | (passed ? R_PASSED : 0);
+}
+
+/* succ[] word, written only by the lock's home server:
+ *   [valid 63][seq 40..53][node 26..31][gslot 14..25][reqid 0..13] */
+#define S_VALID (1ull << 63)
+#define S_SEQ_SHIFT 40
+#define S_NODE_SHIFT 26
+
+static inline uint64_t succ_encode(uint32_t seq, unsigned node, uint32_t gslot, uint32_t reqid)
+{
+    return S_VALID | ((uint64_t)(seq & SEQ_MASK) << S_SEQ_SHIFT) | ((uint64_t)node << S_NODE_SHIFT) |
+           ((uint64_t)gslot << M_GSLOT_SHIFT) | (reqid & MASK(NCL_SRV_REQID_BITS));
+}
+
+uint32_t ncl_srv_chain_lines(const struct ncl_sys_cfg *c)
+{
+    if (c->chain_lines)
+        return (uint32_t)c->chain_lines; /* validated by ncl_sys_create */
+    uint32_t r = 2;
+    while (r < 4u * (uint32_t)c->nnodes)
+        r <<= 1;
+    return r; /* power of two, divides 2^14, so (seq & SEQ_MASK) % R == seq % R */
+}
+
 /* ---- layout ------------------------------------------------------------- */
 
 static uint64_t mix64(uint64_t x)
@@ -98,6 +133,12 @@ struct srv_lock {
     int holder;
     int qh, qn;  /* FIFO of waiting requests; <= 1 per node with the submutex */
     struct waiter q[NCL_MAX_NODES];
+    /* MODE_HANDOFF (chain): grant numbers cur..next-1 are assigned, asg[n % R].
+     * cur = the number the server last granted itself, or the one after the
+     * last REL; holders may have passed beyond it without telling us. */
+    uint32_t cur, next;
+    struct waiter asg[NCL_SRV_CHAIN_MAX];
+    ncl_line_t *succ; /* succ[R] uncached lines */
     /* (e) only */
     int slow;    /* SLOW_*: state of the top lock's SLOW side */
     int grants_this_hold; /* grants since the SLOW side was last acquired */
@@ -113,6 +154,10 @@ static struct {
     struct ncl_sys_cfg cfg;
     struct ncl_srv_layout L;
     int node, N, fast;
+    int chain;     /* MODE_HANDOFF for SERVER: holder-to-waiter passing via succ[] */
+    uint32_t R;    /* chain: succ[] lines per lock = assignment window */
+    ncl_line_t *blocks;
+    size_t lines_per_lock;
     unsigned backoff_cap;
     struct tail tail[NCL_MAX_NODES]; /* producer side: next position into h */
 
@@ -215,6 +260,89 @@ static void advance(struct srv_lock *sl)
     }
 }
 
+/* ---- chain mode (MODE_HANDOFF for SERVER) ----------------------------------
+ * Each REQ gets a grant number n (FIFO order). If n is not the first, the
+ * server publishes succ[(n-1) % R] = (n-1, waiter n): "holder of n-1, pass to
+ * this waiter". The holder of k reads succ[k % R] once at release; tag k ->
+ * it stores the grant (k+1) into that waiter's grant slot itself, no message.
+ * Otherwise it sends REL(k), and the server grants k+1 (if assigned). Each
+ * holder decides exactly once and the server grants k+1 only after REL(k),
+ * so k+1 is granted exactly once. The server never learns about passes, so
+ * at most R numbers are assigned past `cur`; a full window holds REQs back,
+ * which ends the chain within R handoffs and resynchronizes the server.
+ * Numbers below `cur` are finished, so slot n % R may be reused for n. */
+static ncl_line_t *succ_line(struct srv_lock *sl, uint32_t n) { return sl->succ + (n & (S.R - 1)); }
+
+static void chain_grant(struct srv_lock *sl)
+{
+    struct waiter wt = sl->asg[sl->cur & (S.R - 1)];
+    int hint = sl->next - sl->cur > 1; /* succ[cur] already published */
+    ncl_fence(); /* REL / succ publication before the grant */
+    ncl_uc_store(grant_slot(wt.node, wt.gslot), chain_reply(sl->lock, wt.reqid, sl->cur, hint, 0));
+    S.st.grants++;
+}
+
+static void chain_advance(struct srv_lock *sl, int grant)
+{
+    while (sl->qn && sl->next - sl->cur < S.R) {
+        struct waiter wt = sl->q[sl->qh];
+        sl->qh = (sl->qh + 1) % S.N;
+        sl->qn--;
+        uint32_t n = sl->next++;
+        sl->asg[n & (S.R - 1)] = wt;
+        /* Clear n's own slot: it still holds an entry for n - R (done, since
+         * n - R < cur). Without this a slot the chain never refills keeps its
+         * entry until the 14-bit tag wraps and matches again: a pass to a long
+         * finished request, which loses the lock. */
+        ncl_uc_store(succ_line(sl, n), 0);
+        if (n != sl->cur) {
+            ncl_fence();
+            ncl_uc_store(succ_line(sl, n - 1), succ_encode(n - 1, wt.node, wt.gslot, wt.reqid));
+            S.st.published++;
+        } else if (!sl->held) {
+            sl->held = 1;
+            grant = 1;
+        }
+    }
+    if (sl->qn)
+        S.st.window_full++;
+    if (grant)
+        chain_grant(sl);
+}
+
+static void chain_process(int src, unsigned type, struct srv_lock *sl, uint32_t gslot, uint32_t reqid)
+{
+    if (type == MSG_REQ) {
+        if (sl->qn >= S.N) {
+            S.st.errors++;
+            return;
+        }
+        sl->q[(sl->qh + sl->qn) % S.N] =
+            (struct waiter){(uint8_t)src, (uint16_t)gslot, (uint16_t)reqid};
+        sl->qn++;
+        if (sl->held)
+            S.st.queued++;
+        chain_advance(sl, 0);
+    } else if (type == MSG_REL) {
+        /* REL(k): k in [cur, next) and assigned to src. */
+        uint32_t k = sl->cur + ((reqid - sl->cur) & SEQ_MASK);
+        if (!sl->held || k - sl->cur >= sl->next - sl->cur ||
+            sl->asg[k & (S.R - 1)].node != src) {
+            S.st.errors++;
+            return;
+        }
+        sl->cur = k + 1;
+        int grant = sl->cur != sl->next; /* k+1 assigned but not passed to */
+        if (grant)
+            S.st.rel_grants++;
+        else
+            sl->held = 0;
+        chain_advance(sl, grant);
+    } else {
+        S.st.errors++;
+    }
+}
+
 static void process(int src, uint64_t w)
 {
     unsigned type = (unsigned)(w >> M_TYPE_SHIFT) & 3;
@@ -229,6 +357,10 @@ static void process(int src, uint64_t w)
         return;
     }
     struct srv_lock *sl = &S.slocks[S.local_idx[lock]];
+    if (S.chain) {
+        chain_process(src, type, sl, gslot, reqid);
+        return;
+    }
     if (type == MSG_REQ) {
         if (sl->qn >= S.N) {
             S.st.errors++; /* > 1 request per node per lock: protocol violation */
@@ -354,6 +486,10 @@ int ncl_srv_node_start(const struct ncl_sys_cfg *c, const struct ncl_srv_layout 
     S.node = node;
     S.N = c->nnodes;
     S.fast = c->alg == NCL_ALG_FASTSRV;
+    S.chain = c->alg == NCL_ALG_SERVER && c->mode == NCL_MODE_HANDOFF;
+    S.R = ncl_srv_chain_lines(c);
+    S.blocks = blocks;
+    S.lines_per_lock = lines_per_lock;
     S.backoff_cap = c->server_backoff_cap ? c->server_backoff_cap : 1024;
 
     S.local_idx = malloc(sizeof(int) * (size_t)c->nlocks);
@@ -373,6 +509,8 @@ int ncl_srv_node_start(const struct ncl_sys_cfg *c, const struct ncl_srv_layout 
         sl->lock = (uint32_t)l;
         if (S.fast)
             ncl_base_bind(&sl->b, c->alg, S.N, blocks + (size_t)l * lines_per_lock);
+        if (S.chain)
+            sl->succ = blocks + (size_t)l * lines_per_lock; /* SERVER has no base lines */
     }
     if (pthread_create(&S.tid, NULL, server_main, NULL) != 0)
         return -1;
@@ -397,7 +535,7 @@ void ncl_srv_node_stop(void)
 
 /* ---- client side ---------------------------------------------------------- */
 
-void ncl_srv_acquire(struct ncl_thread *t, int lock)
+uint64_t ncl_srv_acquire(struct ncl_thread *t, int lock)
 {
     int h = ncl_srv_home(lock, S.N);
     uint32_t g = (uint32_t)t->local_idx;
@@ -409,14 +547,46 @@ void ncl_srv_acquire(struct ncl_thread *t, int lock)
     send(h, MSG_REQ, (uint32_t)lock, g, reqid);
     ncl_line_t *gs = grant_slot(S.node, g);
     unsigned spins = 0;
-    while (ncl_uc_load(gs) != want) /* stale replies never match */
-        ncl_spin_wait(&spins); /* the server thread must run to grant */
+    uint64_t w;
+    while (((w = ncl_uc_load(gs)) & R_MATCH_MASK) != want) /* stale replies never match */
+        ncl_spin_wait(&spins); /* the server (or, chain mode, the holder) must run to grant */
     ncl_fence();
+    return w;
 }
 
 void ncl_srv_release(int lock)
 {
     send(ncl_srv_home(lock, S.N), MSG_REL, (uint32_t)lock, 0, 0);
+}
+
+int ncl_srv_grant_passed(uint64_t grant) { return (grant & R_PASSED) != 0; }
+
+int ncl_srv_chain_release(int lock, uint64_t grant, int always_read, struct ncl_handoff_stats *h)
+{
+    uint32_t seq = (uint32_t)(grant >> R_SEQ_SHIFT) & SEQ_MASK;
+    if (always_read || (grant & R_HINT)) {
+        ncl_line_t *succ = S.blocks + (size_t)lock * S.lines_per_lock;
+        uint64_t s = ncl_uc_load(succ + (seq & (S.R - 1)));
+        h->announce_loads++;
+        if ((s & S_VALID) && ((uint32_t)(s >> S_SEQ_SHIFT) & SEQ_MASK) == seq) {
+            unsigned node = (unsigned)(s >> S_NODE_SHIFT) & 63;
+            uint32_t gslot = (uint32_t)(s >> M_GSLOT_SHIFT) & MASK(NCL_SRV_GSLOT_BITS);
+            uint32_t reqid = (uint32_t)s & MASK(NCL_SRV_REQID_BITS);
+            if (node >= (unsigned)S.N || gslot >= S.L.grants_per_node) {
+                fprintf(stderr, "ncl: corrupt succ word %#llx\n", (unsigned long long)s);
+                abort();
+            }
+            ncl_fence(); /* data writeback before the grant */
+            ncl_uc_store(grant_slot((int)node, gslot),
+                         chain_reply((uint32_t)lock, reqid, seq + 1, 1, 1));
+            h->handoffs_sent++;
+            return 1;
+        }
+        h->missed_announce++; /* read, but no successor for us */
+    }
+    h->frees++;
+    send(ncl_srv_home(lock, S.N), MSG_REL, (uint32_t)lock, 0, seq);
+    return 0;
 }
 
 int ncl_fastsrv_acquire(struct ncl_thread *t, int lock, struct ncl_base *b,

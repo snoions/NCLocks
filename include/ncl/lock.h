@@ -29,8 +29,8 @@
  *                     itself and hands off with one 8-byte store to `owner`
  *                     (or stores FREE). Waiters poll `owner`; seeing FREE
  *                     means a missed announcement, so they go back through the
- *                     gate. Not for SERVER/FASTSRV (they hand off through the
- *                     server queue) or the no-submutex ablation.
+ *                     gate. Not for FASTSRV or the no-submutex ablation; SERVER
+ *                     uses holder-to-waiter passing instead (below).
  *                     cfg.announce_place selects the §3.5 Open placement:
  *                     NCL_ANNOUNCE_LAZY (default: inside the gate, only
  *                     after reading a held owner), _INSIDE (spec baseline),
@@ -40,6 +40,19 @@
  *                     this node's own acquisition was uncontended, else scans
  *                     (ADAPTIVE, default); always scans (SCAN, spec); always
  *                     probes (PROBE; collapses at moderate load).
+ *                     SERVER ("chain", design §4c variant, see docs/handoff.md):
+ *                     the home server assigns each REQ a grant number and
+ *                     publishes the successor of number n-1 in an uncached
+ *                     succ[] ring; the holder of k passes the lock by storing
+ *                     the grant into its successor's grant slot, and only
+ *                     messages the server (REL) when it finds none. A hint
+ *                     bit in the grant says whether to read succ[] at all:
+ *                     pick_policy ADAPTIVE (default) follows the hint, SCAN
+ *                     always reads. cfg.chain_lines = succ[] ring size =
+ *                     assignment window (default 4N rounded up to a power of
+ *                     two): the server never sees passes, so it assigns at
+ *                     most that many grant numbers past the last one it knows
+ *                     finished. FASTSRV is rejected.
  *
  * Precise dirty hints under NCL_MODE_LOCAL: hints from every release in a
  * local run are accumulated (node-local) and all written back when the lock
@@ -76,6 +89,8 @@ enum { NCL_ANNOUNCE_LAZY = 0, NCL_ANNOUNCE_INSIDE = 1, NCL_ANNOUNCE_BEFORE = 2 }
 
 enum { NCL_PICK_ADAPTIVE = 0, NCL_PICK_SCAN = 1, NCL_PICK_PROBE = 2 }; /* 0 = default */
 
+#define NCL_SRV_CHAIN_MAX 128 /* max chain window (succ[] lines per lock) */
+
 enum { NCL_SRV_PIN_NONE = 0, NCL_SRV_PIN_NEXT = 1, NCL_SRV_PIN_SIBLING = 2 };
 
 struct ncl_sys_cfg {
@@ -89,6 +104,8 @@ struct ncl_sys_cfg {
     int local_cap;          /* LOCAL/HANDOFF: max consecutive local handoffs (0 = 64) */
     int announce_place;     /* HANDOFF: announce placement (§3.5), NCL_ANNOUNCE_*; 0 = lazy */
     int pick_policy;        /* HANDOFF: pick_waiter policy, NCL_PICK_*; 0 = adaptive */
+    int chain_lines;        /* SERVER HANDOFF: succ[] ring = assignment window, power of
+                               two in [2, NCL_SRV_CHAIN_MAX]; 0 = 4N rounded up */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
@@ -123,6 +140,9 @@ struct ncl_srv_stats {
     uint64_t top_acquires;   /* FASTSRV: SLOW side of the top lock taken */
     uint64_t top_wait_polls; /* FASTSRV: polls of the top-lock condition */
     uint64_t top_yields;     /* FASTSRV: SLOW side yielded to a waiting fast winner */
+    uint64_t published;      /* SERVER chain: succ[] entries published */
+    uint64_t rel_grants;     /* SERVER chain: REL(k) with k+1 assigned: server granted it */
+    uint64_t window_full;    /* SERVER chain: REQs held back by a full assignment window */
     struct ncl_base_stats base; /* FASTSRV: splitter resets done by the server */
 };
 
@@ -170,6 +190,8 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints);
 /* Static configuration (read-only after create). */
 const struct ncl_sys_cfg *ncl_sys_cfg(void);
 int ncl_participants(void);
+/* SERVER in MODE_HANDOFF: effective chain window (succ[] lines per lock), else 0. */
+int ncl_chain_window(void);
 
 /* Uncached lines reserved for the application (cfg.user_meta_lines). */
 ncl_line_t *ncl_user_line(size_t i);

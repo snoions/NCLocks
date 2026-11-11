@@ -59,15 +59,21 @@ struct ncl_srv_layout {
 size_t ncl_srv_layout(const struct ncl_sys_cfg *c, struct ncl_srv_layout *L, ncl_off_t base_off);
 int ncl_srv_home(int lock, int nnodes);
 
-/* blocks/lines_per_lock locate each lock's base lines (FASTSRV top lock and
- * splitter); unused for SERVER. */
+/* blocks/lines_per_lock locate each lock's lines: FASTSRV top lock and
+ * splitter; SERVER in MODE_HANDOFF: the succ[] ring. */
 int ncl_srv_node_start(const struct ncl_sys_cfg *c, const struct ncl_srv_layout *L, int node,
                        ncl_line_t *blocks, size_t lines_per_lock);
 void ncl_srv_node_stop(void);
 
-/* (c) */
-void ncl_srv_acquire(struct ncl_thread *t, int lock);
+/* (c). Returns the grant word (chain mode needs it at release). */
+uint64_t ncl_srv_acquire(struct ncl_thread *t, int lock);
 void ncl_srv_release(int lock);
+/* (c) in MODE_HANDOFF ("chain"): succ[] lines per lock; release by passing to
+ * the published successor (returns 1) or REL to the server (returns 0).
+ * always_read: read succ[] even when the grant's hint bit is clear. */
+uint32_t ncl_srv_chain_lines(const struct ncl_sys_cfg *c);
+int ncl_srv_grant_passed(uint64_t grant);
+int ncl_srv_chain_release(int lock, uint64_t grant, int always_read, struct ncl_handoff_stats *h);
 /* (e): returns NCL_PATH_FASTSRV_FAST or _SLOW; release with that path. */
 int ncl_fastsrv_acquire(struct ncl_thread *t, int lock, struct ncl_base *b,
                         struct ncl_base_stats *st);

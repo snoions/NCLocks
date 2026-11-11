@@ -351,12 +351,17 @@ static void usage(const char *argv0)
             "  -P          don't pin threads\n"
             "  -S N        server idle poll backoff cap, pause iterations (server/fastsrv)\n"
             "  -M MODE     phase1 (default) | local (2a cohort passing) | handoff (2b: local +\n"
-            "              gate/owner cross-node handoff; lamport, tournament, hybrid)\n"
+            "              gate/owner cross-node handoff; lamport, tournament, hybrid; server:\n"
+            "              holder passes to the server-published successor)\n"
             "  -K CAP      local/handoff: max consecutive local handoffs (default 64)\n"
             "  -G PLACE    handoff: announce lazy (inside the gate, only after reading a held\n"
             "              owner; default) | inside (spec baseline) | before\n"
             "  -X PICK     handoff release: adaptive (probe one slot if this node's acquisition\n"
-            "              was uncontended, else scan; default) | scan (spec) | probe\n"
+            "              was uncontended, else scan; default) | scan (spec) | probe.\n"
+            "              server: adaptive = read succ[] only if the grant's hint bit is set;\n"
+            "              scan = always read\n"
+            "  -R LINES    server handoff: chain window = succ[] lines per lock (power of two;\n"
+            "              default 4N rounded up)\n"
             "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n"
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
             "              (SMT sibling of node n's first worker)\n"
@@ -370,7 +375,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window"
 
 int main(int argc, char **argv)
 {
@@ -380,7 +385,7 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:X:mCHPh")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:X:R:mCHPh")) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -401,6 +406,7 @@ int main(int argc, char **argv)
         case 'm': cfg.no_submutex = 1; break;
         case 'M': if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; } break;
         case 'K': cfg.local_cap = atoi(optarg); break;
+        case 'R': cfg.chain_lines = atoi(optarg); break;
         case 'B': ncl_backoff_cap = (unsigned)atoi(optarg); break;
         case 'G':
             if (!strcmp(optarg, "inside"))
@@ -580,7 +586,7 @@ int main(int argc, char **argv)
 
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -597,11 +603,12 @@ int main(int argc, char **argv)
                all_paths ? (double)tot->base.split_scan_loads / (double)all_paths : 0.0,
                all_paths ? (double)tot->base.lamport_retries / (double)all_paths : 0.0,
                ncl_fast_release == NCL_FASTREL_HINT ? "hint" : "scan",
-               cfg.mode != NCL_MODE_HANDOFF ? "-" : ANN_NAME(cfg.announce_place),
+               cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER ? "-" : ANN_NAME(cfg.announce_place),
                cfg.mode != NCL_MODE_HANDOFF ? "-" : PICK_NAME(cfg.pick_policy),
                PER(tot->paths[NCL_PATH_GLOBAL_HANDOFF]), PER(tot->paths[NCL_PATH_LOCAL_HANDOFF]),
                PER(tot->ho.missed_announce), PER(tot->ho.owner_polls), PER(tot->ho.gate_entries),
-               PER(tot->ho.announce_loads));
+               PER(tot->ho.announce_loads),
+               ncl_chain_window());
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -656,13 +663,25 @@ int main(int argc, char **argv)
                    (unsigned long)v->errors, (double)v->rounds / secs,
                    v->rounds ? 100.0 * (double)v->idle_rounds / (double)v->rounds : 0.0,
                    (double)v->rounds * nnodes / secs);
+            if (cfg.mode == NCL_MODE_HANDOFF)
+                printf("  succ_published=%lu rel_grants=%lu window_full=%lu",
+                       (unsigned long)v->published, (unsigned long)v->rel_grants,
+                       (unsigned long)v->window_full);
             if (cfg.alg == NCL_ALG_FASTSRV)
                 printf("  top_slow_acquires=%lu top_polls=%lu top_yields=%lu",
                        (unsigned long)v->top_acquires, (unsigned long)v->top_wait_polls,
                        (unsigned long)v->top_yields);
             printf("\n");
         }
-        if (cfg.mode == NCL_MODE_HANDOFF) {
+        if (cfg.mode == NCL_MODE_HANDOFF && cfg.alg == NCL_ALG_SERVER) {
+            const struct ncl_handoff_stats *o = &tot->ho;
+            printf("chain (%s): passes_sent=%lu rels=%lu succ_loads=%lu succ_misses=%lu "
+                   "passes_received=%lu\n",
+                   cfg.pick_policy == NCL_PICK_SCAN ? "always read" : "hint",
+                   (unsigned long)o->handoffs_sent, (unsigned long)o->frees,
+                   (unsigned long)o->announce_loads, (unsigned long)o->missed_announce,
+                   (unsigned long)o->wait_handoffs);
+        } else if (cfg.mode == NCL_MODE_HANDOFF) {
             const struct ncl_handoff_stats *o = &tot->ho;
             printf("handoff (announce %s, pick %s): gate_entries=%lu takes=%lu gate_handoffs=%lu "
                    "wait_handoffs=%lu missed_announce=%lu owner_polls/acq=%.2f sent=%lu frees=%lu "

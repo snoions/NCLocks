@@ -236,6 +236,13 @@ Each lock has a **home node** whose background server thread grants it.
 
 **Handoff:** the server's queue provides handoff naturally. With a fixed home, a cross-node handoff is two hops (holder → server → waiter). Local handoff: the node keeps the grant across its local waiters and notifies the server only when the lock leaves the node.
 
+**Holder-to-waiter chain (Phase 2b for (c); implemented, not model-checked; `docs/handoff.md`):** removes the server from the critical path of a contended handoff.
+- The home server gives each request a grant number n in FIFO order and publishes "holder of n−1: pass to waiter n" as one 8-byte word in a per-lock uncached `succ[R]` ring (written only by the server).
+- At release, the holder of k reads `succ[k % R]` once. If the tag is k, it stores grant k+1 straight into that waiter's grant slot (no message). Otherwise it sends `REL(k)`, and the server grants k+1 itself if assigned. Each holder decides exactly once, and the server grants k+1 only after `REL(k)`, so k+1 is granted exactly once. Grant slots therefore have two possible writers per request (server or previous holder), but exactly one writes.
+- A hint bit in the grant ("succ[] already published when granted"; set on every pass) lets an uncontended holder skip the `succ[]` load.
+- The server never sees passes, so it assigns at most R numbers past the last one it knows finished (R = `succ[]` lines per lock, a power of two; default 4N rounded up, `-R`). A full window holds requests back, which ends the chain and resynchronizes the server at least every R grants; a larger window trades uncached memory for fewer server round trips. Memory: R lines per lock (2 KB at N=8), the largest per-lock item of any variant; reductions (smaller R, a pool of rings assigned only to contended locks, packing entries once sub-line writes are settled) are listed in `docs/handoff.md` (Open, needed before the KV store).
+- The server clears slot n % R when assigning n. Without this, a slot the chain never refills keeps an old entry until the 14-bit tag wraps and matches again (found by stress: a pass to a long-finished request lost the lock).
+
 **Home migration:**
 
 - Migrate when one node dominates recent acquisitions (adaptive policy with hysteresis; high threshold to avoid thrashing under uniform access). If the home moves to the holder, the holder grants directly (one hop).

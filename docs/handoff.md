@@ -3,8 +3,9 @@
 The protocol is design.md §3.3 (Decided); this file records implementation choices and
 measurements. Mode `NCL_MODE_HANDOFF` (`-M handoff`) = Phase 2a local cohort passing
 (`docs/local_handoff.md`) plus cross-node handoff through a gate and an owner field.
-Variants (a) Lamport, (b) tournament, (d) hybrid serve as the gate; (c)/(e) are rejected
-(they hand off through the server queue; use `-M local`), as is the no-submutex ablation.
+Variants (a) Lamport, (b) tournament, (d) hybrid serve as the gate. (c) uses a different
+cross-node handoff, the holder-to-waiter chain (last section). (e) is rejected (use `-M
+local`), as is the no-submutex ablation.
 
 ## Implementation (`src/lock.c`: `handoff_acquire`, `handoff_release`)
 
@@ -161,3 +162,133 @@ across variants), so those points do not rank the variants.
 the spec baseline and ~991 ns for Phase 1. The acquire still costs about +380 ns over
 Phase 1, and saturated capacity stays at ~0.92M: neither change shortens the handoff cycle.
 The spec baseline remains available as `-G inside -X scan`.
+
+## (c) lock server: holder-to-waiter chain (`-a server -M handoff`)
+
+In Phase 1, a contended (c) handoff is two hops through the server: the holder sends REL,
+the server's poll loop finds it, then the server stores GRANT and the waiter's poll sees
+it. The chain takes the server off that path. Protocol and safety argument: design.md §4c
+"Holder-to-waiter chain". Code: `src/server.c` (`chain_*`, `ncl_srv_chain_release`). Not
+model-checked.
+
+- **Server:** each REQ gets a grant number n (FIFO). If n has a predecessor, the server
+  publishes `succ[(n-1) % R] = (n-1, node, gslot, reqid)`, one 8-byte store into a per-lock
+  uncached ring that only the server writes. On `REL(k)` it grants k+1 itself if that
+  number is assigned, otherwise the lock becomes free.
+- **Holder of k at release:** after data writeback, it reads `succ[k % R]` once. If the tag
+  is k, it fences and stores grant k+1 (seq, hint and passed bits) into the successor's
+  grant slot: no message. Otherwise it sends `REL(k)`, carrying k. Local cohort passing
+  (2a) happens first, as in every handoff mode.
+- **Hint** (default; `-X scan` = always read): the grant word says whether `succ[k]` was
+  already published when the server granted, and every pass sets it. An uncontended holder
+  therefore skips the uncached load, and its release is one REL store, as in Phase 1.
+- **Window** (`-R`, default 4N rounded up to a power of two; ≤ 128): the server cannot see
+  passes, so it assigns at most R numbers past the last one it knows finished. A full window
+  makes the chain end with a REL, which resynchronizes the server. Under saturation this
+  costs one server round trip per R grants (`succ_misses`).
+- **Bug found by stress:** the window kept ending at the same ring slot, so that slot was
+  never rewritten. 2^14 grants later its 14-bit tag matched again, and a holder passed the
+  lock to a long-finished request: lost lock, hang. Fix: the server clears slot n % R when it
+  assigns n (that slot belonged to n − R, already finished). `stress_server_*_handoff_wrap`
+  hangs 6/6 without the fix.
+- **Tests:** `stress_server_{emu,uc}_handoff{,_cap1,_scan,_window2,_wrap}`,
+  `emu_detects_missing_writeback_server_handoff` (WILL_FAIL), `handoff_rejects_fastsrv`.
+- **Stats:** path `global_handoff` = received a pass; the CSV's `missed_announce_per_acq` =
+  `succ[]` read without a match, `announce_loads_per_acq` = `succ[]` loads, `chain_window` =
+  R. The human-readable output adds server `succ_published`, `rel_grants`, `window_full` and
+  client `passes_sent`, `rels`.
+
+### Measurements (uc, 200 ns CS, 64 B footprint, servers `-Y sibling` at N=8, 3 interleaved reps)
+
+Raw data: `results/server_chain_uc.csv` (Phase 1 vs chain, hint and always-read, R = 4N; the hint
+rows appear three times per rep because a script bug ran the planned 2N/8N variants at the
+default),
+`results/server_chain_vs_tournament_uc.csv` (first sweep: R = 2N, plus Phase 2a server and
+tournament Phase 1 / 2b references), `results/server_chain_window_uc.csv` (R = 2N/4N/8N).
+
+**Capacity** (closed loop, Mops/s; fairness min/max 1.00 everywhere except tournament Phase 1):
+
+| | server Phase 1 | chain (hint) | chain (always read) | tournament Phase 1 | tournament 2b |
+|---|---|---|---|---|---|
+| 4x1 | 1.44 | **1.58** | 1.56 | 1.58 | 0.92 |
+| 8x1 | 1.15 | **1.55** | 1.48 | 1.68 (0.98) | 0.92 |
+| 4x2 | 1.18 (2a: 1.80) | **2.46** | 2.46 | 1.42 (0.97) | 2.48 |
+
+At 8x1, 97% of acquisitions are passes. The server still receives every REQ, but only
+one REL per 32 grants, and it is off the handoff path.
+The handoff cycle is one uncached load (`succ`) plus one store (grant), versus 2b's four
+serialized uncached operations (0.92M for every gate). At 4x2 (98% local passes), the
+chain beats server 2a by 37%. Each global transfer in 2a waits for the server; with the
+chain it does not.
+
+**Uncontended** (Poisson 100k; hold = sojourn p50 − acquire p50): with the hint, hold time
+equals Phase 1 (N=8: 320 vs 384 ns, one histogram bucket); always-read adds ~130 ns (448-512
+ns). Acquire p50 is unchanged (1.8 us at N=8, 2.3 us at N=4). That number is the idle
+server's backoff (cap 1024 + `sched_yield`), the same for every server variant and much
+slower than the tournament's 575 ns.
+
+**Open loop, N=8** (acquire p50 / p99):
+
+| offered | server Phase 1 | chain (hint) | tournament Phase 1 |
+|---|---|---|---|
+| 300k | 991 ns / 8.7 us | 1.1 / 8.7 us | 575 ns / 2.2 us |
+| 600k | 1.2 / 7.4 us | 1.2 / 4.9 us | 607 ns / 3.2 us |
+| 900k | 3.2 / 39 us | **1.5 / 6.7 us** | 895 ns / 5.4 us |
+| 1.2M | sat (20% unserved) | **2.0 / 12 us** | 1.3 / 9.2 us |
+| on/off 300k mean | 30 / 111 us | **2.3 / 35 us** | 1.3 / 9.7 us |
+
+Below ~600k the two are the same (few waiters, so few passes). Near Phase 1's capacity,
+and in bursts, the chain cuts p50 2-13x and p99 3-6x, and it serves 1.2M without
+saturating.
+
+**Window size** (hint; Mops/s closed loop, p50 / p99 at 1.2M offered):
+
+| R | 2N | 4N (default) | 8N |
+|---|---|---|---|
+| 4x1 capacity | 1.53 | 1.61 | 1.65 |
+| 8x1 capacity | 1.48 | 1.54 | 1.58 |
+| 8x1, 1.2M | 2.3 / 17 us | 2.2 / 13 us | 1.9 / 10 us |
+
+Each doubling halves the REL resyncs (1/R per grant) and gains 3-5% capacity. At 900k and
+in bursts, the three are within noise. 4N is the default as a compromise with memory: R
+lines per lock, i.e. 4 KB per lock at N=8 with R = 8N.
+
+**Memory.** Per-lock uncached lines (64 B each) at N=8:
+
+| | lines per lock | bytes |
+|---|---|---|
+| Lamport | N+2 = 10 | 640 B |
+| tournament | 3(N−1) = 21 | 1.3 KB |
+| hybrid | 34 | 2.2 KB |
+| 2b gate + owner | base + N+1 | +576 B |
+| server Phase 1 | ~2N queue slots (2N-4N with power-of-two rounding), spread over the N source queues | ~1-2 KB |
+| server chain | the above + R (default 4N = 32) | +2 KB, ~3 KB total |
+
+Every variant is O(N) lines per lock. The chain's ring is the largest single item (4 KB per
+lock at N=16). That is irrelevant for the microbenchmark, ~30 MB at 10k locks, but ~3 GB
+for 1M locks at N=8 (KV store scale). The server also keeps a 128-entry assignment array
+(~0.8 KB node-local) per homed lock; it could be sized to R. Options, none implemented:
+
+1. **Smaller window.** Any power of two ≥ 2 is correct (`stress_server_*_handoff_window2`).
+   It trades memory for resyncs: 2N gives 1.48M vs 1.54M at 8x1. R = 2-4 is not measured.
+2. **Rings on demand (preferred before the KV store).** Each home keeps a pool of rings.
+   It assigns one to a lock when a second request arrives, carries the ring index in the
+   grant word (bits 52-63 are free), and reclaims the ring when a REL leaves the lock free.
+   At that point the server knows every assigned number has finished. Memory then scales
+   with the number of concurrently contended locks, not with nlocks; uncontended locks get
+   hint = 0 grants and never touch a ring. Reuse is safe because of clear-on-assign: holder
+   n reads only slot n % R, which the server cleared when it assigned n, so entries left by
+   the ring's previous lock are never visible. Pool exhaustion falls back to Phase 1 grants
+   (no ring, hint = 0).
+3. **Pack 8 entries per line.** The ring is uncached and has a single writer (the server),
+   so packing is safer than for multi-writer variables. It still assumes the device applies
+   an 8-byte store without disturbing the line's other words. That is the open sub-line
+   write question (design §2 rule 3; partial-write test in §5). It would cut ring memory 8x
+   and could combine with option 2.
+
+**Summary.** For (c), cross-node handoff works much better than gate + owner did for
+(a)/(b)/(d): no uncontended cost, +10% (4x1) to +35% (8x1) capacity, and much better tails
+near saturation. It still trails the Phase 1 tournament at low load (the server's poll
+latency) and at 8x1 capacity (1.55 vs 1.68M). The costs: R uncached lines per lock
+(2 KB at N=8), grant slots with two possible writers, and a server that no longer sees each
+hold boundary, so (e)'s yield rule and 2c migration would need rework.
