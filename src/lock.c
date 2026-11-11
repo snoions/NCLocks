@@ -52,6 +52,7 @@ struct ncl_local_lock {
     struct ncl_node_stats st;
 } NCL_ALIGNED(NCL_CACHELINE);
 
+int ncl_wb_overlap = 1;              /* see ncl_release */
 static struct ncl_hdr *hdr;          /* in shared meta */
 static struct ncl_sys_cfg cfg;       /* node-local copy */
 static struct ncl_local_lock *local; /* node-local array [nlocks] */
@@ -503,23 +504,31 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
         }
     }
 
-    /* Global lock leaving this node: write back eagerly (design §2 rule 5). */
+    /* Global lock leaving this node: write back eagerly (design §2 rule 5).
+     * Overlap (ncl_wb_overlap, MODE_HANDOFF only): issue the flushes without
+     * the trailing fence, so the release path's leading loads (2b
+     * pick_waiter, the chain's succ[] load) run while they complete. Both
+     * paths ncl_fence() before the store that hands the lock (and so the
+     * data) to another node: handoff_release before the owner store,
+     * ncl_srv_chain_release before the grant store, send() before REL. */
+    int overlap = ncl_wb_overlap && cfg.mode == NCL_MODE_HANDOFF;
+    void (*wb)(const void *, size_t) = overlap ? ncl_data_writeback_nofence : ncl_data_writeback;
     if (!cfg.debug_skip_data_wb) {
         if (cohort()) {
             if (L->dirty_full) {
                 if (L->data_len)
-                    ncl_data_writeback(L->data, L->data_len);
+                    wb(L->data, L->data_len);
             } else {
                 for (int k = 0; k < L->ndirty; k++)
-                    ncl_data_writeback(L->dirty[k].p, L->dirty[k].len);
+                    wb(L->dirty[k].p, L->dirty[k].len);
             }
         } else if (!hints) {
             if (L->data_len)
-                ncl_data_writeback(L->data, L->data_len);
+                wb(L->data, L->data_len);
         } else {
             for (int k = 0; k < nhints; k++) {
                 check_hint(&hints[k]);
-                ncl_data_writeback(hints[k].p, hints[k].len);
+                wb(hints[k].p, hints[k].len);
             }
         }
     }

@@ -171,6 +171,10 @@ struct ncl_node_stats {
     struct ncl_handoff_stats ho;
 };
 
+/* MODE_HANDOFF: overlap the global release's data writeback with the
+ * release path's leading metadata loads (default 1; set before fork). */
+extern int ncl_wb_overlap;
+
 int ncl_sys_create(const struct ncl_sys_cfg *cfg);
 void ncl_sys_destroy(void);
 

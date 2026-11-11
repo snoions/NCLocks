@@ -22,7 +22,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   - Multi-line metadata reads (scans, server poll) go through `ncl_uc_load_many` /
     `ncl_uc_scan_first`: batched on cached-flush (all flushes, one mfence, parallel loads;
     `-Q serial` to disable), serial with early exit elsewhere. Loads within a batch are
-    unordered. Notes and uc vs cached-flush measurements: `docs/backends.md`.
+    unordered. 2b and the (c) chain issue the release's data writeback without a fence
+    and rely on their fence before the handoff store (`-O on|off`). Notes and uc vs
+    cached-flush measurements: `docs/backends.md`.
   - `coherent`: baseline.
 - `include/ncl/submutex.h`: MCS submutex with local-waiter detection.
 - `include/ncl/base.h`, `src/base.c`: Lamport (a), tournament (b), hybrid (d) per design §4d

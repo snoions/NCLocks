@@ -269,6 +269,11 @@ static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count
  * lines are written (a writeback can clobber a neighbor on the same line —
  * callers must not share lines between independently locked data). */
 void ncl_data_writeback(const void *p, size_t len);
+/* Same, but only ISSUES the writeback: no trailing fence. The caller must
+ * ncl_fence() before any store that lets another node read the data (that
+ * fence waits for the clflushopts). Lets independent loads overlap the
+ * flushes (docs/backends.md). */
+void ncl_data_writeback_nofence(const void *p, size_t len);
 
 /* Discard this node's cached copy of [p, p+len) so later reads fetch the
  * device contents. Must not be called while holding unwritten dirty data in

@@ -111,6 +111,45 @@ Raw data: `results/backends_batch_uc_cf.csv` (`variant` column; `cf` = cached-fl
 
   This would bring in the cached-metadata requirements of design §1: no clean writebacks,
   and padding to the host's writeback granularity. Not implemented.
-- **Not done yet:** overlapping the data writeback with the release-path loads that do not
-  depend on it (2b `pick_waiter`, the chain's `succ` load). That also applies to `uc`,
-  where data is cached.
+
+## Overlapping the data writeback with release-path loads (`-O on|off`, default on)
+
+Only the store that hands the lock to another node has to wait for the data writeback.
+Two release paths load metadata before that store: 2b (`pick_waiter`) and the (c) chain
+(the `succ[]` load). With overlap, `ncl_release` issues the data flushes without the
+trailing fence (`ncl_data_writeback_nofence`). The fence those paths already have before
+the handoff store then waits for the flushes: `handoff_release` before the owner store,
+`ncl_srv_chain_release` before the grant store, and `send()` before REL. The other release
+paths (Lamport, tournament, hybrid, fastsrv, Phase 1 server) start with a store, so they
+keep the fenced writeback. Emu's writeback is a synchronous copy, so emu cannot detect a
+misplaced fence here; correctness rests on the fence placement listed above.
+
+**`ncl_memlat`** (one metadata load next to K dirty data-line flushes; fence first vs load
+first):
+
+| K | uc: fence, load | uc: load, fence | cf: fence, load | cf: load, fence |
+|---|---|---|---|---|
+| 1 | 201 ns | 201 ns | 203 ns | 191 ns |
+| 8 | 230 ns | 237 ns | 252 ns | 239 ns |
+| 64 | 578 ns | 671 ns | 616 ns | 652 ns |
+
+A UC load does not get ahead of outstanding `clflushopt`s: it waits for them, as if they
+were older stores (UC is strongly ordered). So on `uc` there is nothing to overlap.
+
+**Locks** (N=8 x 1, 2b and chain, 3 interleaved reps; `results/wb_overlap_uc_cf.csv`):
+
+| | footprint | closed off -> on | hold at 100k off -> on |
+|---|---|---|---|
+| tournament 2b, uc | 64 B / 4 KB | 0.920 -> 0.920 / 0.582 -> 0.592M | 512 -> 512 / 960 -> 960 ns |
+| tournament 2b `-X scan`, uc | 64 B / 4 KB | 0.917 -> 0.933 / 0.585 -> 0.597M | unchanged |
+| chain (server), uc | 64 B / 4 KB | 1.535 -> 1.589 / 0.785 -> 0.793M | 384 -> 320 / 896 -> 896 ns |
+| tournament 2b `-X scan`, cf batched | 64 B / 4 KB | **0.949 -> 1.007 / 0.610 -> 0.644M** | 512 -> 512 / **1152 -> 1024 ns** |
+
+- **uc:** 0-3%, about the run-to-run noise; hold times are within one histogram bucket.
+- **cached-flush:** +6% capacity, and 128 ns less hold at 4 KB. That gain is not real
+  overlap: the data flushes and the batched `announce[]` flushes now share ONE `mfence`
+  instead of two.
+- A few runs (minimums 0.47-0.96M) were disturbed by a micro-benchmark I ran concurrently
+  by mistake. The medians are unaffected.
+
+The default stays on: neutral on `uc`, and on cached-flush it saves a fence.

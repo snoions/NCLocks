@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     int K = argc > 2 ? atoi(argv[2]) : 7;
-    if (K < 1 || K > 30) return 2;
+    if (K < 1 || K > 64) return 2;
     struct ncl_mem_cfg c = {.backend = be, .meta_size = 1<<20, .data_size = 1<<20};
     if (ncl_mem_init(&c)) return 1;
     ns_per_cycle = tsc_ns();
@@ -44,6 +44,17 @@ int main(int argc, char **argv) {
             atomic_store_explicit(&L[1].v, it, memory_order_relaxed); _mm_clflushopt((void*)&L[1]);
             _mm_clflushopt((void*)&L[0]); _mm_mfence(); sink += atomic_load_explicit(&L[0].v, memory_order_relaxed); });
     }
+    /* Writeback overlap: dirty K data lines, flush them, then one metadata
+     * load either after the fence (serial) or before it (overlapped). */
+    char *dat = ncl_mem.data;
+    TIME("K dirty data flushes; mfence; 1 meta load", {
+        for (int k=0;k<K;k++) dat[k*64] = (char)it;
+        for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
+        _mm_mfence(); sink += ncl_uc_load(&L[0]); });
+    TIME("K dirty data flushes; 1 meta load; mfence", {
+        for (int k=0;k<K;k++) dat[k*64] = (char)it;
+        for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
+        sink += ncl_uc_load(&L[0]); _mm_mfence(); });
     TIME("store; mfence; load (Dekker step, backend)", { ncl_uc_store(&L[1], it); ncl_fence(); sink += ncl_uc_load(&L[0]); });
     ncl_mem_fini();
     return 0;

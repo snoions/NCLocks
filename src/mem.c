@@ -359,6 +359,14 @@ void ncl_data_writeback(const void *p, size_t len)
 {
     if (len == 0)
         return;
+    ncl_data_writeback_nofence(p, len);
+    ncl_fence();
+}
+
+void ncl_data_writeback_nofence(const void *p, size_t len)
+{
+    if (len == 0)
+        return;
     uintptr_t lo, hi;
     line_range(p, len, &lo, &hi);
 
@@ -380,7 +388,6 @@ void ncl_data_writeback(const void *p, size_t len)
         break;
     }
     }
-    ncl_fence();
 }
 
 void ncl_data_invalidate(const void *p, size_t len)
