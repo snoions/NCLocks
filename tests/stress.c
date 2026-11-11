@@ -222,7 +222,8 @@ static void usage(const char *argv0)
             "  -m            ablation: no local submutex\n"
             "  -M MODE       phase1|local|handoff (default phase1)\n"
             "  -K CAP        local/handoff: max consecutive local handoffs (default 64)\n"
-            "  -G PLACE      handoff: announce inside the gate (default) | before\n"
+            "  -G PLACE      handoff: announce lazy (default) | inside | before\n"
+            "  -X PICK       handoff: pick_waiter adaptive (default) | scan | probe\n"
             "  -F MODE       (d)/(e) fast-release check: hint (default) | scan\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
@@ -245,7 +246,7 @@ int main(int argc, char **argv)
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:mHph", lopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:X:mHph", lopts, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -267,8 +268,24 @@ int main(int argc, char **argv)
         case 'K': cfg.local_cap = atoi(optarg); break;
         case 'G':
             if (!strcmp(optarg, "before"))
-                cfg.announce_before = 1;
-            else if (strcmp(optarg, "inside")) {
+                cfg.announce_place = NCL_ANNOUNCE_BEFORE;
+            else if (!strcmp(optarg, "inside"))
+                cfg.announce_place = NCL_ANNOUNCE_INSIDE;
+            else if (!strcmp(optarg, "lazy"))
+                cfg.announce_place = NCL_ANNOUNCE_LAZY;
+            else {
+                usage(argv[0]);
+                return 2;
+            }
+            break;
+        case 'X':
+            if (!strcmp(optarg, "probe"))
+                cfg.pick_policy = NCL_PICK_PROBE;
+            else if (!strcmp(optarg, "adaptive"))
+                cfg.pick_policy = NCL_PICK_ADAPTIVE;
+            else if (!strcmp(optarg, "scan"))
+                cfg.pick_policy = NCL_PICK_SCAN;
+            else {
                 usage(argv[0]);
                 return 2;
             }

@@ -11,16 +11,26 @@ Variants (a) Lamport, (b) tournament, (d) hybrid serve as the gate; (c)/(e) are 
 - **Layout:** per lock, after the base-algorithm lines: one uncached `owner` line
   (0 = FREE, node+1 = held) and `announce[N]`, one line per node. Epoch bits in the
   owner word (§3.5 Open) are not implemented.
-- **Acquire** (caller holds the submutex): gate = `ncl_base_lock`; announce; fence;
-  read `owner`; if FREE or me, store me (one 8-byte store), fence, `ncl_base_unlock`.
-  Otherwise leave the gate and poll `owner`: me = handoff received, FREE = missed
-  announcement (back through the gate). On success: fence, `announce = 0`.
-- **Release** (never enters the gate): data writeback as before; scan `announce[]`
-  round-robin from me+1; fence; store the first waiter (handoff) or FREE; then the
-  submutex unlock. Local cohort passing happens first, exactly as in 2a.
-- **Announce placement (§3.5 Open):** `-G inside` (default, the spec's baseline: announce
-  after entering the gate) or `-G before` (announce, fence, then the gate). Both are safe
-  by the "owner == me means handoff" rule.
+- **Acquire** (caller holds the submutex): gate = `ncl_base_lock`; fence; read `owner`;
+  if FREE or me, store me (one 8-byte store), fence, `ncl_base_unlock`. Otherwise
+  announce, fence, leave the gate and poll `owner`: me = handoff received, FREE = missed
+  announcement (back through the gate). On success: fence, `announce = 0` if announced.
+- **Release** (never enters the gate): data writeback as before; `pick_waiter`; fence;
+  store the chosen waiter (handoff) or FREE; then the submutex unlock. Local cohort passing
+  happens first, exactly as in 2a.
+- **Announce placement (§3.5 Open), `-G`:** `lazy` (**default**): inside the gate, and only
+  after reading a held owner, so an uncontended take never touches `announce[]`.
+  `inside` (the spec's baseline): announce right after entering the gate. `before`:
+  announce, fence, then the gate. All are safe by the "owner == me means handoff" rule plus
+  the missed-announcement recovery.
+- **`pick_waiter`, `-X`:** `adaptive` (**default**): if this node's own global acquisition
+  was uncontended (it took a FREE owner without waiting), probe ONE `announce[]` slot at a
+  per-node round-robin pointer; otherwise scan round-robin from me+1 as the spec says.
+  `scan`: always scan (spec). `probe`: always one probe, which collapses at moderate load
+  (below). A probe that misses stores FREE; a waiter it skipped recovers through the gate.
+  The pointer advances past the node served (or by one on a miss), so under saturation the
+  pointers sweep the ring. A pointer that only remembered the last waiter would let two
+  nodes hand the lock back and forth while the others never see FREE.
 - **Safety sketch:** `owner` is written only by the holder (at release) or by a gate user
   that read FREE (or its own ID); gate users are mutually excluded, and a FREE owner has no
   holder, so no two writers race. A releaser that misses an announcement stores FREE after
@@ -33,11 +43,15 @@ Variants (a) Lamport, (b) tournament, (d) hybrid serve as the gate; (c)/(e) are 
 - **Stats** (`struct ncl_handoff_stats`, CSV columns `global_handoff_frac`,
   `local_handoff_frac`, `missed_announce_per_acq`, `owner_polls_per_acq`,
   `gate_entries_per_acq`, `announce_loads_per_acq`); path `NCL_PATH_GLOBAL_HANDOFF`.
-- **Tests:** `stress_{lamport,tournament,hybrid}_{emu,uc}_handoff[_before_cap1]`
-  (`-K 1` makes almost every release a cross-node handoff), emu negative tests with
+- **Tests:** `stress_{lamport,tournament,hybrid}_{emu,uc}_handoff{,_cap1,_inside_scan,
+  _before_cap1,_probe_cap1}` (`-K 1` makes almost every release a cross-node handoff;
+  defaults are lazy/adaptive), emu negative tests with
   `--skip-wb` / `--skip-inv` in handoff mode, and `handoff_rejects_server`.
 
-## Measurements (uc, 200 ns CS, 64 B footprint, `-B 16`, 3 interleaved reps)
+## Measurements: spec baseline (uc, 200 ns CS, 64 B footprint, `-B 16`, 3 interleaved reps)
+
+This section uses the spec's baseline, `-G inside -X scan` (plus `-G before`). The
+optimizations and the current defaults are in the next section.
 
 Raw data: `results/handoff_uc.csv`.
 
@@ -96,5 +110,54 @@ acquisitions, at moderate load).
 
 **Summary.** Gate + owner pays off where the base algorithm is expensive to hold across the
 CS (Lamport: 0.50 -> 0.93M at N=8 and starvation gone). With the tournament or hybrid as the
-gate it costs 20-45% capacity and about +400 ns uncontended on this platform. Candidate
-optimizations: announce lazily (only after reading a held owner) and a hinted `pick_waiter`.
+gate it costs 20-45% capacity and about +400 ns uncontended on this platform. The
+optimizations below recover most of the uncontended hold-time cost but not the handoff
+cycle.
+
+## Optimizations: lazy announce and adaptive `pick_waiter` (now the defaults)
+
+Raw data: `results/handoff_opt_uc.csv` (Phase 1, inside/scan, lazy/scan, inside/probe,
+lazy/probe; 4x1, 8x1, Poisson 100k at N=4 and 100k-900k at N=8, on/off at N=8) and
+`results/handoff_adaptive_uc.csv` (inside/lazy x scan/adaptive). 3 interleaved reps each.
+
+**Lazy announce** (`-G lazy`): saves the announce store and its clear on an uncontended take.
+- Acquire p50 improves by 32-64 ns, about one histogram bucket: tournament N=4 799 -> 767 ns,
+  Lamport N=8 767 -> 703 ns, hybrid N=8 1087 -> 991 ns. That is less than the two round
+  trips expected; uncached stores are cheaper than loads.
+- Capacity is unchanged.
+- Missed-announcement recoveries double (tournament 600k: 0.05 -> 0.10 per acquisition)
+  because waiters announce later. Latency at 300-600k is unchanged to slightly worse.
+
+**Always-probe** (`-X probe`): rejected as a default.
+- It gets the expected win where every slot agrees: uncontended (tournament N=8 hold −450
+  ns) and saturated (tournament 4x1 0.92 -> 0.97M).
+- At moderate load, the single probe usually hits an idle slot and stores FREE while others
+  wait, so they all retry through the gate. Recoveries reach 0.25-0.79 per acquisition at
+  300k-900k.
+
+  | N=8, 600k, p50 | scan | probe |
+  |---|---|---|
+  | Lamport | 2.0 us | 139 us |
+  | hybrid | 2.4 us | 39 us |
+
+  Hybrid 8x1 capacity also drops from 0.90 to 0.75M.
+
+**Adaptive** (`-X adaptive`): probe only after an uncontended acquisition.
+
+| N=8 | scan | adaptive |
+|---|---|---|
+| hold at 100k (sojourn p50), tournament / Lamport / hybrid | 1983 / 1727 / 2047 ns | **1535 / 1279 / 1599 ns** |
+| release loads per acquisition at 100k | 6.7 | 1.4 |
+| closed-loop capacity, tournament / Lamport / hybrid | 0.913 / 0.922 / 0.893M | 0.919 / 0.908 / 0.899M |
+| fairness | 1.00 | 1.00 |
+| recoveries per acquisition at 300k / 600k | 0.05 / 0.05 | 0.18 / 0.22 |
+| p99 at 300k, tournament / hybrid | 4.4 / 6.1 us | 5.4 / 9.2 us |
+
+p50 at 300k and 600k is unchanged. At 900k, close to saturation, and in the on/off runs,
+every variant is bimodal from run to run (e.g. tournament p99 at 900k ranges 0.2-1.8 ms
+across variants), so those points do not rank the variants.
+
+**With both defaults**, tournament N=8 hold time at 100k is ~1471 ns, versus ~1983 ns for
+the spec baseline and ~991 ns for Phase 1. The acquire still costs about +380 ns over
+Phase 1, and saturated capacity stays at ~0.92M: neither change shortens the handoff cycle.
+The spec baseline remains available as `-G inside -X scan`.

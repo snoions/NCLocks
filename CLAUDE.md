@@ -34,7 +34,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   `sched_yield()`, so oversubscribed runs make progress.
 - `include/ncl/lock.h`, `src/lock.c`: two-level lock. Modes: Phase 1, Phase 2a local handoff,
   and Phase 2b `NCL_MODE_HANDOFF` (`-M handoff`): gate + owner field per design §3.3 for
-  (a)/(b)/(d), both §3.5 announce placements (`-G inside|before`); not model-checked; notes and
+  (a)/(b)/(d). Defaults: lazy announce (`-G lazy`; §3.5 alternatives `inside`, the spec
+  baseline, and `before`) and adaptive `pick_waiter` (`-X adaptive`; `scan` = spec). Not
+  model-checked; notes and
   measurements in `docs/handoff.md`. Includes the no-submutex ablation and full or precise data
   writeback.
 - `tests/stress.c`; `bench/microbench.c`: closed loop (default) or open loop (`-r RATE`, `-A

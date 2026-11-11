@@ -99,7 +99,7 @@ For Phase 1 of the evaluation, the base algorithm **is** held across the critica
 
 - **Announce before entering the gate** (instead of inside it) would shorten gate hold time and is safe given the "owner == me means handoff" rule. Evaluate both; current baseline announces inside.
 - Epoch bits in the owner word: useful for debugging and data-writeback versioning; bit allocation TBD.
-- *Measured (Phase 2b, `docs/handoff.md`):* both placements are implemented (`-G inside|before`). `before` cuts missed-announcement recoveries ~100x with otherwise similar latency and capacity. The uncontended cost is ≈ +4 round trips, not +1 (announce store, owner load, owner store, announce clear, plus fences), and the release scan of `announce[]` adds up to N−1 loads.
+- *Measured (Phase 2b, `docs/handoff.md`):* both placements are implemented (`-G inside|before`), plus a third, **lazy** (announce inside the gate only after reading a held owner; now the implementation default). A releaser's `pick_waiter` may also probe a single slot when its own acquisition was uncontended, instead of scanning (`-X adaptive`, default; a miss stores FREE and the waiter recovers through the gate). Neither changes the safety argument above. `before` cuts missed-announcement recoveries ~100x with otherwise similar latency and capacity. The uncontended cost is ≈ +4 round trips, not +1 (announce store, owner load, owner store, announce clear, plus fences), and the release scan of `announce[]` adds up to N−1 loads.
 
 ## 4. Global algorithms
 

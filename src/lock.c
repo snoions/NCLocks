@@ -43,6 +43,8 @@ struct ncl_local_lock {
     size_t data_len;
     ncl_line_t *owner;    /* HANDOFF: uncached owner word (0 = FREE, node+1) */
     ncl_line_t *announce; /* HANDOFF: announce[P], one line per node */
+    int pw_next;          /* HANDOFF, pick_policy: next announce[] slot to probe */
+    int acq_contended;    /* HANDOFF: this global acquisition waited or got a handoff */
     /* LOCAL/HANDOFF precise hints accumulated over a local run */
     int ndirty, dirty_full;
     struct ncl_range dirty[NCL_DIRTY_MAX];
@@ -212,6 +214,7 @@ int ncl_node_attach(int node_id)
                              ncl_base_nlines(cfg.alg, hdr->participants);
             local[l].owner = ho;
             local[l].announce = ho + 1;
+            local[l].pw_next = (node_id + 1) % hdr->participants;
         }
         local[l].data = d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL;
         local[l].data_len = d[l].data_len;
@@ -259,15 +262,20 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
     ncl_line_t *ann = &L->announce[me];
     int path;
 
-    if (cfg.announce_before) {
+    const int place = cfg.announce_place;
+    int announced = 0, waited = 0;
+    if (place == NCL_ANNOUNCE_BEFORE) {
         ncl_uc_store(ann, 1);
         ncl_fence(); /* announce visible before the gate's owner read */
+        announced = 1;
     }
     for (;;) {
         int gpath = ncl_base_lock(&L->base, me, bst);
         h->gate_entries++;
-        if (!cfg.announce_before)
+        if (place == NCL_ANNOUNCE_INSIDE && !announced) {
             ncl_uc_store(ann, 1);
+            announced = 1;
+        }
         /* Announce (inside variant) before the owner read: a releaser that
          * misses it must store its FREE/handoff after our read of `owner`
          * returned "held", so our poll later sees FREE and we retry. */
@@ -282,15 +290,27 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
             ncl_base_unlock(&L->base, me, gpath, bst);
             if (o == mine) {
                 h->gate_handoffs++;
+                L->acq_contended = 1;
                 path = NCL_PATH_GLOBAL_HANDOFF;
             } else {
                 h->gate_takes++;
+                L->acq_contended = waited;
                 path = gpath;
             }
             break;
         }
+        if (place == NCL_ANNOUNCE_LAZY && !announced) {
+            /* Lazy: announce only now that the owner is known to be held.
+             * Same argument as above: if the holder's pick_waiter misses
+             * this store, its FREE lands after our read of "held", and our
+             * poll sees FREE and retries the gate. */
+            ncl_uc_store(ann, 1);
+            ncl_fence();
+            announced = 1;
+        }
         ncl_base_unlock(&L->base, me, gpath, bst);
 
+        waited = 1;
         /* Wait: poll the owner field directly (no separate handoff flag).
          * Capped backoff paces the uncached polls. This wait depends on
          * another node's releaser and, after a handoff, on THIS thread
@@ -308,6 +328,7 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
             check_owner(o);
             if (o == mine) {
                 h->wait_handoffs++;
+                L->acq_contended = 1;
                 path = NCL_PATH_GLOBAL_HANDOFF;
                 goto acquired;
             }
@@ -324,7 +345,8 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
     }
 acquired:
     ncl_fence(); /* ownership observed before the CS and the clear below */
-    ncl_uc_store(ann, 0);
+    if (announced)
+        ncl_uc_store(ann, 0);
     return path;
 }
 
@@ -334,6 +356,22 @@ static void handoff_release(struct ncl_local_lock *L, int me)
     struct ncl_handoff_stats *h = &L->st.ho;
     const int P = hdr->participants;
     int w = -1;
+    int probe = cfg.pick_policy == NCL_PICK_PROBE ||
+                (cfg.pick_policy == NCL_PICK_ADAPTIVE && !L->acq_contended);
+    if (probe && P > 1) {
+        /* One probe at this node's round-robin pointer. Hit: hand off and
+         * continue after that node next time. Miss: FREE (a waiter we did
+         * not probe recovers through the gate) and advance by one. Under
+         * saturation every slot is set, so the pointers sweep the ring. */
+        int j = L->pw_next;
+        h->announce_loads++;
+        if (ncl_uc_load(&L->announce[j]))
+            w = j;
+        int nx = (j + 1) % P;
+        if (nx == me)
+            nx = (nx + 1) % P;
+        L->pw_next = nx;
+    } else
     for (int k = 1; k < P; k++) { /* pick_waiter: round-robin after me */
         int j = (me + k) % P;
         h->announce_loads++;

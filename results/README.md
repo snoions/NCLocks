@@ -32,7 +32,12 @@ docs/hybrid.md), so its capacity there is ~0.92M rather than ~1.04M.
   other `present[]`) vs hint (remembered slot only; now the default). 4x1, 8x1 (servers
   `-Y sibling`) and 4x2 local; closed loop + Poisson 100k-1M; spin backoff 16;
   3 interleaved reps with alternating A/B order.
-- `handoff_uc.csv`: Phase 2b gate + owner (`mode=handoff`, `announce` inside/before) vs
+- `handoff_uc.csv`: Phase 2b gate + owner (`mode=handoff`, `announce` inside/before; pick = scan, the spec baseline; these rows predate the `pick` column) vs
   Phase 1 (or 2a local at 4x2) for lamport, tournament, hybrid. Closed loop 4x1, 8x1, 4x2;
   Poisson 100k (N=4) and 100k-1.5M (N=8); on/off 1 ms/25% at 300k/600k (N=8); spin
   backoff 16; 3 interleaved reps. See docs/handoff.md.
+- `handoff_opt_uc.csv`: Phase 2b announce placement x pick_waiter (`announce`, `pick`
+  columns: inside/lazy x scan/probe) plus Phase 1; lamport, tournament, hybrid; closed 4x1,
+  8x1; Poisson 100k (N=4), 100k-900k (N=8); on/off 300k (N=8); 3 reps.
+- `handoff_adaptive_uc.csv`: inside/lazy x scan/adaptive; closed 8x1; Poisson 100k (N=4),
+  100k-900k (N=8); on/off 300k (N=8); 3 reps. Lazy + adaptive became the defaults.

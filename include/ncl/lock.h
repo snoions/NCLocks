@@ -31,8 +31,15 @@
  *                     means a missed announcement, so they go back through the
  *                     gate. Not for SERVER/FASTSRV (they hand off through the
  *                     server queue) or the no-submutex ablation.
- *                     cfg.announce_before selects the §3.5 Open placement:
- *                     0 = announce inside the gate (baseline), 1 = before it.
+ *                     cfg.announce_place selects the §3.5 Open placement:
+ *                     NCL_ANNOUNCE_LAZY (default: inside the gate, only
+ *                     after reading a held owner), _INSIDE (spec baseline),
+ *                     _BEFORE.
+ *                     cfg.pick_policy (NCL_PICK_*): release probes one
+ *                     announce[] slot at a per-node round-robin pointer if
+ *                     this node's own acquisition was uncontended, else scans
+ *                     (ADAPTIVE, default); always scans (SCAN, spec); always
+ *                     probes (PROBE; collapses at moderate load).
  *
  * Precise dirty hints under NCL_MODE_LOCAL: hints from every release in a
  * local run are accumulated (node-local) and all written back when the lock
@@ -63,6 +70,12 @@ typedef enum {
     NCL_MODE_LOCAL = 2,
 } ncl_mode_t;
 
+/* Announce placement in MODE_HANDOFF (design §3.5 Open). LAZY: inside the gate,
+ * and only after reading a held owner (an uncontended take never announces). */
+enum { NCL_ANNOUNCE_LAZY = 0, NCL_ANNOUNCE_INSIDE = 1, NCL_ANNOUNCE_BEFORE = 2 }; /* 0 = default */
+
+enum { NCL_PICK_ADAPTIVE = 0, NCL_PICK_SCAN = 1, NCL_PICK_PROBE = 2 }; /* 0 = default */
+
 enum { NCL_SRV_PIN_NONE = 0, NCL_SRV_PIN_NEXT = 1, NCL_SRV_PIN_SIBLING = 2 };
 
 struct ncl_sys_cfg {
@@ -74,7 +87,8 @@ struct ncl_sys_cfg {
     int nlocks;
     int no_submutex;        /* ablation: each thread is a global participant */
     int local_cap;          /* LOCAL/HANDOFF: max consecutive local handoffs (0 = 64) */
-    int announce_before;    /* HANDOFF: announce before entering the gate (§3.5); 0 = inside */
+    int announce_place;     /* HANDOFF: announce placement (§3.5), NCL_ANNOUNCE_*; 0 = lazy */
+    int pick_policy;        /* HANDOFF: pick_waiter policy, NCL_PICK_*; 0 = adaptive */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
