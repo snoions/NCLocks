@@ -136,31 +136,65 @@ batch) and stays within one histogram bucket of batch when the scan finds nothin
 `-F hint` (scans only in `ncl_splitter_reset_if_quiet`, which already pre-checks the hinted
 slot) is unchanged within noise: 0.94 / 0.91 / 0.90M.
 
-## Does the protocol ranking change? (N=8, defaults, `results/ranking_uc_cf_n8.csv`)
+## Does the protocol ranking change? (N=8 x 1, 200 ns CS, defaults, 3 interleaved reps)
 
-Measured with lazy announce, the 2b default at the time; see below.
+Raw data: `results/ranking_uc_cf_n8.csv`, with 2b at the current default `-G before`. An
+earlier run with lazy announce is in `results/ranking_uc_cf_n8_lazy.csv`, where
+Lamport-2b collapsed on cached-flush; see `docs/handoff.md`, "Announce placement
+revisited". cf = cached-flush (probe scans).
 
-| capacity rank | uc | cached-flush |
+**Capacity** (closed loop, Mops/s; fairness 1.00 unless noted):
+
+| rank | uc | cached-flush |
 |---|---|---|
-| 1-3 | tournament 1.68, server chain 1.56, server 1.23 | tournament 1.62, server chain 1.51, server 1.22 |
-| 4 | fastsrv 1.12 | tournament-2b 1.04 |
-| 5 | hybrid 1.10 | hybrid-2b 0.99 (fairness 0.95) |
-| 6 | Lamport-2b 0.95 | fastsrv 0.98 |
-| 7 | tournament-2b 0.93 | hybrid 0.93 |
-| 8 | hybrid-2b 0.92 | Lamport-2b 0.51 (fairness 0.73) |
-| 9 | Lamport 0.49 (0.86) | Lamport 0.48 (0.70) |
+| 1 | tournament 1.70 (0.99) | tournament 1.62 |
+| 2 | server chain 1.58 | server chain 1.49 |
+| 3 | server 1.21 | server 1.22 |
+| 4 | hybrid 1.13 | **hybrid-2b 1.08** |
+| 5 | fastsrv 1.10 | **tournament-2b 1.04** |
+| 6 | Lamport-2b 0.94 | **Lamport-2b 1.02** |
+| 7 | tournament-2b 0.93 | fastsrv 0.96 |
+| 8 | hybrid-2b 0.92 | hybrid 0.91 |
+| 9 | Lamport 0.50 (0.86) | Lamport 0.46 (0.61) |
 
-- **The top three are the same on both backends.**
-- **Hybrid (Phase 1) drops.** At 600k it goes from 2nd (uc: 0.9 / 9.7 us) to 6th (cf:
-  2.7 / 19 us).
-- **The tournament loses its uncontended lead.** Each of its log N levels pays a flush
-  plus fence per load. Uncontended sojourn: uc Lamport 767 < tournament 991 < hybrid 1087
-  ns; cf Lamport 991 < hybrid ≈ Lamport-2b ≈ tournament ≈ 1343 ns.
-- **2b gates move up on cf** (tournament-2b 0.93 -> 1.04M), helped by batched scans and
-  the shared fence.
-- **Lamport-2b collapsed** because of lazy announce, not because of the backend. With
-  `-G before`, now the default, it reaches 1.03M at fairness 1.00 on cf, and hybrid-2b
-  1.06M (`docs/handoff.md`, "Announce placement revisited").
+**Uncontended** (Poisson 100k; sojourn p50 = acquire + hold):
+
+| rank | uc | cached-flush |
+|---|---|---|
+| 1 | Lamport 767 ns | Lamport 991 ns |
+| 2 | tournament 991 | hybrid 1343 |
+| 3 | hybrid, fastsrv 1087 | tournament 1343 |
+| 4 | Lamport-2b 1279 | fastsrv 1471 |
+| 5 | tournament-2b 1535 | Lamport-2b 1599 |
+| 6 | hybrid-2b 1599 | tournament-2b 1791 |
+| 7 | server, server chain 2175 | hybrid-2b 1919 |
+| 8 | | server, server chain 3199 |
+
+**Moderate load** (Poisson 600k; acquire p50 / p99):
+
+| rank | uc | cached-flush |
+|---|---|---|
+| 1 | tournament 0.6 / 3.1 us | tournament 0.9 / 4.4 us |
+| 2 | **hybrid 0.9 / 9.7 us** | server 1.2 / 7.4 us |
+| 3 | server chain 1.2 / 4.9 us | server chain 1.2 / 6.4 us |
+| 4 | server 1.2 / 7.2 us | tournament-2b 1.9 / 10 us |
+| 5 | fastsrv 1.7 / 16 us, tournament-2b 1.7 / 11 us | fastsrv 2.3 / 20 us |
+| 6 | Lamport-2b 2.0 / 19 us | Lamport-2b 2.6 / 22 us |
+| 7 | hybrid-2b 2.9 / 19 us | **hybrid 2.9 / 22 us** |
+| 8 | | hybrid-2b 4.6 / 25 us |
+| - | Lamport saturated (20% unserved) | Lamport saturated (18%) |
+
+What changes on cached-flush:
+- **The top three are the same in every metric.** Tournament first; server chain and
+  server next in capacity and at 600k; last uncontended, because of the idle server's poll
+  backoff.
+- **All three 2b gates move ahead of fastsrv and Phase 1 hybrid in capacity** (uc: last
+  three before Lamport). Their handoff cycle has fewer serialized uncached loads, and
+  batched scans plus the shared fence help.
+- **Phase 1 hybrid drops** from 2nd to 7th at 600k, and from 4th to 8th in capacity.
+- **Tournament and hybrid tie uncontended** (1343 ns): each of the tournament's log N
+  levels pays a flush plus fence per load, while the hybrid's fast path is O(1).
+- **Lamport stays first uncontended** and starves under load on both backends.
 
 ## Overlapping the data writeback with release-path loads (`-O on|off`, default on)
 
