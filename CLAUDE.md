@@ -110,6 +110,17 @@ them silently reintroduces the bugs the design exists to avoid:
   can't share an 8-byte word with other fields). Servers bounds-check any
   index/offset before writing on a message's behalf.
 
+## Platform assumptions from CXL 3.1 (design §1, §2 rule 3)
+
+The spec is in `CXL-3.1-Specification.pdf` (untracked, not for git). The cached regions are
+correct only if no caching agent issues *clean writebacks* of prefetched lines ("No Clean
+Writebacks" bit, spec §2.4.4); "own cache line" means the host's writeback granularity
+(may exceed 64 B). CXL.mem orders nothing across addresses (§3.3.11), so store-fence-load
+patterns rely on the host's fence waiting for write completion. Untorn aligned 8-byte words
+are guaranteed by x86 and the CXL link but only *assumed* at the device. Partial writes
+(`MemWrPtl`, byte enables) exist, but their atomicity is unspecified: packing single-writer
+lines is low risk; multi-writer lines need verification on the target device.
+
 ## Memory regions (design §2)
 
 Keep the memory-access layer abstract so the backend (uncached mapping vs. explicit

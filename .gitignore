@@ -6,3 +6,4 @@ kmod/.*.cmd
 kmod/Module.symvers
 kmod/modules.order
 *.swp
+CXL-3.1-Specification.pdf

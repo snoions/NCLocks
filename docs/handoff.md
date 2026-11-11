@@ -281,10 +281,12 @@ for 1M locks at N=8 (KV store scale). The server also keeps a 128-entry assignme
    the ring's previous lock are never visible. Pool exhaustion falls back to Phase 1 grants
    (no ring, hint = 0).
 3. **Pack 8 entries per line.** The ring is uncached and has a single writer (the server),
-   so packing is safer than for multi-writer variables. It still assumes the device applies
-   an 8-byte store without disturbing the line's other words. That is the open sub-line
-   write question (design §2 rule 3; partial-write test in §5). It would cut ring memory 8x
-   and could combine with option 2.
+   so it needs only what CXL 3.1 defines: `MemWrPtl` byte enables (Table 3-41) plus untorn
+   8-byte words. Even a host-side read-modify-write (forced by host-side encryption)
+   rewrites only the server's own words. It does not need the device to merge concurrent
+   partial writes from different hosts atomically, which the spec leaves unspecified
+   (design §2 rule 3). Confirm with the single-writer partial-write test (design §5). It
+   would cut ring memory 8x and could combine with option 2.
 
 **Summary.** For (c), cross-node handoff works much better than gate + owner did for
 (a)/(b)/(d): no uncontended cost, +10% (4x1) to +35% (8x1) capacity, and much better tails
