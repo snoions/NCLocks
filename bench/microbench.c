@@ -364,7 +364,8 @@ static void usage(const char *argv0)
             "              default 4N rounded up)\n"
             "  -O on|off   handoff: overlap the release's data writeback with its loads (on)\n"
             "  -Q MODE     multi-line metadata reads (scans, server poll): batch (cached-flush:\n"
-            "              flush all, one mfence, parallel loads; default) | serial\n"
+            "              flush all, one mfence, parallel loads) | probe (scans: first candidate\n"
+            "              alone, batch the rest on a miss; default) | serial\n"
             "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n"
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
             "              (SMT sibling of node n's first worker)\n"
@@ -413,11 +414,13 @@ int main(int argc, char **argv)
         case 'O': ncl_wb_overlap = strcmp(optarg, "off") != 0; break;
         case 'Q':
             if (!strcmp(optarg, "batch"))
-                ncl_meta_batch = 1;
+                ncl_meta_batch = NCL_META_BATCH;
             else if (!strcmp(optarg, "serial"))
-                ncl_meta_batch = 0;
+                ncl_meta_batch = NCL_META_SERIAL;
+            else if (!strcmp(optarg, "probe"))
+                ncl_meta_batch = NCL_META_PROBE;
             else {
-                fprintf(stderr, "-Q: batch|serial\n");
+                fprintf(stderr, "-Q: batch|probe|serial\n");
                 return 2;
             }
             break;
@@ -622,7 +625,7 @@ int main(int argc, char **argv)
                PER(tot->paths[NCL_PATH_GLOBAL_HANDOFF]), PER(tot->paths[NCL_PATH_LOCAL_HANDOFF]),
                PER(tot->ho.missed_announce), PER(tot->ho.owner_polls), PER(tot->ho.gate_entries),
                PER(tot->ho.announce_loads),
-               ncl_chain_window(), ncl_meta_batching() ? "batch" : "serial",
+               ncl_chain_window(), !ncl_meta_batching() ? "serial" : ncl_meta_batch == NCL_META_PROBE ? "probe" : "batch",
                cfg.mode != NCL_MODE_HANDOFF ? "-" : ncl_wb_overlap ? "on" : "off");
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "

@@ -21,7 +21,7 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
     behaves as uncached. Use it to check correctness.
   - Multi-line metadata reads (scans, server poll) go through `ncl_uc_load_many` /
     `ncl_uc_scan_first`: batched on cached-flush (all flushes, one mfence, parallel loads;
-    `-Q serial` to disable), serial with early exit elsewhere. Loads within a batch are
+    scans probe the first, hinted slot alone first: `-Q probe`, default; `batch`, `serial`), serial with early exit elsewhere. Loads within a batch are
     unordered. 2b and the (c) chain issue the release's data writeback without a fence
     and rely on their fence before the handoff store (`-O on|off`). Notes and uc vs
     cached-flush measurements: `docs/backends.md`.

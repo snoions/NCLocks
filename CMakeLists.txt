@@ -109,6 +109,12 @@ set_tests_properties(emu_detects_missing_writeback_handoff PROPERTIES WILL_FAIL 
 add_test(NAME emu_detects_missing_invalidate_handoff
   COMMAND ncl_stress -a hybrid -b emu -n 4 -t 3 -l 1 -i 5000 -M handoff -K 1 --skip-inv)
 set_tests_properties(emu_detects_missing_invalidate_handoff PROPERTIES WILL_FAIL TRUE)
+add_test(NAME stress_hybrid_cached-flush_probe_n8
+  COMMAND ncl_stress -a hybrid -b cached-flush -n 8 -t 2 -l 2 -i 10000 -F scan -Q probe)
+add_test(NAME stress_lamport_cached-flush_probe_n8
+  COMMAND ncl_stress -a lamport -b cached-flush -n 8 -t 2 -l 2 -i 10000 -Q probe)
+add_test(NAME stress_tournament_cached-flush_probe_handoff_scan
+  COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff -X scan -K 1 -Q probe)
 add_test(NAME stress_tournament_cached-flush_batch_handoff_scan
   COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff -X scan -K 1)
 add_test(NAME handoff_rejects_fastsrv

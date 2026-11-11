@@ -227,7 +227,7 @@ static void usage(const char *argv0)
             "                (server: adaptive = follow the grant's hint bit, scan = always read succ[])\n"
             "  -R LINES      server handoff: chain window, power of two (default 4N rounded up)\n"
             "  -O on|off     handoff: overlap release data writeback with its loads (default on)\n"
-            "  -Q MODE       multi-line metadata reads: batch (default; cached-flush only) | serial\n"
+            "  -Q MODE       multi-line metadata reads (cached-flush only): probe (default) | batch | serial\n"
             "  -F MODE       (d)/(e) fast-release check: hint (default) | scan\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
@@ -272,7 +272,10 @@ int main(int argc, char **argv)
         case 'K': cfg.local_cap = atoi(optarg); break;
         case 'R': cfg.chain_lines = atoi(optarg); break;
         case 'O': ncl_wb_overlap = strcmp(optarg, "off") != 0; break;
-        case 'Q': ncl_meta_batch = strcmp(optarg, "serial") != 0; break;
+        case 'Q':
+            ncl_meta_batch = !strcmp(optarg, "serial") ? NCL_META_SERIAL
+                             : !strcmp(optarg, "probe") ? NCL_META_PROBE : NCL_META_BATCH;
+            break;
         case 'G':
             if (!strcmp(optarg, "before"))
                 cfg.announce_place = NCL_ANNOUNCE_BEFORE;

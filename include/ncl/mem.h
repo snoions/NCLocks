@@ -202,7 +202,11 @@ static inline void ncl_uc_store(ncl_line_t *l, uint64_t v)
  * (it relies on snoops). A caller that needs one read before another must use
  * separate calls with ncl_fence() between them. Injected device latency
  * (dev_lat_ns) is charged once per batch: the accesses overlap. */
-extern int ncl_meta_batch; /* default 1 */
+/* 0 = serial, 1 = batch, 2 = probe (scans only: load the first candidate
+ * alone and batch the rest only if it is 0; under contention the first,
+ * hinted, slot usually decides). Default 2 (probe). */
+enum { NCL_META_SERIAL = 0, NCL_META_BATCH = 1, NCL_META_PROBE = 2 };
+extern int ncl_meta_batch;
 
 static inline int ncl_meta_batching(void)
 {
@@ -237,14 +241,28 @@ static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count
         ncl_line_t *ls[NCL_MAX_PARTICIPANTS];
         int idx[NCL_MAX_PARTICIPANTS];
         uint64_t v[NCL_MAX_PARTICIPANTS];
-        int m = 0;
-        for (int k = 0; k < count; k++) {
+        int m = 0, k0 = 0;
+        if (ncl_meta_batch == NCL_META_PROBE) {
+            for (; k0 < count; k0++) {
+                int j = (start + k0) % n;
+                if (j == skip)
+                    continue;
+                ++*nloads;
+                if (ncl_uc_load(&arr[j]))
+                    return j;
+                k0++;
+                break;
+            }
+        }
+        for (int k = k0; k < count; k++) {
             int j = (start + k) % n;
             if (j != skip) {
                 idx[m] = j;
                 ls[m++] = &arr[j];
             }
         }
+        if (m == 0)
+            return -1;
         ncl_uc_load_many(ls, m, v);
         *nloads += (uint64_t)m;
         for (int k = 0; k < m; k++)

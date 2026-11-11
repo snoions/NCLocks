@@ -40,7 +40,7 @@ writeback that real non-coherent hardware would not pay.
   - the Peterson wait (`flag[other]` and `turn` together);
   - 2b `pick_waiter` with `-X scan`;
   - the lock server's poll round (all N queue slots).
-- `-Q batch|serial` (bench and stress; default `batch`) for A/B; CSV column `meta_batch`.
+- `-Q probe|batch|serial` (bench and stress; default `probe`, see below) for A/B; CSV column `meta_batch`.
 - Server poll on serial backends keeps load-then-process per slot. A first version loaded
   all N slots before processing any; on `uc` at N=8 that delayed each grant by up to 7
   uncached loads (about 500 ns) and cost 35% capacity (1.21 -> 0.80M).
@@ -100,8 +100,8 @@ Raw data: `results/backends_batch_uc_cf.csv` (`variant` column; `cf` = cached-fl
 - **It loses a little under saturation.** The serial scan stops at the first set slot,
   usually the first one read, while the batch reads all of them. Hybrid `-F scan` and 2b
   `-X scan` lose 4-5% capacity against serial. Part of this is the testbed: flushing lines
-  that other cores keep modifying costs coherence traffic here. A possible refinement is
-  to probe the hinted slot alone first and batch the rest only on a miss. Not done.
+  that other cores keep modifying costs coherence traffic here. The probe-first refinement
+  (next section) recovers this.
 - **Everything else favors uc:** single-word polls, stores, and store-fence-load steps.
   Lock acquisition is 110-200 ns slower on cached-flush for every algorithm.
 - **Best of both would be per-region memory types:**
@@ -111,6 +111,30 @@ Raw data: `results/backends_batch_uc_cf.csv` (`variant` column; `cf` = cached-fl
 
   This would bring in the cached-metadata requirements of design §1: no clean writebacks,
   and padding to the host's writeback granularity. Not implemented.
+
+## Probe first, then batch (`-Q probe`, the default)
+
+`ncl_uc_scan_first` with `-Q probe` reads the first candidate alone (one `flushopt; mfence;
+load`). If that slot is 0, it batches the rest. The first candidate is the hinted or next
+slot (`reset_hint`, me+1). Under contention it usually decides, so a saturated scan costs
+one load as in serial mode; an empty scan costs one load plus one batch. Only scans
+change; `ncl_uc_load_many` (Peterson wait, server poll) still reads all lines.
+
+cached-flush, N=8 x 1, 3 interleaved reps (`results/scan_probe_cf.csv`):
+
+| | serial | batch | probe |
+|---|---|---|---|
+| tournament 2b `-X scan`, capacity | 1.061M | 1.008M | **1.059M** |
+| tournament 2b `-X scan`, hold at 100k | 960 ns | 512 ns | **576 ns** |
+| tournament 2b `-X scan`, 600k p50 / p99 | 2.2 / 9.2 us | 1.5 / 6.7 us | **1.6 / 6.9 us** |
+| hybrid `-F scan`, capacity | 0.930M | 0.909M | **0.931M** |
+| hybrid `-F scan`, hold at 100k | 1152 ns | 672 ns | **704 ns** |
+| Lamport, capacity (fairness) | 0.441M (0.77) | 0.493M (0.70) | 0.484M (0.74) |
+
+Probe matches serial at saturation (release loads per acquisition: 1.00 vs 7.00 for
+batch) and stays within one histogram bucket of batch when the scan finds nothing. Hybrid
+`-F hint` (scans only in `ncl_splitter_reset_if_quiet`, which already pre-checks the hinted
+slot) is unchanged within noise: 0.94 / 0.91 / 0.90M.
 
 ## Overlapping the data writeback with release-path loads (`-O on|off`, default on)
 
