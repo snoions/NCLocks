@@ -226,6 +226,7 @@ static void usage(const char *argv0)
             "  -X PICK       handoff: pick_waiter adaptive (default) | scan | probe\n"
             "                (server: adaptive = follow the grant's hint bit, scan = always read succ[])\n"
             "  -R LINES      server handoff: chain window, power of two (default 4N rounded up)\n"
+            "  -Q MODE       multi-line metadata reads: batch (default; cached-flush only) | serial\n"
             "  -F MODE       (d)/(e) fast-release check: hint (default) | scan\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
@@ -248,7 +249,7 @@ int main(int argc, char **argv)
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:X:R:mHph", lopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:X:R:Q:mHph", lopts, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -269,6 +270,7 @@ int main(int argc, char **argv)
             break;
         case 'K': cfg.local_cap = atoi(optarg); break;
         case 'R': cfg.chain_lines = atoi(optarg); break;
+        case 'Q': ncl_meta_batch = strcmp(optarg, "serial") != 0; break;
         case 'G':
             if (!strcmp(optarg, "before"))
                 cfg.announce_place = NCL_ANNOUNCE_BEFORE;

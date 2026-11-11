@@ -362,6 +362,8 @@ static void usage(const char *argv0)
             "              scan = always read\n"
             "  -R LINES    server handoff: chain window = succ[] lines per lock (power of two;\n"
             "              default 4N rounded up)\n"
+            "  -Q MODE     multi-line metadata reads (scans, server poll): batch (cached-flush:\n"
+            "              flush all, one mfence, parallel loads; default) | serial\n"
             "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n"
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
             "              (SMT sibling of node n's first worker)\n"
@@ -375,7 +377,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch"
 
 int main(int argc, char **argv)
 {
@@ -385,7 +387,7 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:X:R:mCHPh")) != -1) {
+    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:X:R:Q:mCHPh")) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -407,6 +409,16 @@ int main(int argc, char **argv)
         case 'M': if (ncl_mode_parse(optarg, &cfg.mode) < 0) { usage(argv[0]); return 2; } break;
         case 'K': cfg.local_cap = atoi(optarg); break;
         case 'R': cfg.chain_lines = atoi(optarg); break;
+        case 'Q':
+            if (!strcmp(optarg, "batch"))
+                ncl_meta_batch = 1;
+            else if (!strcmp(optarg, "serial"))
+                ncl_meta_batch = 0;
+            else {
+                fprintf(stderr, "-Q: batch|serial\n");
+                return 2;
+            }
+            break;
         case 'B': ncl_backoff_cap = (unsigned)atoi(optarg); break;
         case 'G':
             if (!strcmp(optarg, "inside"))
@@ -586,7 +598,7 @@ int main(int argc, char **argv)
 
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -608,7 +620,7 @@ int main(int argc, char **argv)
                PER(tot->paths[NCL_PATH_GLOBAL_HANDOFF]), PER(tot->paths[NCL_PATH_LOCAL_HANDOFF]),
                PER(tot->ho.missed_announce), PER(tot->ho.owner_polls), PER(tot->ho.gate_entries),
                PER(tot->ho.announce_loads),
-               ncl_chain_window());
+               ncl_chain_window(), ncl_meta_batching() ? "batch" : "serial");
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",

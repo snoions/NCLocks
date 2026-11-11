@@ -386,14 +386,7 @@ static void handoff_release(struct ncl_local_lock *L, int me)
             nx = (nx + 1) % P;
         L->pw_next = nx;
     } else
-    for (int k = 1; k < P; k++) { /* pick_waiter: round-robin after me */
-        int j = (me + k) % P;
-        h->announce_loads++;
-        if (ncl_uc_load(&L->announce[j])) {
-            w = j;
-            break;
-        }
-    }
+    w = ncl_uc_scan_first(L->announce, P, me + 1, P - 1, me, &h->announce_loads); /* round-robin after me */
     ncl_fence(); /* CS effects, data writeback and the scan before the owner store */
     if (w >= 0) {
         ncl_uc_store(L->owner, (uint64_t)w + 1); /* handoff = one 8-byte store */

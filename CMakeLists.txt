@@ -34,6 +34,8 @@ target_link_libraries(ncl_stress ncl)
 
 add_executable(ncl_bench bench/microbench.c)
 target_link_libraries(ncl_bench ncl m)
+add_executable(ncl_memlat bench/memlat.c)
+target_link_libraries(ncl_memlat ncl)
 
 enable_testing()
 foreach(alg lamport tournament hybrid server fastsrv)
@@ -51,6 +53,11 @@ foreach(alg lamport tournament hybrid server fastsrv)
     add_test(NAME stress_${alg}_emu_nosub
       COMMAND ncl_stress -a ${alg} -b emu -n 3 -t 3 -l 2 -i 10000 -m)
   endif()
+  # Batched multi-line reads (cached-flush only; default -Q batch): N=8 with the
+  # scan-heavy options. Exercises the batch index logic on a coherent host;
+  # it cannot expose missing flushes or fences (see include/ncl/mem.h).
+  add_test(NAME stress_${alg}_cached-flush_batch_n8
+    COMMAND ncl_stress -a ${alg} -b cached-flush -n 8 -t 2 -l 2 -i 10000 -F scan)
   add_test(NAME stress_${alg}_emu_precise
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 2 -l 3 -i 20000 -H)
 endforeach()
@@ -102,6 +109,8 @@ set_tests_properties(emu_detects_missing_writeback_handoff PROPERTIES WILL_FAIL 
 add_test(NAME emu_detects_missing_invalidate_handoff
   COMMAND ncl_stress -a hybrid -b emu -n 4 -t 3 -l 1 -i 5000 -M handoff -K 1 --skip-inv)
 set_tests_properties(emu_detects_missing_invalidate_handoff PROPERTIES WILL_FAIL TRUE)
+add_test(NAME stress_tournament_cached-flush_batch_handoff_scan
+  COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff -X scan -K 1)
 add_test(NAME handoff_rejects_fastsrv
   COMMAND ncl_stress -a fastsrv -b emu -M handoff)
 set_tests_properties(handoff_rejects_fastsrv PROPERTIES WILL_FAIL TRUE)

@@ -21,6 +21,7 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
+int ncl_meta_batch = 1;
 struct ncl_mem ncl_mem;
 
 /* Default VA for the shared region: high, unlikely to collide. */

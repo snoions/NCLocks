@@ -106,7 +106,10 @@ start:
         slow = 1;
         ncl_uc_store(LAM_B(b, i), 0);
         ncl_fence(); /* b[i] = 0 before scanning b[] */
-        for (int j = 0; j < b->P; j++)
+        /* Wait for every b[j] == 0, in index order. A batched first pass
+         * reads all slots at once; only nonzero ones are then awaited. */
+        uint64_t nl = 0;
+        for (int j = 0; (j = ncl_uc_scan_first(LAM_B(b, 0), b->P, j, b->P - j, -1, &nl)) >= 0; j++)
             await_eq(LAM_B(b, j), 0);
         if (ncl_uc_load(LAM_Y(b)) != me) {
             await_eq(LAM_Y(b), 0);
@@ -142,6 +145,12 @@ static void peterson_announce(ncl_line_t *flag_me, ncl_line_t *turn, uint64_t si
 
 static int peterson_may_enter(ncl_line_t *flag_other, ncl_line_t *turn, uint64_t side)
 {
+    if (ncl_meta_batching()) { /* both reads in one batch; either order is safe */
+        ncl_line_t *ls[2] = {flag_other, turn};
+        uint64_t v[2];
+        ncl_uc_load_many(ls, 2, v);
+        return !(v[0] && v[1] == side);
+    }
     return !(ncl_uc_load(flag_other) && ncl_uc_load(turn) == side);
 }
 
@@ -231,16 +240,11 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
         ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
         return;
     }
-    for (int k = 0; k < b->P; k++) {
-        int j = (start + k) % b->P;
-        if (j == i)
-            continue;
-        st->split_scan_loads++;
-        if (ncl_uc_load(SP_PRESENT(b, j))) {
-            b->reset_hint = j;
-            st->split_fast_keep_closed++;
-            return; /* leave CLOSED: someone is on the slow path */
-        }
+    int j = ncl_uc_scan_first(SP_PRESENT(b, 0), b->P, start, b->P, i, &st->split_scan_loads);
+    if (j >= 0) {
+        b->reset_hint = j;
+        st->split_fast_keep_closed++;
+        return; /* leave CLOSED: someone is on the slow path */
     }
     ncl_fence(); /* scan before the store (load->store order, explicit) */
     ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
@@ -271,16 +275,11 @@ void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_s
     /* Start after `skip` so the scan spreads over nodes; early exit on the
      * first set flag. Order doesn't affect safety: a reset requires all 0. */
     int start = skip >= 0 ? skip + 1 : 0;
-    for (int k = 0; k < b->P; k++) {
-        int j = (start + k) % b->P;
-        if (j == skip)
-            continue;
-        st->split_scan_loads++;
-        if (ncl_uc_load(SP_PRESENT(b, j))) {
-            b->reset_hint = j;
-            st->split_reset_skips++;
-            return;
-        }
+    int j = ncl_uc_scan_first(SP_PRESENT(b, 0), b->P, start, b->P, skip, &st->split_scan_loads);
+    if (j >= 0) {
+        b->reset_hint = j;
+        st->split_reset_skips++;
+        return;
     }
     ncl_fence();
     ncl_uc_store(SP_DOOR(b), DOOR_OPEN);

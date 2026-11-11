@@ -452,9 +452,22 @@ static void *server_main(void *arg)
         int got = 0;
         S.st.rounds++;
         /* At most one message per source per round: round-robin fairness. */
+        /* One poll round over the expected slot of every source queue.
+         * Batched (cached-flush): all N slots in one batch, then process.
+         * Serial (uc etc.): load and process one at a time, so a message is
+         * acted on without waiting for the remaining N-1 uncached loads
+         * (loading all first cost ~30% capacity on uc at N=8). */
+        int batch = ncl_meta_batching();
+        ncl_line_t *slots[NCL_MAX_NODES];
+        uint64_t words[NCL_MAX_NODES];
+        if (batch) {
+            for (int src = 0; src < S.N; src++)
+                slots[src] = q_slot(src, S.node, S.head[src]);
+            ncl_uc_load_many(slots, S.N, words);
+        }
         for (int src = 0; src < S.N; src++) {
             uint64_t pos = S.head[src];
-            uint64_t w = ncl_uc_load(q_slot(src, S.node, pos));
+            uint64_t w = batch ? words[src] : ncl_uc_load(q_slot(src, S.node, pos));
             if ((w >> M_POS_SHIFT) == (pos & 0xffff) && ((w >> M_TYPE_SHIFT) & 3) != 0) {
                 S.head[src] = pos + 1;
                 process(src, w);

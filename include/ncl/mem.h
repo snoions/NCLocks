@@ -188,6 +188,81 @@ static inline void ncl_uc_store(ncl_line_t *l, uint64_t v)
         ncl__flushopt(l); /* write back so other nodes can see it */
 }
 
+/* ---- batched metadata reads -------------------------------------------- */
+
+/* Batch invalidates for multi-line reads (cached-flush only): clflushopt every
+ * line, ONE mfence, then all loads, which miss in parallel (about 2 round trips
+ * instead of n). On uc (UC loads execute one at a time), emu and coherent the
+ * loads stay serial, with early exit where the caller allows it, so behavior
+ * there is unchanged. ncl_meta_batch = 0 forces serial everywhere (A/B).
+ *
+ * Ordering: the batch starts after earlier fences, so it is ordered after
+ * earlier stores the same way a single ncl_uc_load is. Loads WITHIN a batch
+ * are unordered: on non-coherent memory x86 load-load ordering does not hold
+ * (it relies on snoops). A caller that needs one read before another must use
+ * separate calls with ncl_fence() between them. Injected device latency
+ * (dev_lat_ns) is charged once per batch: the accesses overlap. */
+extern int ncl_meta_batch; /* default 1 */
+
+static inline int ncl_meta_batching(void)
+{
+    return ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH && ncl_meta_batch;
+}
+
+/* out[k] = *ls[k] for k < n (all n loads, any backend). */
+static inline void ncl_uc_load_many(ncl_line_t *const *ls, int n, uint64_t *out)
+{
+    if (ncl_meta_batching()) {
+        ncl_dev_delay();
+        for (int k = 0; k < n; k++)
+            ncl__flushopt(ls[k]);
+#if defined(__x86_64__)
+        _mm_mfence();
+#endif
+        for (int k = 0; k < n; k++)
+            out[k] = atomic_load_explicit(&ls[k]->v, memory_order_relaxed);
+    } else {
+        for (int k = 0; k < n; k++)
+            out[k] = ncl_uc_load(ls[k]);
+    }
+}
+
+/* First j = (start + k) % n, k < count, j != skip, with arr[j] != 0; -1 if none.
+ * Serial backends stop at the first hit; batched reads all candidates.
+ * *nloads += metadata loads issued. */
+static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count, int skip,
+                                    uint64_t *nloads)
+{
+    if (ncl_meta_batching()) {
+        ncl_line_t *ls[NCL_MAX_PARTICIPANTS];
+        int idx[NCL_MAX_PARTICIPANTS];
+        uint64_t v[NCL_MAX_PARTICIPANTS];
+        int m = 0;
+        for (int k = 0; k < count; k++) {
+            int j = (start + k) % n;
+            if (j != skip) {
+                idx[m] = j;
+                ls[m++] = &arr[j];
+            }
+        }
+        ncl_uc_load_many(ls, m, v);
+        *nloads += (uint64_t)m;
+        for (int k = 0; k < m; k++)
+            if (v[k])
+                return idx[k];
+        return -1;
+    }
+    for (int k = 0; k < count; k++) {
+        int j = (start + k) % n;
+        if (j == skip)
+            continue;
+        ++*nloads;
+        if (ncl_uc_load(&arr[j]))
+            return j;
+    }
+    return -1;
+}
+
 /* ---- protected data (cached) ------------------------------------------- */
 
 /* Make this node's writes to [p, p+len) visible on the device. Whole cache
