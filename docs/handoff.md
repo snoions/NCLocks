@@ -19,10 +19,11 @@ local`), as is the no-submutex ablation.
 - **Release** (never enters the gate): data writeback as before; `pick_waiter`; fence;
   store the chosen waiter (handoff) or FREE; then the submutex unlock. Local cohort passing
   happens first, exactly as in 2a.
-- **Announce placement (§3.5 Open), `-G`:** `lazy` (**default**): inside the gate, and only
-  after reading a held owner, so an uncontended take never touches `announce[]`.
-  `inside` (the spec's baseline): announce right after entering the gate. `before`:
-  announce, fence, then the gate. All are safe by the "owner == me means handoff" rule plus
+- **Announce placement (§3.5 Open), `-G`:** `before` (**default** since the backend
+  study, see "Announce placement revisited" below): announce, fence, then the gate.
+  `inside` (the spec's baseline): announce right after entering the gate. `lazy` (the
+  default before that): inside the gate, and only after reading a held owner, so an
+  uncontended take never touches `announce[]`. All are safe by the "owner == me means handoff" rule plus
   the missed-announcement recovery.
 - **`pick_waiter`, `-X`:** `adaptive` (**default**): if this node's own global acquisition
   was uncontended (it took a FREE owner without waiting), probe ONE `announce[]` slot at a
@@ -45,8 +46,8 @@ local`), as is the no-submutex ablation.
   `local_handoff_frac`, `missed_announce_per_acq`, `owner_polls_per_acq`,
   `gate_entries_per_acq`, `announce_loads_per_acq`); path `NCL_PATH_GLOBAL_HANDOFF`.
 - **Tests:** `stress_{lamport,tournament,hybrid}_{emu,uc}_handoff{,_cap1,_inside_scan,
-  _before_cap1,_probe_cap1}` (`-K 1` makes almost every release a cross-node handoff;
-  defaults are lazy/adaptive), emu negative tests with
+  _lazy_cap1,_probe_cap1}` (`-K 1` makes almost every release a cross-node handoff;
+  defaults are before/adaptive), emu negative tests with
   `--skip-wb` / `--skip-inv` in handoff mode, and `handoff_rejects_server`.
 
 ## Measurements: spec baseline (uc, 200 ns CS, 64 B footprint, `-B 16`, 3 interleaved reps)
@@ -115,7 +116,10 @@ gate it costs 20-45% capacity and about +400 ns uncontended on this platform. Th
 optimizations below recover most of the uncontended hold-time cost but not the handoff
 cycle.
 
-## Optimizations: lazy announce and adaptive `pick_waiter` (now the defaults)
+## Optimizations: lazy announce and adaptive `pick_waiter`
+
+(Lazy announce was the default until "Announce placement revisited" below; adaptive
+`pick_waiter` still is.)
 
 Raw data: `results/handoff_opt_uc.csv` (Phase 1, inside/scan, lazy/scan, inside/probe,
 lazy/probe; 4x1, 8x1, Poisson 100k at N=4 and 100k-900k at N=8, on/off at N=8) and
@@ -162,6 +166,41 @@ across variants), so those points do not rank the variants.
 the spec baseline and ~991 ns for Phase 1. The acquire still costs about +380 ns over
 Phase 1, and saturated capacity stays at ~0.92M: neither change shortens the handoff cycle.
 The spec baseline remains available as `-G inside -X scan`.
+
+## Announce placement revisited: `before` is the default
+
+Lazy announce was chosen on uc data. On the cached-flush backend, where every metadata
+load costs a flush plus a fence, it collapses for Lamport and partly for hybrid.
+
+**Mechanism.** A lazy waiter announces only after it gets through the gate. When the gate
+is slow compared with the handoff cycle (Lamport's gate with costly loads), waiters pile up
+inside it, retrying (5.3 Lamport retries per acquisition), and none of them is announced
+yet. The releaser finds nobody, stores FREE, and the next gate winner takes the lock: 2b
+degrades to Phase 1 Lamport, with its starvation. Once in that mode it stays there. With
+`before`, a waiter is announced before it enters the gate, so a releaser always sees it,
+however congested the gate is. Whether `lazy` works therefore depends on the gate's speed
+relative to the handoff, which differs between backends. Real CXL latencies could push
+`uc` into the same mode.
+
+N=8 x 1, 200 ns CS, 3 interleaved reps (`results/handoff_announce_uc_cf.csv`;
+cf = cached-flush):
+
+| | before | lazy |
+|---|---|---|
+| Lamport-2b cf, capacity (fairness, handoff share) | **1.03M (1.00, 100%)** | 0.52M (0.76, 11%) |
+| Lamport-2b cf, 600k p50 | **2.6 us** | saturated (13% unserved) |
+| hybrid-2b cf, capacity (fairness) | **1.06M (1.00)** | 0.99M (0.95) |
+| hybrid-2b cf, 600k p50 / p99 | **4.4 / 24 us** | 5.1 / 27 us |
+| tournament-2b cf, capacity | 1.03M | 1.03M |
+| uc capacity, Lamport / tournament / hybrid | 0.94 / 0.94 / 0.92M | 0.93 / 0.93 / 0.92M |
+| uc 600k p50, Lamport / tournament / hybrid | **2.0 / 1.7 / 2.9 us** | 2.7 / 1.9 / 3.2 us |
+| uncontended acquire p50 at 100k, uc (L / T / H) | 767 / 1023 / 1087 ns | 703 / 959 / 991 ns |
+| uncontended acquire p50 at 100k, cf (L / T / H) | 1087 / 1343 / 1407 ns | 895 / 1151 / 1279 ns |
+
+`before` costs 64-96 ns uncontended on uc and 128-192 ns on cached-flush: the announce
+store, a fence, and the clear. It wins at moderate load on both backends, because missed
+announcements halve (600k: 0.08-0.15 vs 0.18-0.26 per acquisition). Most importantly, it
+never falls into gate mode. The lazy measurements above remain valid for uc.
 
 ## (c) lock server: holder-to-waiter chain (`-a server -M handoff`)
 

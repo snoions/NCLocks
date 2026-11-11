@@ -222,7 +222,7 @@ static void usage(const char *argv0)
             "  -m            ablation: no local submutex\n"
             "  -M MODE       phase1|local|handoff (default phase1)\n"
             "  -K CAP        local/handoff: max consecutive local handoffs (default 64)\n"
-            "  -G PLACE      handoff: announce lazy (default) | inside | before\n"
+            "  -G PLACE      handoff: announce before (default) | inside | lazy\n"
             "  -X PICK       handoff: pick_waiter adaptive (default) | scan | probe\n"
             "                (server: adaptive = follow the grant's hint bit, scan = always read succ[])\n"
             "  -R LINES      server handoff: chain window, power of two (default 4N rounded up)\n"

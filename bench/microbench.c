@@ -354,8 +354,8 @@ static void usage(const char *argv0)
             "              gate/owner cross-node handoff; lamport, tournament, hybrid; server:\n"
             "              holder passes to the server-published successor)\n"
             "  -K CAP      local/handoff: max consecutive local handoffs (default 64)\n"
-            "  -G PLACE    handoff: announce lazy (inside the gate, only after reading a held\n"
-            "              owner; default) | inside (spec baseline) | before\n"
+            "  -G PLACE    handoff: announce before (announce, fence, gate; default) | inside\n"
+            "              (spec baseline) | lazy (inside the gate, only after reading a held owner)\n"
             "  -X PICK     handoff release: adaptive (probe one slot if this node's acquisition\n"
             "              was uncontended, else scan; default) | scan (spec) | probe.\n"
             "              server: adaptive = read succ[] only if the grant's hint bit is set;\n"
@@ -592,7 +592,7 @@ int main(int argc, char **argv)
     fast = tot->paths[NCL_PATH_LAMPORT_FAST] + tot->paths[NCL_PATH_HYBRID_FAST] +
            tot->paths[NCL_PATH_FASTSRV_FAST];
     const struct hist *hl = &tot->h[H_LOCK], *hs = &tot->h[H_SERVICE], *hj = &tot->h[H_SOJOURN];
-#define ANN_NAME(a) ((a) == NCL_ANNOUNCE_BEFORE ? "before" : (a) == NCL_ANNOUNCE_INSIDE ? "inside" : "lazy")
+#define ANN_NAME(a) ((a) == NCL_ANNOUNCE_LAZY ? "lazy" : (a) == NCL_ANNOUNCE_INSIDE ? "inside" : "before")
 #define PICK_NAME(x) ((x) == NCL_PICK_PROBE ? "probe" : (x) == NCL_PICK_SCAN ? "scan" : "adaptive")
 #define PER(x) (all_paths ? (double)(x) / (double)all_paths : 0.0)
     char arrdesc[64];

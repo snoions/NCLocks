@@ -32,9 +32,10 @@
  *                     gate. Not for FASTSRV or the no-submutex ablation; SERVER
  *                     uses holder-to-waiter passing instead (below).
  *                     cfg.announce_place selects the §3.5 Open placement:
- *                     NCL_ANNOUNCE_LAZY (default: inside the gate, only
- *                     after reading a held owner), _INSIDE (spec baseline),
- *                     _BEFORE.
+ *                     NCL_ANNOUNCE_BEFORE (default: announce, fence, then
+ *                     the gate), _INSIDE (spec baseline), _LAZY (inside the
+ *                     gate, only after reading a held owner; collapses when
+ *                     the gate is slow, see docs/backends.md).
  *                     cfg.pick_policy (NCL_PICK_*): release probes one
  *                     announce[] slot at a per-node round-robin pointer if
  *                     this node's own acquisition was uncontended, else scans
@@ -83,9 +84,13 @@ typedef enum {
     NCL_MODE_LOCAL = 2,
 } ncl_mode_t;
 
-/* Announce placement in MODE_HANDOFF (design §3.5 Open). LAZY: inside the gate,
- * and only after reading a held owner (an uncontended take never announces). */
-enum { NCL_ANNOUNCE_LAZY = 0, NCL_ANNOUNCE_INSIDE = 1, NCL_ANNOUNCE_BEFORE = 2 }; /* 0 = default */
+/* Announce placement in MODE_HANDOFF (design §3.5 Open). BEFORE (default):
+ * announce, fence, then enter the gate, so a releaser sees every waiter even
+ * while the gate is congested. LAZY: inside the gate, and only after reading a
+ * held owner (an uncontended take never announces); cheaper uncontended, but
+ * with a slow gate (Lamport on cached-flush) waiters pile up in the gate
+ * unannounced, releasers store FREE, and 2b degrades to Phase 1. */
+enum { NCL_ANNOUNCE_BEFORE = 0, NCL_ANNOUNCE_INSIDE = 1, NCL_ANNOUNCE_LAZY = 2 }; /* 0 = default */
 
 enum { NCL_PICK_ADAPTIVE = 0, NCL_PICK_SCAN = 1, NCL_PICK_PROBE = 2 }; /* 0 = default */
 
@@ -102,7 +107,7 @@ struct ncl_sys_cfg {
     int nlocks;
     int no_submutex;        /* ablation: each thread is a global participant */
     int local_cap;          /* LOCAL/HANDOFF: max consecutive local handoffs (0 = 64) */
-    int announce_place;     /* HANDOFF: announce placement (§3.5), NCL_ANNOUNCE_*; 0 = lazy */
+    int announce_place;     /* HANDOFF: announce placement (§3.5), NCL_ANNOUNCE_*; 0 = before */
     int pick_policy;        /* HANDOFF: pick_waiter policy, NCL_PICK_*; 0 = adaptive */
     int chain_lines;        /* SERVER HANDOFF: succ[] ring = assignment window, power of
                                two in [2, NCL_SRV_CHAIN_MAX]; 0 = 4N rounded up */

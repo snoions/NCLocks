@@ -136,6 +136,32 @@ batch) and stays within one histogram bucket of batch when the scan finds nothin
 `-F hint` (scans only in `ncl_splitter_reset_if_quiet`, which already pre-checks the hinted
 slot) is unchanged within noise: 0.94 / 0.91 / 0.90M.
 
+## Does the protocol ranking change? (N=8, defaults, `results/ranking_uc_cf_n8.csv`)
+
+Measured with lazy announce, the 2b default at the time; see below.
+
+| capacity rank | uc | cached-flush |
+|---|---|---|
+| 1-3 | tournament 1.68, server chain 1.56, server 1.23 | tournament 1.62, server chain 1.51, server 1.22 |
+| 4 | fastsrv 1.12 | tournament-2b 1.04 |
+| 5 | hybrid 1.10 | hybrid-2b 0.99 (fairness 0.95) |
+| 6 | Lamport-2b 0.95 | fastsrv 0.98 |
+| 7 | tournament-2b 0.93 | hybrid 0.93 |
+| 8 | hybrid-2b 0.92 | Lamport-2b 0.51 (fairness 0.73) |
+| 9 | Lamport 0.49 (0.86) | Lamport 0.48 (0.70) |
+
+- **The top three are the same on both backends.**
+- **Hybrid (Phase 1) drops.** At 600k it goes from 2nd (uc: 0.9 / 9.7 us) to 6th (cf:
+  2.7 / 19 us).
+- **The tournament loses its uncontended lead.** Each of its log N levels pays a flush
+  plus fence per load. Uncontended sojourn: uc Lamport 767 < tournament 991 < hybrid 1087
+  ns; cf Lamport 991 < hybrid ≈ Lamport-2b ≈ tournament ≈ 1343 ns.
+- **2b gates move up on cf** (tournament-2b 0.93 -> 1.04M), helped by batched scans and
+  the shared fence.
+- **Lamport-2b collapsed** because of lazy announce, not because of the backend. With
+  `-G before`, now the default, it reaches 1.03M at fairness 1.00 on cf, and hybrid-2b
+  1.06M (`docs/handoff.md`, "Announce placement revisited").
+
 ## Overlapping the data writeback with release-path loads (`-O on|off`, default on)
 
 Only the store that hands the lock to another node has to wait for the data writeback.
