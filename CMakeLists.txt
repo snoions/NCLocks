@@ -218,3 +218,23 @@ foreach(alg hybrid fastsrv)
     COMMAND ncl_stress -a ${alg} -b emu -F always -i 100)
   set_tests_properties(${alg}_rejects_reopen_always PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# AKSRV: (e) with AK's fast path; the server runs AK's reset at queue drain.
+foreach(be emu uc)
+  add_test(NAME stress_aksrv_${be}
+    COMMAND ncl_stress -a aksrv -b ${be} -n 4 -t 2 -l 3 -i 20000 --timeout 100)
+  add_test(NAME stress_aksrv_${be}_always
+    COMMAND ncl_stress -a aksrv -b ${be} -F always -n 6 -t 2 -l 2 -i 20000 --timeout 100)
+  add_test(NAME stress_aksrv_${be}_n8_delay
+    COMMAND ncl_stress -a aksrv -b ${be} -n 8 -t 2 -l 1 -i 10000 -d 2000 --timeout 100)
+  add_test(NAME stress_aksrv_${be}_local
+    COMMAND ncl_stress -a aksrv -b ${be} -M local -K 4 -H -n 4 -t 3 -l 2 -i 10000 --timeout 100)
+endforeach()
+set_tests_properties(stress_aksrv_uc stress_aksrv_uc_always stress_aksrv_uc_n8_delay
+  stress_aksrv_uc_local PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+add_test(NAME stress_aksrv_cached-flush_n8
+  COMMAND ncl_stress -a aksrv -b cached-flush -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+add_test(NAME stress_aksrv_emu_split
+  COMMAND ncl_stress -a aksrv -b emu -U split -n 6 -t 2 -l 2 -i 20000 --timeout 100)
+add_test(NAME handoff_rejects_aksrv
+  COMMAND ncl_stress -a aksrv -b emu -M handoff)
+set_tests_properties(handoff_rejects_aksrv PROPERTIES WILL_FAIL TRUE)

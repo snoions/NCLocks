@@ -44,6 +44,8 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   variant (the fast winner reopens only if no slow waiter is at the top lock; every slow
   releaser resets). `-F always` = as published (unfair). `-F` applies to ak only. Not
   model-checked; `docs/hybrid.md`.
+- `-a aksrv`: (e) with AK's fast path; the home server runs AK's reset when its queue drains,
+  while holding the top SLOW side. Not model-checked; `docs/hybrid.md`.
 - `src/server.c`: lock servers (c) and fast-path server (e), Phase 1 (fixed home =
   hash % N). Message and reply bit layouts are in `src/server.h`. Nodes must call
   `ncl_node_detach()` (an all-nodes barrier) before servers stop. (d) and (e) are **not

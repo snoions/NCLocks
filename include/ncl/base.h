@@ -18,6 +18,10 @@
  *                   O(1) accesses (renaming via Y.indx, Name_Taken[],
  *                   Obstacle[]) instead of scanning present[]. NOT
  *                   model-checked. docs/hybrid.md, "Anderson-Kim fast path".
+ *   AKSRV           (e) with AK's fast path instead of the splitter: the
+ *                   home server runs AK's reset (statements 29-37) when its
+ *                   queue drains, while still holding the top SLOW side;
+ *                   grantees clear their own Obstacle (32). NOT model-checked.
  *
  * Every variable is its own ncl_line_t. Each lock has two blocks of lines,
  * laid out by ncl_base_nlines()/ncl_base_nscan()/ncl_base_bind(): single
@@ -36,7 +40,11 @@ typedef enum {
     NCL_ALG_SERVER = 3,
     NCL_ALG_FASTSRV = 4,
     NCL_ALG_AK = 5,
+    NCL_ALG_AKSRV = 6,
 } ncl_alg_t;
+
+/* (e)-style: fast path + lock-server slow path holding the top SLOW side. */
+static inline int ncl_alg_fastsrv_like(ncl_alg_t a) { return a == NCL_ALG_FASTSRV || a == NCL_ALG_AKSRV; }
 
 /* Path taken by an acquisition (stats; for HYBRID/FASTSRV also needed at release). */
 enum {
@@ -150,6 +158,16 @@ extern uint64_t ncl_debug_reset_delay;
  * slot. */
 void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st);
 void ncl_present_clear(struct ncl_base *b, int i);
+
+/* AKSRV pieces (src/server.c). try_fast: statements 1-11 (returns 1 holding the
+ * top FAST side) or deflected (0; remembers SLOW 1/2 node-locally).
+ * fast_release: 13-20 (fair rule unless -F always). slow_release: the
+ * grantee's statement 32, before its REL. server_reset: 29-31, 33-37 by the
+ * home server, holding the SLOW side. */
+int ncl_aksrv_try_fast(struct ncl_base *b, int i, struct ncl_base_stats *st);
+void ncl_aksrv_fast_release(struct ncl_base *b, int i, struct ncl_base_stats *st);
+void ncl_aksrv_slow_release(struct ncl_base *b, int i);
+void ncl_aksrv_server_reset(struct ncl_base *b, struct ncl_base_stats *st);
 /* FASTSRV server: the reset check above with the server visible in
  * present[P] for its duration, so a fast winner's full scan never reopens
  * during it (the same protection a slow node's own present[i] gives in

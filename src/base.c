@@ -44,6 +44,7 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
     case NCL_ALG_SERVER: return 0;
     case NCL_ALG_FASTSRV: return split_lines(P) + top_lines();
     case NCL_ALG_AK: return ak_lines(P) + tree_lines(P) + top_lines();
+    case NCL_ALG_AKSRV: return ak_lines(P) + top_lines();
     }
     return 0;
 }
@@ -56,7 +57,8 @@ size_t ncl_base_nscan(ncl_alg_t alg, int P)
     case NCL_ALG_FASTSRV: return (size_t)P + 1; /* present[] + server reset marker */
     case NCL_ALG_TOURNAMENT:
     case NCL_ALG_SERVER:
-    case NCL_ALG_AK: return 0;
+    case NCL_ALG_AK:
+    case NCL_ALG_AKSRV: return 0;
     }
     return 0;
 }
@@ -95,6 +97,10 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
         b->ak = lines;
         b->tree = lines + ak_lines(P);
         b->top = b->tree + tree_lines(P);
+        break;
+    case NCL_ALG_AKSRV:
+        b->ak = lines;
+        b->top = lines + ak_lines(P);
         break;
     }
 }
@@ -424,44 +430,52 @@ static void ak_check(struct ncl_base *b, uint64_t w)
     }
 }
 
-static int ak_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+/* Statements 1-10: returns 1 with Infast set and *k = y.indx if this process
+ * may take the fast path (caller then runs ENTRY 2(0)); 0 if deflected, with
+ * *slow2 = 1 for SLOW 2 (it closed Y and its Obstacle[p] is set). */
+static int ak_try_fast(struct ncl_base *b, int i, struct ncl_base_stats *st, int *k, int *slow2)
 {
     const uint64_t me = (uint64_t)i + 1;
-    int slow2;
     ncl_uc_store(AK_X(b), me);                     /* 1: X := p */
     ncl_fence();
     uint64_t y = ncl_uc_load(AK_Y(b));             /* 2: y := Y */
     ak_check(b, y);
     if (!AK_FREE(y)) {
         st->split_fail_closed++;
-        slow2 = 0;                                 /* SLOW 1 */
-        goto slow;
+        *slow2 = 0;                                /* SLOW 1 */
+        return 0;
     }
     ncl_uc_store(AK_Y(b), ak_word(0, 0));          /* 3: Y := (false, 0) */
     ncl_fence_ss();
     ncl_uc_store(AK_OBS(b, i), 1);                 /* 4: Obstacle[p] := true */
     ncl_fence();
+    *slow2 = 1;
     if (ncl_uc_load(AK_X(b)) != me ||              /* 5: X != p */
         ncl_uc_load(AK_INFAST(b))) {               /* 6: Infast */
         st->split_fail_lost++;
-        slow2 = 1;
-        goto slow;
+        return 0;
     }
-    int k = AK_INDX(y);
-    ncl_uc_store(AK_NT(b, k), 1);                  /* 7: Name_Taken[y.indx] := true */
+    *k = AK_INDX(y);
+    ncl_uc_store(AK_NT(b, *k), 1);                 /* 7: Name_Taken[y.indx] := true */
     ncl_fence();
     if (ncl_uc_load(AK_RESET(b)) != y) {           /* 8: Reset != y */
-        ncl_uc_store(AK_NT(b, k), 0);              /* 9 */
+        ncl_uc_store(AK_NT(b, *k), 0);             /* 9 */
         st->split_fail_lost++;
-        slow2 = 1;
-        goto slow;
+        return 0;
     }
     ncl_uc_store(AK_INFAST(b), 1);                 /* 10: Infast := true */
     ncl_fence_ss();
-    ncl_top_lock(b, NCL_SIDE_FAST);                /* 11: ENTRY 2(0) */
-    b->ak_k = k;                                   /* holder-only from here */
-    return NCL_PATH_HYBRID_FAST;
-slow:
+    return 1;
+}
+
+static int ak_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    int k = 0, slow2;
+    if (ak_try_fast(b, i, st, &k, &slow2)) {
+        ncl_top_lock(b, NCL_SIDE_FAST);            /* 11: ENTRY 2(0) */
+        b->ak_k = k;                               /* holder-only from here */
+        return NCL_PATH_HYBRID_FAST;
+    }
     tournament_lock(b, i);                         /* 21/26: ENTRY N(p) */
     ncl_top_lock(b, NCL_SIDE_SLOW);                /* 22/27: ENTRY 2(1) */
     b->ak_slow2 = slow2;
@@ -497,27 +511,50 @@ static void ak_reopen_if_clear(struct ncl_base *b, int k, int check_nt, struct n
     st->split_resets++;
 }
 
+/* Statements 13-20 (fast-path release), caller has fenced. */
+static void ak_fast_exit(struct ncl_base *b, int i, int k, struct ncl_base_stats *st)
+{
+    ncl_uc_store(AK_OBS(b, i), 0);                 /* 13: Obstacle[p] := false */
+    ncl_fence_ss();
+    ncl_uc_store(AK_RESET(b), ak_word(0, (uint64_t)k)); /* 14 */
+    if (ncl_fast_release != NCL_FASTREL_ALWAYS && ncl_top_other_flag(b, NCL_SIDE_FAST)) {
+        /* Fairness variant: a slow-path process (or, for AKSRV, the server
+         * with queued requests) waits at the top lock; leave the fast path
+         * closed (always safe). The slow side's reset reopens it. */
+        st->split_fast_keep_closed++;
+    } else {
+        ak_reopen_if_clear(b, k, 0, st);           /* 15-17: if !Obstacle[y.indx] */
+    }
+    ncl_fence_ss();
+    ncl_uc_store(AK_NT(b, k), 0);                  /* 18: Name_Taken[y.indx] := false */
+    ncl_fence_ss();
+    ncl_top_unlock(b, NCL_SIDE_FAST);              /* 19: EXIT 2(0) */
+    ncl_fence_ss();
+    ncl_uc_store(AK_INFAST(b), 0);                 /* 20: Infast := false */
+}
+
+/* Statements 29-37 by a holder of the top lock's SLOW side; xval is its X
+ * value (p+1, or P+1 for an AKSRV server); own_obs = this holder's Obstacle
+ * slot to clear at 32 (-1: none, cleared by the grantee itself). */
+static void ak_slow_reset(struct ncl_base *b, uint64_t xval, int own_obs, struct ncl_base_stats *st)
+{
+    ncl_uc_store(AK_Y(b), ak_word(0, 0));          /* 29: Y := (false, 0) */
+    ncl_fence_ss();
+    ncl_uc_store(AK_X(b), xval);                   /* 30: X := p */
+    uint64_t r = ncl_uc_load(AK_RESET(b));         /* 31: y := Reset (only written in CS) */
+    ak_check(b, r);
+    if (own_obs >= 0)
+        ncl_uc_store(AK_OBS(b, own_obs), 0);       /* 32: Obstacle[p] := false */
+    ncl_fence_ss();
+    ncl_uc_store(AK_RESET(b), ak_word(0, (uint64_t)AK_INDX(r))); /* 33 */
+    ak_reopen_if_clear(b, AK_INDX(r), 1, st);      /* 34-37 */
+}
+
 static void ak_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats *st)
 {
     ncl_fence(); /* critical-section effects (incl. data writeback) first */
     if (path == NCL_PATH_HYBRID_FAST) {
-        int k = b->ak_k;
-        ncl_uc_store(AK_OBS(b, i), 0);             /* 13: Obstacle[p] := false */
-        ncl_fence_ss();
-        ncl_uc_store(AK_RESET(b), ak_word(0, (uint64_t)k)); /* 14 */
-        if (ncl_fast_release != NCL_FASTREL_ALWAYS && ncl_top_other_flag(b, NCL_SIDE_FAST)) {
-            /* Fairness variant: a slow-path process waits at the top lock;
-             * leave the fast path closed (always safe). Its release reopens. */
-            st->split_fast_keep_closed++;
-        } else {
-            ak_reopen_if_clear(b, k, 0, st);       /* 15-17: if !Obstacle[y.indx] */
-        }
-        ncl_fence_ss();
-        ncl_uc_store(AK_NT(b, k), 0);              /* 18: Name_Taken[y.indx] := false */
-        ncl_fence_ss();
-        ncl_top_unlock(b, NCL_SIDE_FAST);          /* 19: EXIT 2(0) */
-        ncl_fence_ss();
-        ncl_uc_store(AK_INFAST(b), 0);             /* 20: Infast := false */
+        ak_fast_exit(b, i, b->ak_k, st);
         return;
     }
     /* As published only SLOW 2 resets; the fairness variant has every
@@ -525,21 +562,43 @@ static void ak_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats
      * The reset's safety argument (Name_Taken/Reset and Obstacle/Reset Dekker
      * pairs, Infast, statements 29-30) does not depend on the holder having
      * closed Y itself; a SLOW 1 holder's Obstacle is already false. */
-    if (b->ak_slow2 || ncl_fast_release != NCL_FASTREL_ALWAYS) {
-        ncl_uc_store(AK_Y(b), ak_word(0, 0));      /* 29: Y := (false, 0) */
-        ncl_fence_ss();
-        ncl_uc_store(AK_X(b), (uint64_t)i + 1);    /* 30: X := p */
-        uint64_t r = ncl_uc_load(AK_RESET(b));     /* 31: y := Reset (only written in CS) */
-        ak_check(b, r);
-        ncl_uc_store(AK_OBS(b, i), 0);             /* 32: Obstacle[p] := false */
-        ncl_fence_ss();
-        ncl_uc_store(AK_RESET(b), ak_word(0, (uint64_t)AK_INDX(r))); /* 33 */
-        ak_reopen_if_clear(b, AK_INDX(r), 1, st);  /* 34-37 */
-    }
+    if (b->ak_slow2 || ncl_fast_release != NCL_FASTREL_ALWAYS)
+        ak_slow_reset(b, (uint64_t)i + 1, i, st);
     ncl_fence_ss();
     ncl_top_unlock(b, NCL_SIDE_SLOW);              /* 24/38: EXIT 2(1) */
     ncl_fence_ss();
     tournament_unlock_nofence(b, i);               /* 25/39: EXIT N(p) */
+}
+
+/* ---- AKSRV: AK fast path, lock-server slow path ------------------------- */
+
+int ncl_aksrv_try_fast(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    int k = 0, slow2;
+    if (ak_try_fast(b, i, st, &k, &slow2)) {
+        ncl_top_lock(b, NCL_SIDE_FAST);            /* 11: ENTRY 2(0) */
+        b->ak_k = k;
+        return 1;
+    }
+    b->ak_slow2 = slow2; /* node-local; read by this node's release only */
+    return 0;
+}
+
+void ncl_aksrv_fast_release(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    ncl_fence();
+    ak_fast_exit(b, i, b->ak_k, st);
+}
+
+void ncl_aksrv_slow_release(struct ncl_base *b, int i)
+{
+    if (b->ak_slow2)
+        ncl_uc_store(AK_OBS(b, i), 0);             /* 32, by the grantee in its CS */
+}
+
+void ncl_aksrv_server_reset(struct ncl_base *b, struct ncl_base_stats *st)
+{
+    ak_slow_reset(b, (uint64_t)b->P + 1, -1, st);
 }
 
 /* ---- dispatch ----------------------------------------------------------- */
@@ -552,7 +611,8 @@ int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     case NCL_ALG_HYBRID: return hybrid_lock(b, i, st);
     case NCL_ALG_AK: return ak_lock(b, i, st);
     case NCL_ALG_SERVER:
-    case NCL_ALG_FASTSRV: break; /* handled in src/server.c */
+    case NCL_ALG_FASTSRV:
+    case NCL_ALG_AKSRV: break; /* handled in src/server.c */
     }
     return -1;
 }
@@ -565,7 +625,8 @@ void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats 
     case NCL_ALG_HYBRID: hybrid_unlock(b, i, path, st); break;
     case NCL_ALG_AK: ak_unlock(b, i, path, st); break;
     case NCL_ALG_SERVER:
-    case NCL_ALG_FASTSRV: break;
+    case NCL_ALG_FASTSRV:
+    case NCL_ALG_AKSRV: break;
     }
 }
 
@@ -576,6 +637,7 @@ const char *ncl_alg_name(ncl_alg_t a)
     case NCL_ALG_TOURNAMENT: return "tournament";
     case NCL_ALG_HYBRID: return "hybrid";
     case NCL_ALG_AK: return "ak";
+    case NCL_ALG_AKSRV: return "aksrv";
     case NCL_ALG_SERVER: return "server";
     case NCL_ALG_FASTSRV: return "fastsrv";
     }
@@ -588,6 +650,7 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out)
     else if (!strcmp(s, "tournament") || !strcmp(s, "b")) *out = NCL_ALG_TOURNAMENT;
     else if (!strcmp(s, "hybrid") || !strcmp(s, "d")) *out = NCL_ALG_HYBRID;
     else if (!strcmp(s, "ak")) *out = NCL_ALG_AK;
+    else if (!strcmp(s, "aksrv")) *out = NCL_ALG_AKSRV;
     else if (!strcmp(s, "server") || !strcmp(s, "c")) *out = NCL_ALG_SERVER;
     else if (!strcmp(s, "fastsrv") || !strcmp(s, "e")) *out = NCL_ALG_FASTSRV;
     else return -1;

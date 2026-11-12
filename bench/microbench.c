@@ -338,7 +338,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [options]\n"
             "  -n N        nodes (default 2)            -t T   threads per node (default 1)\n"
-            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv|ak\n"
+            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv|ak|aksrv\n"
             "  -b BACKEND  coherent|cached-flush|uc|emu (default cached-flush)\n"
             "  -L NS       injected device latency      -m     no submutex (ablation)\n"
             "  -s SECS     duration (default 2)         -W SECS warmup, not recorded (0.2)\n"
@@ -673,7 +673,7 @@ int main(int argc, char **argv)
                        100.0 * (double)tot->paths[p] / (double)all_paths);
         printf("\n");
         const struct ncl_base_stats *b = &tot->base;
-        if (cfg.alg == NCL_ALG_AK && all_paths) {
+        if ((cfg.alg == NCL_ALG_AK || cfg.alg == NCL_ALG_AKSRV) && all_paths) {
             double A = (double)all_paths;
             printf("ak: slow1(Y closed)=%.1f%% slow2(deflected)=%.1f%%  reopens=%lu "
                    "reopen_blocked=%lu loads/check=%.2f\n",
@@ -695,7 +695,7 @@ int main(int argc, char **argv)
                        : 0.0);
         }
         const struct ncl_srv_stats *v = &tot->srv;
-        if (cfg.alg == NCL_ALG_SERVER || cfg.alg == NCL_ALG_FASTSRV) {
+        if (cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg)) {
             /* each server round = one uncached load per source queue */
             printf("servers: msgs=%lu grants=%lu queued=%lu errors=%lu  poll_rounds/s=%.0f "
                    "(idle %.0f%%) queue_loads/s=%.0f",
@@ -707,7 +707,7 @@ int main(int argc, char **argv)
                 printf("  succ_published=%lu rel_grants=%lu window_full=%lu",
                        (unsigned long)v->published, (unsigned long)v->rel_grants,
                        (unsigned long)v->window_full);
-            if (cfg.alg == NCL_ALG_FASTSRV)
+            if (ncl_alg_fastsrv_like(cfg.alg))
                 printf("  top_slow_acquires=%lu top_polls=%lu top_yields=%lu",
                        (unsigned long)v->top_acquires, (unsigned long)v->top_wait_polls,
                        (unsigned long)v->top_yields);

@@ -157,6 +157,7 @@ static struct {
     struct ncl_sys_cfg cfg;
     struct ncl_srv_layout L;
     int node, N, fast;
+    int ak;        /* AKSRV: AK fast path; the server runs AK's reset at drain */
     int chain;     /* MODE_HANDOFF for SERVER: holder-to-waiter passing via succ[] */
     uint32_t R;    /* chain: succ[] lines per lock = assignment window */
     ncl_line_t *blocks;
@@ -253,6 +254,14 @@ static void advance(struct srv_lock *sl)
     }
     if (!sl->held && sl->qn) {
         grant_next(sl);
+    } else if (S.fast && !sl->held && !sl->qn && sl->slow == SLOW_HOLDING && S.ak) {
+        /* AKSRV: AK's reset (29-37) while still holding the SLOW side, which
+         * excludes the fast holder's 13-18 as AK's critical section does. */
+        ncl_fence();
+        ncl_aksrv_server_reset(&sl->b, &S.st.base);
+        ncl_fence();
+        ncl_top_unlock(&sl->b, NCL_SIDE_SLOW);
+        sl->slow = SLOW_NONE;
     } else if (S.fast && !sl->held && !sl->qn && sl->slow == SLOW_HOLDING) {
         ncl_fence();
         ncl_top_unlock(&sl->b, NCL_SIDE_SLOW);
@@ -504,7 +513,8 @@ int ncl_srv_node_start(const struct ncl_sys_cfg *c, const struct ncl_srv_layout 
     S.L = *L;
     S.node = node;
     S.N = c->nnodes;
-    S.fast = c->alg == NCL_ALG_FASTSRV;
+    S.fast = ncl_alg_fastsrv_like(c->alg);
+    S.ak = c->alg == NCL_ALG_AKSRV;
     S.chain = c->alg == NCL_ALG_SERVER && c->mode == NCL_MODE_HANDOFF;
     S.R = ncl_srv_chain_lines(c);
     S.blocks = blocks;
@@ -612,8 +622,9 @@ int ncl_srv_chain_release(int lock, uint64_t grant, int always_read, struct ncl_
 int ncl_fastsrv_acquire(struct ncl_thread *t, int lock, struct ncl_base *b,
                         struct ncl_base_stats *st)
 {
-    if (ncl_splitter_enter(b, S.node, st)) {
-        ncl_top_lock(b, NCL_SIDE_FAST); /* server not involved */
+    if (S.ak ? ncl_aksrv_try_fast(b, S.node, st) : ncl_splitter_enter(b, S.node, st)) {
+        if (!S.ak)
+            ncl_top_lock(b, NCL_SIDE_FAST); /* server not involved */
         return NCL_PATH_FASTSRV_FAST;
     }
     /* Deflected: present[node] stays set until release (design §4e). */
@@ -623,6 +634,16 @@ int ncl_fastsrv_acquire(struct ncl_thread *t, int lock, struct ncl_base *b,
 
 void ncl_fastsrv_release(int lock, struct ncl_base *b, int path, struct ncl_base_stats *st)
 {
+    if (S.ak) {
+        if (path == NCL_PATH_FASTSRV_FAST) {
+            ncl_aksrv_fast_release(b, S.node, st);
+        } else {
+            ncl_fence();
+            ncl_aksrv_slow_release(b, S.node); /* Obstacle[p] := false, in the CS */
+            ncl_srv_release(lock);             /* send() fences before publishing */
+        }
+        return;
+    }
     ncl_fence();
     if (path == NCL_PATH_FASTSRV_FAST) {
         ncl_top_unlock(b, NCL_SIDE_FAST);

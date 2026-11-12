@@ -220,7 +220,7 @@ static void usage(const char *argv0)
             "  -i I          iterations per thread (default 100000)\n"
             "  -w W          data words per lock (default 16)\n"
             "  -d NS         max random delay in/out of CS, ns (default 200)\n"
-            "  -a ALG        lamport|tournament|hybrid|server|fastsrv|ak (default lamport)\n"
+            "  -a ALG        lamport|tournament|hybrid|server|fastsrv|ak|aksrv (default lamport)\n"
             "  -b BACKEND    coherent|cached-flush|uc|emu (default emu)\n"
             "  -L NS         injected device latency, ns (default 0)\n"
             "  -m            ablation: no local submutex\n"

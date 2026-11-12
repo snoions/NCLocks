@@ -276,6 +276,8 @@ Same composition as (d), with the lock server of (c) replacing the tournament as
 
 **Slow path (node i):** if the splitter deflects it, send a request to the lock's home server and wait for a grant in its grant slot (Section 4c). On release, clear `present[i]`, fence, then send the release message to the server. (If `present[i]` were cleared after the release message, the server's reset check could still see it set and leave the fast path closed until the next contended episode.)
 
+**Variant (implemented, `-a aksrv`, not model-checked):** Anderson & Kim's fast path (see §4d, "Alternative reset") instead of the splitter and `present[]`. The fast winner reopens only if the top lock's SLOW flag is clear (the server has nothing queued); the home server runs AK's reset (statements 29–37, with `Obstacle[p]` cleared by each SLOW 2 grantee before its REL) when its queue drains, while still holding the SLOW side. Constant-cost fast release and reset; measured equal capacity, flat uncontended cost in N, and much better latency after bursts (`docs/hybrid.md`, "AK fast path in the fast-path server").
+
 **Server:**
 
 ```

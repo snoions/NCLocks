@@ -380,3 +380,53 @@ Uncontended the safe hybrid is now slower than the plain tournament on uc (991 n
 On cached-flush or the split layout the scan is batched and much cheaper. Earlier
 hybrid/fastsrv measurements in this repository used the unsafe hint default; their costs
 are accurate for that protocol, not for the safe one.
+
+## AK fast path in the fast-path server (`-a aksrv`; not model-checked)
+
+(e) with AK's fast path instead of the splitter and `present[]`. The slow path is the
+home server's queue, and the server holds the top lock's SLOW side while it has queued
+requests (as in (e)). Mapping onto AK's Figure 4:
+
+- Client fast path: statements 1-11, then the top lock's FAST side. Release: 13-20,
+  with the fair rule (reopen only if the top lock's SLOW flag is clear, which here means
+  "the server has queued requests"); `-F always` = AK as published.
+- Deflected client (SLOW 1 or 2): request to the server as in (e). A SLOW 2 grantee
+  clears its own `Obstacle[p]` (statement 32) in its critical section, before its REL.
+- Server: when a release empties its queue, it runs 29-31 and 33-37 while still
+  holding the SLOW side (excluding the fast holder's 13-18, as AK's critical section
+  does), with its own `X` value P+1, then unlocks. This replaces (e)'s `present[]` scan
+  and its reset marker. The adaptation (server resets on the slow path's behalf; the
+  slow path is a queue, not an arbitration tree) is ours and not model-checked.
+
+**uc, 200 ns CS, `-B 16`, pinned (`-P -Y sibling`: servers on the SMT siblings of their
+nodes' workers), 3 reps, medians** (`results/aksrv_vs_fastsrv_uc_pinned.csv`). N=10 is the
+largest N with dedicated hardware threads on this 20-thread host; its tails (ms-scale p99
+for every variant) reflect a fully loaded host and are not compared. An unpinned N=16 run
+(32 threads on 20) collapsed every variant to 0.04 Mops/s
+(`results/aksrv_vs_fastsrv_uc_unpinned.csv`; its N=8 rows agree with the pinned ones).
+
+| | fastsrv | aksrv (fair) | aksrv as published |
+|---|---|---|---|
+| N=8 capacity | 1.02M (1.00) | 1.00M (1.00) | 1.01M (1.00) |
+| N=8 100k sojourn p50 | 1599 ns | 1535 ns | 1471 ns |
+| N=8 600k sojourn p50 | **2303 ns** | 2431 ns | 2559 ns |
+| N=8 onoff sojourn p50 | 12.3 us | **8.7 us** | 9.2 us |
+| N=10 capacity | 0.84M (1.00) | 0.88M (1.00) | 0.91M (1.00) |
+| N=10 100k sojourn p50 | 1791 ns | **1535 ns** | 1471 ns |
+| N=10 600k sojourn p50 | 2815 ns | **2559 ns** | 2815 ns |
+| N=10 onoff sojourn p50 | 15.4 us | **9.7 us** | 9.7 us |
+
+- **Closed loop: no difference.** The queue never drains, the fast path stays closed
+  (0% fast), and both are pure lock servers with fairness 1.00.
+- **Uncontended, aksrv is flat in N; fastsrv grows** (+190 ns from N=8 to 10: the
+  strict `present[]` scan at every fast release). At N=8 they are within 64 ns.
+- **More fast-path use:** 85% vs 75% at 100k, 25-29% vs 12-17% at 600k. The server's
+  drain reopens the path with a constant-cost reset, and the fast winner's check is one
+  load of the SLOW flag instead of a scan.
+- **Bursty load improves most** (onoff p50 8.7 vs 12.3 us at N=8, 9.7 vs 15.4 us at
+  N=10): after a burst the path reopens at the first drain, so the quiet phase is
+  served by the fast path instead of the backed-off server.
+- **At N=8, 600k is 128 ns worse**: AK's fast path costs one more fenced step, and at
+  this load the fast path is entered often but the scan it replaces is still short.
+- The published rule is unfair under the hybrid's tournament, but here it measured
+  fairness 1.00: under saturation the queue never drains, so nobody reopens.
