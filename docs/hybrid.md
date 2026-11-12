@@ -273,3 +273,62 @@ holds end contention episodes sooner, so the fast path is used more:
   difference between variants. In open loop, weaker fairness would show up as tail
   latency rather than as uneven completions, so a real cost could be hiding here.
   Settling it needs more reps or per-path latency histograms.
+
+## Anderson-Kim fast path (`-a ak`; not model-checked)
+
+Anderson & Kim, "A new fast-path mechanism for mutual exclusion", Distrib. Comput. 14
+(2001), Figure 4 (bounded version; https://cs.unc.edu/~anderson/papers/dc00.pdf), in
+`src/base.c` with the paper's statement numbers. Slow path = our tournament, ENTRY 2 = our
+top Peterson lock. Instead of the splitter and `present[]` it uses `X`, `Y = (free, indx)`
+(one word), `Reset`, `Infast`, `Name_Taken[N]` and `Obstacle[N]`, all single-word
+metadata. The reopen check reads one `Name_Taken` and one `Obstacle` entry instead of
+scanning `present[]`. The cost is one more store-fence-load step on the fast path
+(`Name_Taken` vs `Reset`) and several more stores.
+
+- **As published (`-F always`) it is unfair:** the fast winner always reopens, and the
+  quickest node keeps winning (closed loop fairness 0.36 at N=8, 0.25 at N=16), as our
+  hybrid did before its fairness fix.
+- **Default = fairness variant (ours):** the fast winner reopens only if the top lock's
+  SLOW flag is clear (one load), and every slow-path releaser runs the reset (statements
+  29-37), not only SLOW 2 processes; otherwise the fast path could stay closed. The
+  reset's safety argument (Name_Taken/Reset and Obstacle/Reset Dekker pairs, `Infast`,
+  statements 29-30) does not depend on which critical-section holder runs it, but this
+  is an argument, not a proof.
+
+**uc, 200 ns CS, `-B 16`, 3 interleaved reps, medians** (`results/ak_vs_hybrid_uc.csv`).
+Closed loop: Mops/s (fairness). Open loop: sojourn p50 (us); onoff = `-r 200k -A
+onoff:200:0.25` (bursts at 800k). hybrid-scan = hybrid `-F scan` (full `present[]` scan at
+every fast release).
+
+| N, -L | load | hybrid | hybrid-scan | ak (fair) | ak as published |
+|---|---|---|---|---|---|
+| 8, 0 | closed | 1.12 (1.00) | 1.12 (1.00) | 0.93 (0.97) | 1.31 (0.36) |
+| 8, 0 | 100k | **1.09** | 1.54 | 1.54 | 1.41 |
+| 8, 0 | 600k | 1.79 | 2.56 | 2.18 | 1.60 |
+| 8, 0 | onoff | 2.69 | 3.46 | 3.20 | 1.92 |
+| 16, 0 | closed | 1.06 (1.00) | 1.06 (1.00) | 0.93 (0.91) | 1.32 (0.25) |
+| 16, 0 | 100k | **1.09** | 2.18 | 1.54 | 1.47 |
+| 16, 0 | 600k | 3.46 | 4.86 | **2.30** | 1.66 |
+| 16, 0 | onoff | 4.35 | 5.63 | **3.20** | 1.92 |
+| 16, 300 | closed | 0.26 (1.00) | 0.26 (1.00) | 0.21 (0.93) | 0.30 (0.14) |
+| 16, 300 | 100k | **10.8** | 15.9 | 12.3 | 9.2 |
+| 16, 300 | onoff | **74** | 74 | 377 | 57 |
+
+(600k with `-L 300` saturates every variant: 56-73% unserved.)
+
+- **Uncontended the hybrid wins** by about 450 ns (N=8 or 16, no injected latency): AK's
+  extra fenced step plus its extra stores (Obstacle, Name_Taken, Infast, Reset, Y).
+- **The O(N) scan is real:** hybrid-scan is 450 ns slower than hybrid at N=8 and 1.1 us
+  at N=16 uncontended. The default hybrid avoids most of it with the hinted pre-check.
+- **At N=16 under moderate or bursty load the fair AK wins** (600k: 2.3 vs 3.5 us; onoff:
+  3.2 vs 4.4 us). It keeps the fast path in use (fast fraction 0.41 vs 0.26 at 600k):
+  the hybrid's fairness rule keeps the door closed while anyone is present and reopens
+  only when quiet, AK's reopens after every slow release. Part of the gain is that
+  policy, not only the O(1) reset.
+- **The fair AK pays in capacity** (0.93 vs 1.06-1.12): every slow release runs the reset
+  inside the critical section (two more round trips of hold time). With 300 ns device
+  latency that lower capacity makes bursts queue much longer (onoff p50 377 vs 74 us).
+- **AK as published is the fastest in every open-loop row and in capacity, but closed-loop
+  fairness 0.14-0.36** rules it out under saturation.
+- Net: no variant dominates. For N <= 8 the hybrid stays the better choice; at N=16 with
+  moderate load the fair AK is better, unless the device is slow or the load saturates.

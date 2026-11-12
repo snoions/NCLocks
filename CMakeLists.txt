@@ -38,7 +38,7 @@ add_executable(ncl_memlat bench/memlat.c)
 target_link_libraries(ncl_memlat ncl)
 
 enable_testing()
-foreach(alg lamport tournament hybrid server fastsrv)
+foreach(alg lamport tournament hybrid server fastsrv ak)
   foreach(be emu cached-flush coherent uc)
     add_test(NAME stress_${alg}_${be}
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 3 -i 20000)
@@ -63,7 +63,7 @@ foreach(alg lamport tournament hybrid server fastsrv)
 endforeach()
 # Phase 2a local handoff: precise-hint accumulation (-K 4 -H), overflow
 # fallback (-H), and cap-forced releases (-K 1).
-foreach(alg lamport tournament hybrid server fastsrv)
+foreach(alg lamport tournament hybrid server fastsrv ak)
   add_test(NAME stress_${alg}_emu_local
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -H)
   add_test(NAME stress_${alg}_emu_local_cap4
@@ -83,7 +83,7 @@ endforeach()
 # Phase 2b: gate + owner handoff (design §3.3). Default = announce before the
 # gate + adaptive pick_waiter; also the spec baseline (inside/scan), lazy
 # announce, and always-probe. -K 1 makes almost every release a cross-node handoff.
-foreach(alg lamport tournament hybrid)
+foreach(alg lamport tournament hybrid ak)
   foreach(be emu uc)
     add_test(NAME stress_${alg}_${be}_handoff
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 3 -l 2 -i 10000 -M handoff -H)
@@ -160,7 +160,7 @@ set_tests_properties(emu_detects_missing_invalidate PROPERTIES WILL_FAIL TRUE)
 # region has per-node private views, so these runs check the cached-metadata
 # accesses (batched/probe scans included); on uc they run the real mix.
 foreach(be emu uc)
-  foreach(alg lamport tournament hybrid server fastsrv)
+  foreach(alg lamport tournament hybrid server fastsrv ak)
     add_test(NAME stress_${alg}_${be}_split
       COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 3 -i 20000 -F scan --timeout 100)
     list(APPEND split_tests_${be} stress_${alg}_${be}_split)
@@ -192,3 +192,18 @@ foreach(k wb inv)
   set_tests_properties(emu_split_detects_missing_meta_${k}_hybrid
     emu_split_detects_missing_meta_${k}_server PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Anderson-Kim fast path (-a ak): as published (-F always) and the fairness
+# variant (default); -m runs it with P = all threads (Obstacle[]/indx over P);
+# -d 2000 stretches the windows the Obstacle mechanism guards.
+foreach(be emu uc)
+  add_test(NAME stress_ak_${be}_always
+    COMMAND ncl_stress -a ak -b ${be} -n 6 -t 2 -l 2 -i 20000 -F always)
+  add_test(NAME stress_ak_${be}_n8_delay
+    COMMAND ncl_stress -a ak -b ${be} -n 8 -t 2 -l 1 -i 10000 -d 2000)
+  add_test(NAME stress_ak_${be}_always_n8_delay
+    COMMAND ncl_stress -a ak -b ${be} -n 8 -t 2 -l 1 -i 10000 -d 2000 -F always)
+endforeach()
+set_tests_properties(stress_ak_uc_always stress_ak_uc_n8_delay stress_ak_uc_always_n8_delay
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+add_test(NAME stress_ak_emu_nosub_always
+  COMMAND ncl_stress -a ak -b emu -n 3 -t 3 -l 2 -i 10000 -m -F always)

@@ -338,7 +338,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [options]\n"
             "  -n N        nodes (default 2)            -t T   threads per node (default 1)\n"
-            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv\n"
+            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv|ak\n"
             "  -b BACKEND  coherent|cached-flush|uc|emu (default cached-flush)\n"
             "  -L NS       injected device latency      -m     no submutex (ablation)\n"
             "  -s SECS     duration (default 2)         -W SECS warmup, not recorded (0.2)\n"
@@ -373,7 +373,9 @@ static void usage(const char *argv0)
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
             "              (SMT sibling of node n's first worker)\n"
             "  -F MODE     (d)/(e) fast-release reopen check: hint (only the slot last seen\n"
-            "              set, default) | scan (all present[])\n",
+            "              set, default) | scan (all present[]) | always (unconditional, as\n"
+            "              published). ak: hint/scan = fairness variant (reopen only if no\n"
+            "              slow waiter at the top lock), always = Anderson-Kim as published\n",
             argv0);
 }
 
@@ -465,8 +467,10 @@ int main(int argc, char **argv)
                 ncl_fast_release = NCL_FASTREL_SCAN;
             else if (!strcmp(optarg, "hint"))
                 ncl_fast_release = NCL_FASTREL_HINT;
+            else if (!strcmp(optarg, "always"))
+                ncl_fast_release = NCL_FASTREL_ALWAYS;
             else {
-                fprintf(stderr, "-F: scan|hint\n");
+                fprintf(stderr, "-F: scan|hint|always\n");
                 return 2;
             }
             break;
@@ -630,7 +634,7 @@ int main(int argc, char **argv)
                !pin ? "none" : srv_place == NCL_SRV_PIN_SIBLING ? "sibling" : "next",
                all_paths ? (double)tot->base.split_scan_loads / (double)all_paths : 0.0,
                all_paths ? (double)tot->base.lamport_retries / (double)all_paths : 0.0,
-               ncl_fast_release == NCL_FASTREL_HINT ? "hint" : "scan",
+               ncl_fast_release == NCL_FASTREL_HINT ? "hint" : ncl_fast_release == NCL_FASTREL_ALWAYS ? "always" : "scan",
                cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER ? "-" : ANN_NAME(cfg.announce_place),
                cfg.mode != NCL_MODE_HANDOFF ? "-" : PICK_NAME(cfg.pick_policy),
                PER(tot->paths[NCL_PATH_GLOBAL_HANDOFF]), PER(tot->paths[NCL_PATH_LOCAL_HANDOFF]),
@@ -673,6 +677,16 @@ int main(int argc, char **argv)
                        100.0 * (double)tot->paths[p] / (double)all_paths);
         printf("\n");
         const struct ncl_base_stats *b = &tot->base;
+        if (cfg.alg == NCL_ALG_AK && all_paths) {
+            double A = (double)all_paths;
+            printf("ak: slow1(Y closed)=%.1f%% slow2(deflected)=%.1f%%  reopens=%lu "
+                   "reopen_blocked=%lu loads/check=%.2f\n",
+                   100 * (double)b->split_fail_closed / A, 100 * (double)b->split_fail_lost / A,
+                   (unsigned long)b->split_resets, (unsigned long)b->split_reset_skips,
+                   b->split_resets + b->split_reset_skips
+                       ? (double)b->split_scan_loads / (double)(b->split_resets + b->split_reset_skips)
+                       : 0.0);
+        }
         if ((cfg.alg == NCL_ALG_HYBRID || cfg.alg == NCL_ALG_FASTSRV) && all_paths) {
             double A = (double)all_paths;
             printf("splitter: deflected door_closed=%.1f%% lost_race=%.1f%%  door_resets=%lu "

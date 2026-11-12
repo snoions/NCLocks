@@ -38,6 +38,12 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
 - `include/ncl/base.h`, `src/base.c`: Lamport (a), tournament (b), hybrid (d) per design §4d
   (race/door/present splitter, Aspnes reset), plus splitter and top-lock primitives shared
   with (e).
+- `-a ak`: Anderson & Kim's bounded fast path (Distrib. Comput. 2001, Fig. 4) with our
+  tournament and top Peterson lock as slow path and ENTRY 2. It reopens the fast path with O(1)
+  accesses instead of the hybrid's `present[]` scan. Default `-F hint|scan` = our fairness
+  variant (the fast winner reopens only if no slow waiter is at the top lock; every slow
+  releaser resets). `-F always` = as published, and for the hybrid the original
+  unconditional reopen. Not model-checked; `docs/hybrid.md`.
 - `src/server.c`: lock servers (c) and fast-path server (e), Phase 1 (fixed home =
   hash % N). Message and reply bit layouts are in `src/server.h`. Nodes must call
   `ncl_node_detach()` (an all-nodes barrier) before servers stop. (d) and (e) are **not

@@ -219,7 +219,7 @@ static void usage(const char *argv0)
             "  -i I          iterations per thread (default 100000)\n"
             "  -w W          data words per lock (default 16)\n"
             "  -d NS         max random delay in/out of CS, ns (default 200)\n"
-            "  -a ALG        lamport|tournament|hybrid|server|fastsrv (default lamport)\n"
+            "  -a ALG        lamport|tournament|hybrid|server|fastsrv|ak (default lamport)\n"
             "  -b BACKEND    coherent|cached-flush|uc|emu (default emu)\n"
             "  -L NS         injected device latency, ns (default 0)\n"
             "  -m            ablation: no local submutex\n"
@@ -233,7 +233,7 @@ static void usage(const char *argv0)
             "  -U LAYOUT     metadata layout: uniform (default) | split (scanned arrays in a\n"
             "                cached region; uc, emu)\n"
             "  -Q MODE       multi-line reads of cached metadata (cached-flush, split): probe (default) | batch | serial\n"
-            "  -F MODE       (d)/(e) fast-release check: hint (default) | scan\n"
+            "  -F MODE       (d)/(e)/ak fast-release check: hint (default) | scan | always\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
             "  --skip-wb     DEBUG: skip data writeback (emu must fail)\n"
@@ -316,6 +316,8 @@ int main(int argc, char **argv)
                 ncl_fast_release = NCL_FASTREL_HINT;
             else if (!strcmp(optarg, "scan"))
                 ncl_fast_release = NCL_FASTREL_SCAN;
+            else if (!strcmp(optarg, "always"))
+                ncl_fast_release = NCL_FASTREL_ALWAYS;
             else {
                 usage(argv[0]);
                 return 2;

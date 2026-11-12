@@ -12,6 +12,12 @@
  *   (e) FASTSRV     Splitter fast path + lock-server slow path; the server
  *                   holds the top lock's SLOW side (src/server.c). NOT yet
  *                   model-checked.
+ *   AK              Anderson & Kim's bounded fast-path mechanism (Distrib.
+ *                   Comput. 14, 2001, Fig. 4) on the same tournament and top
+ *                   Peterson lock as HYBRID: the fast path is reopened with
+ *                   O(1) accesses (renaming via Y.indx, Name_Taken[],
+ *                   Obstacle[]) instead of scanning present[]. NOT
+ *                   model-checked. docs/hybrid.md, "Anderson-Kim fast path".
  *
  * Every variable is its own ncl_line_t. Each lock has two blocks of lines,
  * laid out by ncl_base_nlines()/ncl_base_nscan()/ncl_base_bind(): single
@@ -29,6 +35,7 @@ typedef enum {
     NCL_ALG_HYBRID = 2,
     NCL_ALG_SERVER = 3,
     NCL_ALG_FASTSRV = 4,
+    NCL_ALG_AK = 5,
 } ncl_alg_t;
 
 /* Path taken by an acquisition (stats; for HYBRID/FASTSRV also needed at release). */
@@ -36,8 +43,8 @@ enum {
     NCL_PATH_LAMPORT_FAST = 0,
     NCL_PATH_LAMPORT_SLOW,     /* went through the b[] scan */
     NCL_PATH_TOURNAMENT,
-    NCL_PATH_HYBRID_FAST,
-    NCL_PATH_HYBRID_SLOW,
+    NCL_PATH_HYBRID_FAST,      /* also AK's fast path */
+    NCL_PATH_HYBRID_SLOW,      /* also AK's SLOW 1 / SLOW 2 */
     NCL_PATH_SERVER,
     NCL_PATH_FASTSRV_FAST,     /* splitter winner, server not involved */
     NCL_PATH_FASTSRV_SLOW,     /* deflected: request/grant via the server */
@@ -59,12 +66,19 @@ struct ncl_base {
     ncl_line_t *present; /* HYBRID/FASTSRV: present[0..P-1] (scan region) */
     ncl_line_t *tree;  /* TOURNAMENT/HYBRID: 3 lines per internal node */
     ncl_line_t *top;   /* HYBRID/FASTSRV: [flag[FAST], flag[SLOW], turn] */
+    ncl_line_t *ak;    /* AK: [X, Y, Reset, Infast, Name_Taken[P], Obstacle[P]] */
+    int ak_k;          /* AK, node-local, holder only: fast path's y.indx */
+    int ak_slow2;      /* AK, node-local, holder only: slow path is SLOW 2 */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
 };
 
-/* All fields are uint64_t counters (merged generically by ncl_base_stats_add). */
+/* All fields are uint64_t counters (merged generically by ncl_base_stats_add).
+ * AK reuses the split_* counters: fail_closed = SLOW 1 (Y not free), fail_lost
+ * = SLOW 2 (deflected after closing Y), resets = fast path reopened,
+ * reset_skips = reopen blocked (Name_Taken/Obstacle set), scan_loads = loads
+ * in reopen checks. */
 struct ncl_base_stats {
     uint64_t lamport_retries;     /* Lamport `goto start` taken */
     uint64_t split_fail_closed;   /* splitter "right": door already CLOSED */
@@ -117,7 +131,11 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
  * HINT (default) = probe only the slot last seen set, 1 load; a miss reopens,
  * as the original design did. SCAN = every other present[], up to N-1 loads,
  * the strict "reopen only if alone" rule. Both measured fairness 1.00. */
-enum { NCL_FASTREL_SCAN = 0, NCL_FASTREL_HINT = 1 };
+/* ALWAYS: reopen unconditionally (design §4d as first written; AK as
+ * published). For AK, HINT and SCAN both mean the fairness variant: the fast
+ * winner reopens only if the top lock's SLOW flag is clear, and every
+ * slow-path releaser runs the reset (statements 29-37). */
+enum { NCL_FASTREL_SCAN = 0, NCL_FASTREL_HINT = 1, NCL_FASTREL_ALWAYS = 2 };
 extern int ncl_fast_release;
 /* Reopen the door iff it is CLOSED and every present[j] (j != skip) is 0.
  * skip = -1 checks everyone. First an unfenced pre-check of one likely-set
