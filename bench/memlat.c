@@ -3,6 +3,8 @@
  * backends (docs/backends.md): single load, store + fence, a K-line scan read
  * serially vs batched (K clflushopt, one mfence, K loads), and one Dekker step.
  * Single process, one core; usage: ncl_memlat uc|cached-flush [K] [split]
+ * Also compares clflushopt and clwb data writebacks (clwb rows only if the
+ * CPU has it) and the acquire-side invalidate of clean vs uncached lines.
  * "split" (uc only) adds the mixed-layout rows: a cached scan-region store
  * (store + clflushopt) followed by uncached accesses.
  * The "merged" row (invalidate issued before the fence that orders the store)
@@ -15,6 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <x86intrin.h>
+#include <cpuid.h>
+static inline void clwb(void *p) { __asm__ __volatile__("clwb %0" : "+m"(*(volatile char *)p)); }
+static int has_clwb(void) { unsigned a, b, c, d; return __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & (1u << 24)); }
 #define IT 200000
 static ncl_line_t *L;
 static double ns_per_cycle;
@@ -59,6 +64,38 @@ int main(int argc, char **argv) {
         for (int k=0;k<K;k++) dat[k*64] = (char)it;
         for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
         sink += ncl_uc_load(&L[0]); _mm_mfence(); });
+    /* Writeback instruction comparison (--wb): data lines are cached on uc. */
+    TIME("K dirty data clflushopt; mfence", {
+        for (int k=0;k<K;k++) dat[k*64] = (char)it;
+        for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
+        _mm_mfence(); });
+    if (has_clwb()) {
+        TIME("K dirty data clwb; mfence", {
+            for (int k=0;k<K;k++) dat[k*64] = (char)it;
+            for (int k=0;k<K;k++) clwb(dat + k*64);
+            _mm_mfence(); });
+        TIME("K dirty data clwb; mfence; 1 meta load", {
+            for (int k=0;k<K;k++) dat[k*64] = (char)it;
+            for (int k=0;k<K;k++) clwb(dat + k*64);
+            _mm_mfence(); sink += ncl_uc_load(&L[0]); });
+        /* Does clwb keep the line? A re-read hits (a few ns) if it does. */
+        TIME("write; clwb; mfence; re-read same line", {
+            dat[0] = (char)it; clwb(dat); _mm_mfence(); sink += *(volatile char *)dat; });
+    } else {
+        printf("  (no clwb on this CPU: clwb rows skipped)\n");
+    }
+    TIME("write; clflushopt; mfence; re-read same line", {
+        dat[0] = (char)it; _mm_clflushopt(dat); _mm_mfence(); sink += *(volatile char *)dat; });
+    /* Acquire-side invalidate: clean line in cache (what a clwb release
+     * leaves behind) vs line not cached (what a clflushopt release leaves). */
+    TIME("K invalidates of clean cached lines; mfence", {
+        for (int k=0;k<K;k++) sink += *(volatile char *)(dat + k*64);
+        _mm_mfence();
+        for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
+        _mm_mfence(); });
+    TIME("K invalidates of uncached lines; mfence", {
+        for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
+        _mm_mfence(); });
     if (split) {
         ncl_line_t *SL = (ncl_line_t *)ncl_mem.scan;
         TIME("split: UC store; UC load (no fence)", { ncl_uc_store(&L[1], it); sink += ncl_uc_load(&L[0]); });
