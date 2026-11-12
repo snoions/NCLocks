@@ -139,6 +139,11 @@ slot) is unchanged within noise: 0.94 / 0.91 / 0.90M.
 
 ## Does the protocol ranking change? (N=8 x 1, 200 ns CS, defaults, 3 interleaved reps)
 
+**Note:** hybrid and fastsrv rows below use the then-default `-F hint`, which has a
+reset race (`docs/hybrid.md`, "Reset race"). The safe default `-F scan` costs about
+450-580 ns uncontended at N=8 on uc and moves the hybrid behind the tournament
+uncontended.
+
 Raw data: `results/ranking_uc_cf_n8.csv`, with 2b at the current default `-G before`. An
 earlier run with lazy announce is in `results/ranking_uc_cf_n8_lazy.csv`, where
 Lamport-2b collapsed on cached-flush; see `docs/handoff.md`, "Announce placement

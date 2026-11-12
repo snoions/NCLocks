@@ -57,7 +57,7 @@ foreach(alg lamport tournament hybrid server fastsrv ak)
   # scan-heavy options. Exercises the batch index logic on a coherent host;
   # it cannot expose missing flushes or fences (see include/ncl/mem.h).
   add_test(NAME stress_${alg}_cached-flush_batch_n8
-    COMMAND ncl_stress -a ${alg} -b cached-flush -n 8 -t 2 -l 2 -i 10000 -F scan)
+    COMMAND ncl_stress -a ${alg} -b cached-flush -n 8 -t 2 -l 2 -i 10000)
   add_test(NAME stress_${alg}_emu_precise
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 2 -l 3 -i 20000 -H)
 endforeach()
@@ -70,15 +70,6 @@ foreach(alg lamport tournament hybrid server fastsrv ak)
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -K 4 -H)
   add_test(NAME stress_${alg}_emu_local_cap1
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -K 1)
-endforeach()
-# (d)/(e) with the strict all-slots fast-release check (-F scan; default is hint).
-foreach(alg hybrid fastsrv)
-  add_test(NAME stress_${alg}_emu_fastrel_scan
-    COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 2 -l 3 -i 20000 -F scan)
-  add_test(NAME stress_${alg}_uc_fastrel_scan
-    COMMAND ncl_stress -a ${alg} -b uc -n 4 -t 2 -l 3 -i 20000 -F scan)
-  set_tests_properties(stress_${alg}_uc_fastrel_scan PROPERTIES
-    SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
 endforeach()
 # Phase 2b: gate + owner handoff (design §3.3). Default = announce before the
 # gate + adaptive pick_waiter; also the spec baseline (inside/scan), lazy
@@ -110,7 +101,7 @@ add_test(NAME emu_detects_missing_invalidate_handoff
   COMMAND ncl_stress -a hybrid -b emu -n 4 -t 3 -l 1 -i 5000 -M handoff -K 1 --skip-inv)
 set_tests_properties(emu_detects_missing_invalidate_handoff PROPERTIES WILL_FAIL TRUE)
 add_test(NAME stress_hybrid_cached-flush_probe_n8
-  COMMAND ncl_stress -a hybrid -b cached-flush -n 8 -t 2 -l 2 -i 10000 -F scan -Q probe)
+  COMMAND ncl_stress -a hybrid -b cached-flush -n 8 -t 2 -l 2 -i 10000 -Q probe)
 add_test(NAME stress_lamport_cached-flush_probe_n8
   COMMAND ncl_stress -a lamport -b cached-flush -n 8 -t 2 -l 2 -i 10000 -Q probe)
 add_test(NAME stress_tournament_cached-flush_probe_handoff_scan
@@ -162,7 +153,7 @@ set_tests_properties(emu_detects_missing_invalidate PROPERTIES WILL_FAIL TRUE)
 foreach(be emu uc)
   foreach(alg lamport tournament hybrid server fastsrv ak)
     add_test(NAME stress_${alg}_${be}_split
-      COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 3 -i 20000 -F scan --timeout 100)
+      COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 3 -i 20000 --timeout 100)
     list(APPEND split_tests_${be} stress_${alg}_${be}_split)
   endforeach()
   foreach(alg lamport tournament hybrid server)
@@ -171,7 +162,7 @@ foreach(be emu uc)
     list(APPEND split_tests_${be} stress_${alg}_${be}_split_handoff_cap1)
   endforeach()
   add_test(NAME stress_hybrid_${be}_split_n8_batch
-    COMMAND ncl_stress -a hybrid -b ${be} -U split -n 8 -t 2 -l 2 -i 10000 -F scan -Q batch --timeout 100)
+    COMMAND ncl_stress -a hybrid -b ${be} -U split -n 8 -t 2 -l 2 -i 10000 -Q batch --timeout 100)
   add_test(NAME stress_lamport_${be}_split_local
     COMMAND ncl_stress -a lamport -b ${be} -U split -n 4 -t 3 -l 2 -i 10000 -M local -H --timeout 100)
   list(APPEND split_tests_${be} stress_hybrid_${be}_split_n8_batch stress_lamport_${be}_split_local)
@@ -207,3 +198,23 @@ set_tests_properties(stress_ak_uc_always stress_ak_uc_n8_delay stress_ak_uc_alwa
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
 add_test(NAME stress_ak_emu_nosub_always
   COMMAND ncl_stress -a ak -b emu -n 3 -t 3 -l 2 -i 10000 -m -F always)
+# Splitter reset race (docs/hybrid.md, "Reset race"): --reset-delay widens the
+# reset check's window (as a preempted releaser would). The default (strict
+# scan, plus the fastsrv server's present[P] marker) must pass; the old hint
+# rule (--debug-unsafe-reopen) must fail. -F always is ak-only.
+foreach(be emu uc)
+  foreach(alg hybrid fastsrv)
+    add_test(NAME stress_${alg}_${be}_reset_window
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 6 -t 2 -l 2 -i 60000 --reset-delay 3000 --timeout 100)
+  endforeach()
+endforeach()
+set_tests_properties(stress_hybrid_uc_reset_window stress_fastsrv_uc_reset_window
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+add_test(NAME emu_detects_reset_race_hint
+  COMMAND ncl_stress -a hybrid -b emu --debug-unsafe-reopen -n 6 -t 2 -l 2 -i 60000 --reset-delay 3000 --timeout 100)
+set_tests_properties(emu_detects_reset_race_hint PROPERTIES WILL_FAIL TRUE)
+foreach(alg hybrid fastsrv)
+  add_test(NAME ${alg}_rejects_reopen_always
+    COMMAND ncl_stress -a ${alg} -b emu -F always -i 100)
+  set_tests_properties(${alg}_rejects_reopen_always PROPERTIES WILL_FAIL TRUE)
+endforeach()

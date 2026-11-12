@@ -5,7 +5,8 @@
 #include <string.h>
 
 unsigned ncl_backoff_cap = 1024;
-int ncl_fast_release = NCL_FASTREL_HINT;
+int ncl_fast_release = NCL_FASTREL_SCAN; /* hint/always are UNSAFE, see base.h */
+uint64_t ncl_debug_reset_delay = 0;
 
 const char *const ncl_path_names[NCL_PATH__COUNT] = {
     [NCL_PATH_LAMPORT_FAST] = "lamport_fast",
@@ -51,8 +52,8 @@ size_t ncl_base_nscan(ncl_alg_t alg, int P)
 {
     switch (alg) {
     case NCL_ALG_LAMPORT:            /* b[] */
-    case NCL_ALG_HYBRID:             /* present[] */
-    case NCL_ALG_FASTSRV: return (size_t)P;
+    case NCL_ALG_HYBRID: return (size_t)P; /* present[] */
+    case NCL_ALG_FASTSRV: return (size_t)P + 1; /* present[] + server reset marker */
     case NCL_ALG_TOURNAMENT:
     case NCL_ALG_SERVER:
     case NCL_ALG_AK: return 0;
@@ -78,6 +79,7 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
     case NCL_ALG_HYBRID:
         b->split = lines;
         b->present = scan;
+        b->npresent = P;
         b->tree = lines + split_lines(P);
         b->top = b->tree + tree_lines(P);
         break;
@@ -86,6 +88,7 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
     case NCL_ALG_FASTSRV:
         b->split = lines;
         b->present = scan;
+        b->npresent = P + 1;
         b->top = lines + split_lines(P);
         break;
     case NCL_ALG_AK:
@@ -249,16 +252,17 @@ void ncl_splitter_open(struct ncl_base *b) { ncl_uc_store(SP_DOOR(b), DOOR_OPEN)
 void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
     /* Start at the slot last seen set: under contention one load decides. */
-    int start = b->reset_hint >= 0 && b->reset_hint != i ? b->reset_hint : (i + 1) % b->P;
+    const int np = b->npresent;
+    int start = b->reset_hint >= 0 && b->reset_hint != i ? b->reset_hint : (i + 1) % np;
     if (ncl_fast_release == NCL_FASTREL_ALWAYS) {
         ncl_splitter_open(b);
         st->split_resets++;
         return;
     }
     if (ncl_fast_release == NCL_FASTREL_HINT) {
-        /* Cheap variant: probe only the remembered slot. A miss reopens even
-         * if some other node is present (the design's original unconditional
-         * reopen, so still safe); fairness is weaker. */
+        /* Probe only the remembered slot; a miss reopens even if some other
+         * node is present. UNSAFE: that node may be a slow releaser in the
+         * middle of its reset check (see base.h). Measurement only. */
         if (start != i) {
             st->split_scan_loads++;
             if (ncl_uc_load(SP_PRESENT(b, start))) {
@@ -270,7 +274,7 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
         ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
         return;
     }
-    int j = ncl_uc_scan_first(SP_PRESENT(b, 0), b->P, start, b->P, i, &st->split_scan_loads);
+    int j = ncl_uc_scan_first(SP_PRESENT(b, 0), np, start, np, i, &st->split_scan_loads);
     if (j >= 0) {
         b->reset_hint = j;
         st->split_fast_keep_closed++;
@@ -282,15 +286,27 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
 
 void ncl_present_clear(struct ncl_base *b, int i) { ncl_uc_store(SP_PRESENT(b, i), 0); }
 
+void ncl_splitter_server_reset(struct ncl_base *b, struct ncl_base_stats *st)
+{
+    const int m = b->npresent - 1; /* the server's marker slot */
+    ncl_uc_store(SP_PRESENT(b, m), 1);
+    ncl_fence(); /* marker visible before the door read and scan (Dekker with the
+                    fast winner: its present[] set, fence, scan incl. slot m) */
+    ncl_splitter_reset_if_quiet(b, m, st);
+    ncl_fence_ss(); /* any door = OPEN store before the marker clears */
+    ncl_present_clear(b, m);
+}
+
 void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st)
 {
     /* Pre-check (optimization only): under contention some other node is
      * almost always present, typically the one seen last time. One load, no
      * fence, instead of door load + fence + scan. Skipping is always safe: it
      * only leaves the fast path closed longer. */
+    const int np = b->npresent;
     int hint = b->reset_hint;
     if (hint < 0 || hint == skip)
-        hint = skip >= 0 ? (skip + 1) % b->P : 0;
+        hint = skip >= 0 ? (skip + 1) % np : 0;
     if (hint != skip && ncl_uc_load(SP_PRESENT(b, hint))) {
         st->split_precheck_skips++;
         st->split_reset_skips++;
@@ -302,15 +318,19 @@ void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_s
     /* door read before present[] reads: a node that read door == OPEN and is
      * about to close it set present[] before its fence (1), so we see it. */
     ncl_fence();
+    if (NCL_UNLIKELY(ncl_debug_reset_delay))
+        ncl_lat_spin_cycles(ncl_debug_reset_delay);
     /* Start after `skip` so the scan spreads over nodes; early exit on the
      * first set flag. Order doesn't affect safety: a reset requires all 0. */
-    int start = skip >= 0 ? skip + 1 : 0;
-    int j = ncl_uc_scan_first(SP_PRESENT(b, 0), b->P, start, b->P, skip, &st->split_scan_loads);
+    int start = skip >= 0 ? (skip + 1) % np : 0;
+    int j = ncl_uc_scan_first(SP_PRESENT(b, 0), np, start, np, skip, &st->split_scan_loads);
     if (j >= 0) {
         b->reset_hint = j;
         st->split_reset_skips++;
         return;
     }
+    if (NCL_UNLIKELY(ncl_debug_reset_delay))
+        ncl_lat_spin_cycles(ncl_debug_reset_delay);
     ncl_fence();
     ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
     st->split_resets++;
@@ -357,7 +377,7 @@ static void hybrid_unlock(struct ncl_base *b, int i, int path, struct ncl_base_s
     if (path == NCL_PATH_HYBRID_FAST) {
         ncl_top_unlock(b, NCL_SIDE_FAST);
         ncl_fence();
-        ncl_splitter_open_unless_others(b, i, st); /* fairness rule (was: unconditional) */
+        ncl_splitter_open_unless_others(b, i, st); /* safety + fairness rule */
     } else {
         ncl_top_unlock(b, NCL_SIDE_SLOW);
         ncl_fence();

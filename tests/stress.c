@@ -38,6 +38,7 @@ struct lockdata {
 static int nnodes = 4, nthreads = 2, nlocks = 4, nwords = 16, pin = 0, precise = 0;
 static long iters = 100000;
 static int timeout_s = 0;
+static unsigned reset_delay_ns = 0;
 static unsigned max_delay_ns = 200;
 static size_t stride;
 static uint64_t delay_cycles;
@@ -233,13 +234,17 @@ static void usage(const char *argv0)
             "  -U LAYOUT     metadata layout: uniform (default) | split (scanned arrays in a\n"
             "                cached region; uc, emu)\n"
             "  -Q MODE       multi-line reads of cached metadata (cached-flush, split): probe (default) | batch | serial\n"
-            "  -F MODE       (d)/(e)/ak fast-release check: hint (default) | scan | always\n"
+            "  -F MODE       ak: fair (default, our fairness variant) | always (as published)\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
             "  --skip-wb     DEBUG: skip data writeback (emu must fail)\n"
             "  --skip-inv    DEBUG: skip data invalidate (emu must fail)\n"
             "  --skip-meta-wb / --skip-meta-inv\n"
             "                DEBUG: split layout: skip scan-region writeback / invalidate\n"
+            "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
+            "  --debug-unsafe-reopen  DEBUG: (d)/(e) fast winner probes one present[] slot\n"
+            "                and reopens on a miss (the old -F hint; reset race, must FAIL\n"
+            "                with --reset-delay)\n"
             "  --timeout S   kill the nodes and FAIL after S seconds (default 0 = none)\n",
             argv0);
 }
@@ -257,6 +262,8 @@ int main(int argc, char **argv)
         {"skip-meta-wb", no_argument, 0, 3},
         {"skip-meta-inv", no_argument, 0, 4},
         {"timeout", required_argument, 0, 5},
+        {"reset-delay", required_argument, 0, 6},
+        {"debug-unsafe-reopen", no_argument, 0, 7},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -312,9 +319,7 @@ int main(int argc, char **argv)
             }
             break;
         case 'F':
-            if (!strcmp(optarg, "hint"))
-                ncl_fast_release = NCL_FASTREL_HINT;
-            else if (!strcmp(optarg, "scan"))
+            if (!strcmp(optarg, "fair"))
                 ncl_fast_release = NCL_FASTREL_SCAN;
             else if (!strcmp(optarg, "always"))
                 ncl_fast_release = NCL_FASTREL_ALWAYS;
@@ -336,6 +341,8 @@ int main(int argc, char **argv)
         case 3: cfg.debug_skip_meta_wb = 1; break;
         case 4: cfg.debug_skip_meta_inv = 1; break;
         case 5: timeout_s = atoi(optarg); break;
+        case 6: reset_delay_ns = (unsigned)atoi(optarg); break;
+        case 7: ncl_fast_release = NCL_FASTREL_HINT; break;
         case 1: cfg.debug_skip_data_wb = 1; break;
         case 2: cfg.debug_skip_data_inv = 1; break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;
@@ -363,6 +370,7 @@ int main(int argc, char **argv)
         return 2;
     printf("mem: %s\n", ncl_mem_describe());
     delay_cycles = ncl_ns_to_cycles(max_delay_ns);
+    ncl_debug_reset_delay = ncl_ns_to_cycles(reset_delay_ns);
 
     for (int l = 0; l < nlocks; l++) {
         if (ncl_lock_set_data(l, (ncl_off_t)l * stride, stride) < 0)

@@ -229,7 +229,11 @@ Candidates to cut the release scan:
    would also break the one-8-byte-store invariant and introduce mixed-size accesses.
    Expected saving at N=8: about 500 ns per hold.
 
-## Fast-release check: hint (default) vs scan
+## Fast-release check: hint vs scan (hint was the default until the reset race)
+
+**Superseded:** the claim below that a hint miss leaves safety unaffected is wrong; see
+"Reset race" at the end. The strict scan is now the only rule; `-F hint`/`-F scan` no
+longer exist for (d)/(e) (hint survives as `ncl_stress --debug-unsafe-reopen`).
 
 The fairness rule's scan of every other `present[]` slot is the ~600 ns hold-time cost
 found at N=8. The default (`-F hint`, `ncl_fast_release = NCL_FASTREL_HINT`) now
@@ -285,10 +289,10 @@ metadata. The reopen check reads one `Name_Taken` and one `Obstacle` entry inste
 scanning `present[]`. The cost is one more store-fence-load step on the fast path
 (`Name_Taken` vs `Reset`) and several more stores.
 
-- **As published (`-F always`) it is unfair:** the fast winner always reopens, and the
+- **As published (`-F always`, ak only) it is unfair:** the fast winner always reopens, and the
   quickest node keeps winning (closed loop fairness 0.36 at N=8, 0.25 at N=16), as our
   hybrid did before its fairness fix.
-- **Default = fairness variant (ours):** the fast winner reopens only if the top lock's
+- **Default = fairness variant (ours, `-F fair`):** the fast winner reopens only if the top lock's
   SLOW flag is clear (one load), and every slow-path releaser runs the reset (statements
   29-37), not only SLOW 2 processes; otherwise the fast path could stay closed. The
   reset's safety argument (Name_Taken/Reset and Obstacle/Reset Dekker pairs, `Infast`,
@@ -297,8 +301,8 @@ scanning `present[]`. The cost is one more store-fence-load step on the fast pat
 
 **uc, 200 ns CS, `-B 16`, 3 interleaved reps, medians** (`results/ak_vs_hybrid_uc.csv`).
 Closed loop: Mops/s (fairness). Open loop: sojourn p50 (us); onoff = `-r 200k -A
-onoff:200:0.25` (bursts at 800k). hybrid-scan = hybrid `-F scan` (full `present[]` scan at
-every fast release).
+onoff:200:0.25` (bursts at 800k). hybrid = the then-default hint rule (unsafe, see "Reset
+race"); hybrid-scan = the strict scan at every fast release, now the only rule.
 
 | N, -L | load | hybrid | hybrid-scan | ak (fair) | ak as published |
 |---|---|---|---|---|---|
@@ -332,3 +336,47 @@ every fast release).
   fairness 0.14-0.36** rules it out under saturation.
 - Net: no variant dominates. For N <= 8 the hybrid stays the better choice; at N=16 with
   moderate load the fair AK is better, unless the device is slow or the load saturates.
+
+## Reset race: the strict scan is the only rule (found 2026-11-11)
+
+While trying a hybrid that reopens after every slow release, stress on uc found mutual
+exclusion violations, and then also in the original unconditional reopen (`-F always`).
+Cause: `ncl_splitter_reset_if_quiet` is check-then-act (read `door == CLOSED`, scan
+`present[]`, store `door = OPEN`). A fast winner that reopens inside that window lets a
+new node win after the scan; the resetter's stale `door = OPEN` then admits a second
+winner while the first holds the fast path. Only the strict fast-release rule excludes
+this: the resetter's `present[i]` is set throughout, and the winner reopens only if every
+other `present[j]` is 0 (Dekker pair on `present[]`).
+
+- (d) hint/always and (e) hint (then `-F hint`/`-F always`) all fail once the window is stretched (`ncl_stress
+  --reset-delay NS`, a debug spin after the reset's door read and after its scan; a
+  preempted releaser does the same). Hybrid hint: 8 of 10 runs on uc, 7 of 10 on emu;
+  fastsrv hint 2 of 6.
+- (e) also failed with `-F scan`: its reset runs in the server thread, which has no
+  `present[]` slot, so the winner's scan could not see it. Fix: each FASTSRV lock has
+  `present[P]`, set by its home server (single writer) for the duration of the check
+  (`ncl_splitter_server_reset`).
+- With both fixes, 66 stretched-window runs (hybrid and fastsrv; uc and emu; several
+  shapes, local/handoff modes, split layout; delays 0.5-30 us) pass. ctests:
+  `stress_{hybrid,fastsrv}_{emu,uc}_reset_window`, `emu_detects_reset_race_hint` (the hint
+  rule via `--debug-unsafe-reopen` must fail), and `{hybrid,fastsrv}_rejects_reopen_always`.
+  `-F` now applies to ak only (`fair` | `always`).
+- The experimental "reopen after every slow release" hybrid (deflected nodes leaving
+  `present[]` at once) is unsafe for the same reason (it hides resetters from the scan)
+  and was dropped. The fair AK (`-a ak`) runs its reset inside the critical section,
+  guarded by `Infast`, `Name_Taken` and `Obstacle`.
+
+**Cost** (uc, N=8 x 1, 200 ns CS, `-B 16`, 3 reps; `results/fastrel_scan_default_uc.csv`):
+
+| | capacity | 100k sojourn p50 | 600k acquire p50 / p99 | 600k fast share |
+|---|---|---|---|---|
+| hybrid scan (default) | 1.12M (1.00) | 1535 ns | 1.53 / 11.3 us | 25% |
+| hybrid hint (unsafe) | 1.10M (1.00) | 1087 ns | 0.93 / 10.2 us | 44% |
+| fastsrv scan (default) | 1.12M (1.00) | 1663 ns | 1.92 / 13.8 us | 17% |
+| fastsrv hint (unsafe) | 1.09M (1.00) | 1087 ns | 1.66 / 15.9 us | 33% |
+
+Uncontended the safe hybrid is now slower than the plain tournament on uc (991 ns,
+`docs/backends.md` ranking), so at N=8 on uncached metadata its fast path no longer pays.
+On cached-flush or the split layout the scan is batched and much cheaper. Earlier
+hybrid/fastsrv measurements in this repository used the unsafe hint default; their costs
+are accurate for that protocol, not for the safe one.

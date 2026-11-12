@@ -129,6 +129,12 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         fprintf(stderr, "ncl: --skip-meta-wb/--skip-meta-inv apply to the split layout only\n");
         return -1;
     }
+    if (ncl_fast_release == NCL_FASTREL_ALWAYS &&
+        (c->alg == NCL_ALG_HYBRID || c->alg == NCL_ALG_FASTSRV)) {
+        fprintf(stderr, "ncl: -F always (unconditional reopen) is unsafe for %s (splitter reset "
+                        "race, docs/hybrid.md); it applies to ak only\n", ncl_alg_name(c->alg));
+        return -1;
+    }
     if (c->nnodes < 1 || c->nnodes > NCL_MAX_NODES || c->nlocks < 1) {
         fprintf(stderr, "ncl: bad nnodes=%d / nlocks=%d\n", c->nnodes, c->nlocks);
         return -1;

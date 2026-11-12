@@ -372,10 +372,8 @@ static void usage(const char *argv0)
             "  -B N        spin-wait backoff cap for base algorithms, pause iterations (1024)\n"
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
             "              (SMT sibling of node n's first worker)\n"
-            "  -F MODE     (d)/(e) fast-release reopen check: hint (only the slot last seen\n"
-            "              set, default) | scan (all present[]) | always (unconditional, as\n"
-            "              published). ak: hint/scan = fairness variant (reopen only if no\n"
-            "              slow waiter at the top lock), always = Anderson-Kim as published\n",
+            "  -F MODE     ak: fair (default; reopen only if no slow waiter at the top\n"
+            "              lock) | always (Anderson-Kim as published; unfair)\n",
             argv0);
 }
 
@@ -463,14 +461,12 @@ int main(int argc, char **argv)
             }
             break;
         case 'F':
-            if (!strcmp(optarg, "scan"))
+            if (!strcmp(optarg, "fair"))
                 ncl_fast_release = NCL_FASTREL_SCAN;
-            else if (!strcmp(optarg, "hint"))
-                ncl_fast_release = NCL_FASTREL_HINT;
             else if (!strcmp(optarg, "always"))
                 ncl_fast_release = NCL_FASTREL_ALWAYS;
             else {
-                fprintf(stderr, "-F: scan|hint|always\n");
+                fprintf(stderr, "-F: fair|always (ak only)\n");
                 return 2;
             }
             break;

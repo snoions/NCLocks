@@ -40,15 +40,18 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   with (e).
 - `-a ak`: Anderson & Kim's bounded fast path (Distrib. Comput. 2001, Fig. 4) with our
   tournament and top Peterson lock as slow path and ENTRY 2. It reopens the fast path with O(1)
-  accesses instead of the hybrid's `present[]` scan. Default `-F hint|scan` = our fairness
+  accesses instead of the hybrid's `present[]` scan. Default `-F fair` = our fairness
   variant (the fast winner reopens only if no slow waiter is at the top lock; every slow
-  releaser resets). `-F always` = as published, and for the hybrid the original
-  unconditional reopen. Not model-checked; `docs/hybrid.md`.
+  releaser resets). `-F always` = as published (unfair). `-F` applies to ak only. Not
+  model-checked; `docs/hybrid.md`.
 - `src/server.c`: lock servers (c) and fast-path server (e), Phase 1 (fixed home =
   hash % N). Message and reply bit layouts are in `src/server.h`. Nodes must call
   `ncl_node_detach()` (an all-nodes barrier) before servers stop. (d) and (e) are **not
-  model-checked**, including two fairness fixes added after measurement (fast winner reopens
-  only if the node last seen present has left, `-F hint`, default; or only if alone, `-F scan`; the (e) server yields the SLOW side to a waiting fast winner). See
+  model-checked**, including two fixes added after measurement: the fast winner reopens only
+  if no other node is present (strict scan of `present[]`; required for SAFETY: the splitter
+  reset is check-then-act, and any cheaper reopen rule races a slow releaser's stale `door =
+  OPEN`; (e)'s server holds a `present[N]` marker during its reset; `ncl_stress --reset-delay`
+  widens the window and `--debug-unsafe-reopen` shows the race); the (e) server yields the SLOW side to a waiting fast winner. See
   design.md §4d/§4e. Implementation notes and measurements: `docs/hybrid.md`.
 - Waits that depend on another thread (submutex handoff, server grants) spin and then
   `sched_yield()`, so oversubscribed runs make progress.

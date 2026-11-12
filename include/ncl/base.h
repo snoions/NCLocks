@@ -63,7 +63,8 @@ struct ncl_base {
     ncl_line_t *lam;   /* LAMPORT: [x, y] */
     ncl_line_t *lam_b; /* LAMPORT: b[0..P-1] (scan region) */
     ncl_line_t *split; /* HYBRID/FASTSRV: [race, door] */
-    ncl_line_t *present; /* HYBRID/FASTSRV: present[0..P-1] (scan region) */
+    ncl_line_t *present; /* HYBRID/FASTSRV: present[0..npresent-1] (scan region) */
+    int npresent;      /* P; FASTSRV P+1: slot P = home server's reset marker */
     ncl_line_t *tree;  /* TOURNAMENT/HYBRID: 3 lines per internal node */
     ncl_line_t *top;   /* HYBRID/FASTSRV: [flag[FAST], flag[SLOW], turn] */
     ncl_line_t *ak;    /* AK: [X, Y, Reset, Infast, Name_Taken[P], Obstacle[P]] */
@@ -119,24 +120,29 @@ enum { NCL_SIDE_FAST = 0, NCL_SIDE_SLOW = 1 };
 int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st);
 /* door = OPEN (the design's unconditional fast-winner reset; kept for reference). */
 void ncl_splitter_open(struct ncl_base *b);
-/* Fast-path winner i at release (fairness rule, see docs/hybrid.md): reopen
- * the door only if no other node is present (SCAN) or, by default (HINT),
- * unless the node last seen present still is. Otherwise leave it CLOSED so the
- * winner's node cannot immediately re-win while others wait on the slow path;
- * the last slow-path releaser reopens it via ncl_splitter_reset_if_quiet.
- * Skipping a reopen is always safe, and no other resetter can act while
- * present[i] is still set, so this needs no door read. */
+/* Fast-path winner i at release: reopen the door only if no other node is
+ * present (SCAN, default). Otherwise leave it CLOSED; the last slow-path
+ * releaser reopens it via ncl_splitter_reset_if_quiet. This rule is needed
+ * for SAFETY, not only fairness: the reset check is check-then-act (door read,
+ * present[] scan, door store), and a reopen during it lets a new winner in
+ * before its stale door = OPEN admits a second one. While a slow releaser
+ * runs that check its own present[] is set, so the strict scan never reopens
+ * then (docs/hybrid.md, "Reset race"). */
 void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_stats *st);
 /* How the fast winner's release decides (global, set before nodes start):
- * HINT (default) = probe only the slot last seen set, 1 load; a miss reopens,
- * as the original design did. SCAN = every other present[], up to N-1 loads,
- * the strict "reopen only if alone" rule. Both measured fairness 1.00. */
-/* ALWAYS: reopen unconditionally (design §4d as first written; AK as
- * published). For AK, HINT and SCAN both mean the fairness variant: the fast
- * winner reopens only if the top lock's SLOW flag is clear, and every
- * slow-path releaser runs the reset (statements 29-37). */
+ * SCAN (default) = every other present[], up to N-1 loads: the only safe
+ * choice for HYBRID/FASTSRV. HINT = probe one remembered slot and reopen on a
+ * miss: UNSAFE (reset race above), reachable only through the stress test's
+ * --debug-unsafe-reopen, to show the race is detected. ALWAYS = unconditional
+ * reopen: for AK only (AK as published; rejected for HYBRID/FASTSRV). For AK,
+ * SCAN means our fairness variant (reopen only if the top lock's SLOW flag is
+ * clear; every slow-path releaser runs the reset, statements 29-37). */
 enum { NCL_FASTREL_SCAN = 0, NCL_FASTREL_HINT = 1, NCL_FASTREL_ALWAYS = 2 };
 extern int ncl_fast_release;
+/* DEBUG: spin this many TSC cycles after the reset check's door read and again
+ * after its present[] scan, before the door = OPEN store (widens the window of the stale-door race; stress
+ * --reset-delay). 0 = off. */
+extern uint64_t ncl_debug_reset_delay;
 /* Reopen the door iff it is CLOSED and every present[j] (j != skip) is 0.
  * skip = -1 checks everyone. First an unfenced pre-check of one likely-set
  * present[] slot: if it is set, give up immediately (skipping a reset is
@@ -144,6 +150,11 @@ extern int ncl_fast_release;
  * slot. */
 void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_stats *st);
 void ncl_present_clear(struct ncl_base *b, int i);
+/* FASTSRV server: the reset check above with the server visible in
+ * present[P] for its duration, so a fast winner's full scan never reopens
+ * during it (the same protection a slow node's own present[i] gives in
+ * HYBRID). */
+void ncl_splitter_server_reset(struct ncl_base *b, struct ncl_base_stats *st);
 
 /* Top two-party Peterson lock, split so a polling server can run it. */
 void ncl_top_announce(struct ncl_base *b, int side); /* flag[side]=1; turn=side; fence */

@@ -258,8 +258,9 @@ static void advance(struct srv_lock *sl)
         ncl_top_unlock(&sl->b, NCL_SIDE_SLOW);
         sl->slow = SLOW_NONE;
         ncl_fence();
-        /* Releasing grantee cleared present[] before its REL, so check all. */
-        ncl_splitter_reset_if_quiet(&sl->b, -1, &S.st.base);
+        /* Releasing grantee cleared present[] before its REL, so check all
+         * node slots; the server is visible in its marker slot meanwhile. */
+        ncl_splitter_server_reset(&sl->b, &S.st.base);
     }
 }
 
