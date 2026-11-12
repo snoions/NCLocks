@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(NCL_SANITIZE "Build with -fsanitize=address,undefined" OFF)
-set(NCL_MAX_NODES 16 CACHE STRING "Max nodes")
+set(NCL_MAX_NODES 64 CACHE STRING "Max nodes")
 set(NCL_MAX_PARTICIPANTS 256 CACHE STRING "Max global-algorithm participants")
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
@@ -23,7 +23,7 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(ncl STATIC src/mem.c src/base.c src/lock.c src/server.c)
+add_library(ncl STATIC src/mem.c src/base.c src/lock.c src/server.c src/cpus.c)
 target_include_directories(ncl PUBLIC include)
 target_compile_definitions(ncl PUBLIC
   NCL_MAX_NODES=${NCL_MAX_NODES} NCL_MAX_PARTICIPANTS=${NCL_MAX_PARTICIPANTS})
@@ -238,3 +238,26 @@ add_test(NAME stress_aksrv_emu_split
 add_test(NAME handoff_rejects_aksrv
   COMMAND ncl_stress -a aksrv -b emu -M handoff)
 set_tests_properties(handoff_rejects_aksrv PROPERTIES WILL_FAIL TRUE)
+# PTHREAD: process-shared pthread_mutex_t, a coherent-memory reference baseline
+# (coherent backend, phase1 only).
+add_test(NAME stress_pthread_coherent
+  COMMAND ncl_stress -a pthread -b coherent -n 4 -t 2 -l 3 -i 20000 --timeout 100)
+add_test(NAME stress_pthread_coherent_ablation
+  COMMAND ncl_stress -a pthread -b coherent -m -n 4 -t 3 -l 2 -i 20000 --timeout 100)
+add_test(NAME pthread_rejects_noncoherent
+  COMMAND ncl_stress -a pthread -b emu -i 100)
+set_tests_properties(pthread_rejects_noncoherent PROPERTIES WILL_FAIL TRUE)
+add_test(NAME pthread_rejects_local
+  COMMAND ncl_stress -a pthread -b coherent -M local -i 100)
+set_tests_properties(pthread_rejects_local PROPERTIES WILL_FAIL TRUE)
+# NUMA placement and CPU lists (docs/cxl_host.md). Node 0 exists everywhere.
+add_test(NAME stress_hybrid_emu_mem_node0
+  COMMAND ncl_stress -a hybrid -b emu -U split -n 4 -t 2 -l 2 -i 20000 --mem-node 0 --timeout 100)
+add_test(NAME mem_node_rejects_missing_node
+  COMMAND ncl_stress -a tournament -b coherent -i 100 --mem-node 1000)
+set_tests_properties(mem_node_rejects_missing_node PROPERTIES WILL_FAIL TRUE)
+add_test(NAME cpus_rejects_bad_list
+  COMMAND ncl_stress -a tournament -b coherent -i 100 -p --cpus 3-1)
+set_tests_properties(cpus_rejects_bad_list PROPERTIES WILL_FAIL TRUE)
+add_test(NAME stress_tournament_emu_n24
+  COMMAND ncl_stress -a tournament -b emu -n 24 -t 1 -l 2 -i 5000 --timeout 100)

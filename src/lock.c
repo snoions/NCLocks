@@ -1,4 +1,5 @@
 #include "ncl/lock.h"
+#include "ncl/cpus.h"
 #include "server.h"
 
 #include <sched.h>
@@ -139,6 +140,21 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         fprintf(stderr, "ncl: bad nnodes=%d / nlocks=%d\n", c->nnodes, c->nlocks);
         return -1;
     }
+    if (c->alg == NCL_ALG_PTHREAD && c->backend != NCL_BACKEND_COHERENT) {
+        /* A futex mutex needs coherent cross-node atomics: the reference point
+         * "if coherent atomics existed", not a lock for non-coherent memory.
+         * On uc it would fall back to x86 bus locks, which says nothing about
+         * CXL. */
+        fprintf(stderr, "ncl: pthread is a coherent-memory baseline: use -b coherent\n");
+        return -1;
+    }
+    if (c->alg == NCL_ALG_PTHREAD && c->mode != NCL_MODE_PHASE1) {
+        /* Cohort passing would unlock the mutex from a thread that did not lock
+         * it (undefined for pthread mutexes); the gate + owner handoff needs no
+         * base lock. */
+        fprintf(stderr, "ncl: pthread runs in phase1 mode only\n");
+        return -1;
+    }
     int server = c->alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(c->alg);
     if (server && c->no_submutex) {
         fprintf(stderr, "ncl: %s needs the local submutex (no ablation)\n", ncl_alg_name(c->alg));
@@ -175,7 +191,9 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         .data_size = c->data_size,
         .base_addr = c->base_addr,
         .dev_lat_ns = c->dev_lat_ns,
+        .mem_node = c->mem_node,
     };
+    ncl_cpus_init(); /* before nodes fork and threads pin (default = our affinity) */
     if (ncl_mem_init(&mc) < 0)
         return -1;
 
@@ -191,6 +209,10 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     hdr->user_off = hdr_sz + descs_sz + locks_sz;
     hdr->done_off = hdr->user_off + user_sz;
     hdr->srv = srv;
+    for (int l = 0; l < c->nlocks; l++)
+        if (ncl_base_init_shared(c->alg, (ncl_line_t *)ncl_meta_ptr(hdr->locks_off) +
+                                             (size_t)l * lines_per_lock) < 0)
+            return -1;
     ncl_fence();
     hdr->magic = NCL_MAGIC;
     ncl_fence();

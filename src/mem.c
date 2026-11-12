@@ -8,10 +8,12 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
 #if defined(__x86_64__)
+#include <cpuid.h>
 #include <x86intrin.h>
 #endif
 
@@ -23,6 +25,104 @@
 
 int ncl_meta_batch = NCL_META_PROBE;
 struct ncl_mem ncl_mem;
+static int wb_mode = NCL_WB_CLFLUSHOPT; /* survives ncl_mem_init's reset */
+
+int ncl_wb_mode_set(int mode)
+{
+    if (mode == NCL_WB_CLWB) {
+#if defined(__x86_64__)
+        unsigned a, b, c, d;
+        if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !(b & (1u << 24))) {
+            fprintf(stderr, "ncl: this CPU has no clwb\n");
+            return -1;
+        }
+#else
+        fprintf(stderr, "ncl: clwb is x86-only\n");
+        return -1;
+#endif
+    }
+    wb_mode = mode;
+    ncl_mem.wb_clwb = mode == NCL_WB_CLWB;
+    return 0;
+}
+
+const char *ncl_wb_mode_name(void) { return wb_mode == NCL_WB_CLWB ? "clwb" : "clflushopt"; }
+
+/* ---- NUMA placement of the shared regions (no libnuma dependency) ------- */
+
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_MF_STRICT
+#define MPOL_MF_STRICT 1
+#endif
+#define NCL_NUMA_MAXNODE 1024
+
+/* Bind [p, p+len) to `node` before anything touches it. For a MAP_SHARED
+ * memfd mapping this sets the shared (inode) policy, so it holds for every
+ * process that maps the file. */
+static int bind_region(void *p, size_t len, int node, const char *what)
+{
+    unsigned long mask[NCL_NUMA_MAXNODE / (8 * sizeof(unsigned long))] = {0};
+    if (node < 0 || node >= NCL_NUMA_MAXNODE)
+        return -1;
+    mask[node / (8 * sizeof(unsigned long))] = 1ul << (node % (8 * sizeof(unsigned long)));
+    if (syscall(SYS_mbind, p, len, MPOL_BIND, mask, (unsigned long)NCL_NUMA_MAXNODE,
+                MPOL_MF_STRICT) < 0) {
+        fprintf(stderr, "ncl: mbind %s to NUMA node %d: %s\n", what, node, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* Fault every page of [p, p+len) in (writing the zero it already holds) and
+ * check that each one landed on `node` (node < 0: just report the first
+ * page's node). Returns the node of the first page, or -2 on a mismatch. */
+static int touch_and_check(char *p, size_t len, int node, const char *what)
+{
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE), n = len / pg;
+    for (size_t i = 0; i < n; i++)
+        *(volatile char *)(p + i * pg) = *(volatile char *)(p + i * pg);
+    enum { CH = 512 };
+    void *pages[CH];
+    int status[CH];
+    int first = -1;
+    for (size_t i = 0; i < n; i += CH) {
+        size_t m = n - i < CH ? n - i : CH;
+        for (size_t k = 0; k < m; k++)
+            pages[k] = p + (i + k) * pg;
+        if (syscall(SYS_move_pages, 0, (unsigned long)m, pages, NULL, status, 0) < 0) {
+            if (node >= 0) {
+                fprintf(stderr, "ncl: move_pages(%s): %s\n", what, strerror(errno));
+                return -2;
+            }
+            return -1; /* reporting only */
+        }
+        for (size_t k = 0; k < m; k++) {
+            if (i + k == 0)
+                first = status[k];
+            if (node >= 0 && status[k] != node) {
+                fprintf(stderr, "ncl: %s page %zu is on NUMA node %d, not %d; refusing to run\n",
+                        what, i + k, status[k], node);
+                return -2;
+            }
+        }
+    }
+    return first;
+}
+
+/* Bind (if node >= 0) and verify one shared region. */
+static int place_region(char *p, size_t len, int node, const char *what)
+{
+    if (node >= 0 && bind_region(p, len, node, what) < 0)
+        return -1;
+    int got = touch_and_check(p, len, node, what);
+    if (got == -2)
+        return -1;
+    if (node < 0 && ncl_mem.mem_node == -1)
+        ncl_mem.mem_node = -(got + 2); /* unbound: remember where it landed (<= -2) */
+    return 0;
+}
 
 /* Default VA for the shared region: high, unlikely to collide. */
 #define NCL_DEFAULT_BASE ((uintptr_t)0x600000000000ULL)
@@ -153,9 +253,20 @@ static int map_uc_meta(uintptr_t base, size_t len)
 
     struct ncl_uc_info info;
     if (ioctl(fd, NCL_UC_IOC_INFO, &info) < 0) {
-        perror("ncl: NCL_UC_IOC_INFO");
-        return -1;
+        /* Driver built before the nid field: same layout minus nid/pad. Its
+         * pool node is unknown (-1), so --mem-node refuses uc with it. */
+        struct { __u64 size; __s32 memtype, pat_enabled; } old;
+        if (errno != ENOTTY ||
+            ioctl(fd, _IOR('N', 1, old), &old) < 0) {
+            perror("ncl: NCL_UC_IOC_INFO");
+            return -1;
+        }
+        info.size = old.size;
+        info.memtype = old.memtype;
+        info.pat_enabled = old.pat_enabled;
+        info.nid = -1;
     }
+    ncl_mem.uc_pool_node = info.nid;
     if (info.size < len) {
         fprintf(stderr, "ncl: uc pool %llu B < metadata %zu B; reload with larger size_mb\n",
                 (unsigned long long)info.size, len);
@@ -220,6 +331,12 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
     ncl_mem.uc_fd = -1;
     ncl_mem.meta_memtype = "WB";
     ncl_mem.meta_store_sfence = cfg->backend == NCL_BACKEND_CACHED_FLUSH;
+    ncl_mem.wb_clwb = wb_mode == NCL_WB_CLWB;
+    ncl_mem.mem_node = -1;
+    ncl_mem.uc_pool_node = -1;
+    int node = cfg->mem_node - 1;
+    if (!cfg->mem_node && getenv("NCL_MEM_NODE"))
+        node = atoi(getenv("NCL_MEM_NODE"));
     if (cfg->meta_split && cfg->backend != NCL_BACKEND_UC && cfg->backend != NCL_BACKEND_EMU) {
         fprintf(stderr, "ncl: split metadata needs the uc or emu backend (%s metadata is "
                         "uniform by definition)\n", ncl_backend_name(cfg->backend));
@@ -255,7 +372,7 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
             goto fail;
     } else {
         ncl_mem.meta = map_fixed(base, meta_map, prot, MAP_SHARED, fd, 0, "metadata");
-        if (!ncl_mem.meta)
+        if (!ncl_mem.meta || place_region(ncl_mem.meta, meta_map, node, "metadata") < 0)
             goto fail;
     }
     uintptr_t scan_va = base + ncl_mem.meta_size;
@@ -270,13 +387,14 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
         ncl_mem.scan_dev = map_fixed(data_va + 2 * ncl_mem.data_size, ncl_mem.scan_size, prot,
                                      MAP_SHARED, fd, (off_t)ncl_mem.meta_size,
                                      "scan metadata (device view)");
-        if (!ncl_mem.scan_dev)
+        if (!ncl_mem.scan_dev ||
+            place_region(ncl_mem.scan_dev, ncl_mem.scan_size, node, "scan metadata") < 0)
             goto fail;
     } else {
         ncl_mem.scan = ncl_mem.scan_dev = map_fixed(scan_va, ncl_mem.scan_size, prot, MAP_SHARED,
                                                     fd, (off_t)ncl_mem.meta_size,
                                                     "scan metadata (cached)");
-        if (!ncl_mem.scan)
+        if (!ncl_mem.scan || place_region(ncl_mem.scan, ncl_mem.scan_size, node, "scan metadata") < 0)
             goto fail;
     }
     if (ncl_mem.split) {
@@ -294,14 +412,23 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
             goto fail;
         ncl_mem.data_dev = map_fixed(data_va + ncl_mem.data_size, ncl_mem.data_size, prot,
                                      MAP_SHARED, fd, (off_t)meta_all, "data (device view)");
-        if (!ncl_mem.data_dev)
+        if (!ncl_mem.data_dev || place_region(ncl_mem.data_dev, ncl_mem.data_size, node, "data") < 0)
             goto fail;
     } else {
         ncl_mem.data = map_fixed(data_va, ncl_mem.data_size, prot, MAP_SHARED, fd,
                                  (off_t)meta_all, "data");
-        if (!ncl_mem.data)
+        if (!ncl_mem.data || place_region(ncl_mem.data, ncl_mem.data_size, node, "data") < 0)
             goto fail;
         ncl_mem.data_dev = ncl_mem.data;
+    }
+
+    if (node >= 0)
+        ncl_mem.mem_node = node;
+    if (cfg->backend == NCL_BACKEND_UC && node >= 0 && ncl_mem.uc_pool_node != node) {
+        fprintf(stderr, "ncl: uc pool pages are on NUMA node %d, not %d: reload the driver "
+                        "with nid=%d (kmod/README.md); refusing to run\n",
+                ncl_mem.uc_pool_node, node, node);
+        goto fail;
     }
 
     ncl_mem.meta_load_ns = measure_meta_load_ns();
@@ -319,13 +446,25 @@ fail:
     return -1;
 }
 
+/* NUMA node of the shared regions: bound node, else where the first page
+ * landed (-1 = unknown). */
+int ncl_mem_node(void)
+{
+    return ncl_mem.mem_node >= 0 ? ncl_mem.mem_node : ncl_mem.mem_node <= -2 ? -(ncl_mem.mem_node + 2) : -1;
+}
+
 const char *ncl_mem_describe(void)
 {
-    static char buf[160];
-    snprintf(buf, sizeof buf, "backend=%s meta_memtype=%s meta_load=%.1fns scan=%s",
+    static char buf[256];
+    char pool[32] = "";
+    if (ncl_mem.backend == NCL_BACKEND_UC)
+        snprintf(pool, sizeof pool, " uc_pool_node=%d", ncl_mem.uc_pool_node);
+    snprintf(buf, sizeof buf, "backend=%s meta_memtype=%s meta_load=%.1fns scan=%s mem_node=%d%s%s wb=%s",
              ncl_backend_name(ncl_mem.backend), ncl_mem.meta_memtype, ncl_mem.meta_load_ns,
              !ncl_mem.split ? "uniform"
-             : ncl_mem.backend == NCL_BACKEND_EMU ? "split(emu-cached)" : "split(WB+clflushopt)");
+             : ncl_mem.backend == NCL_BACKEND_EMU ? "split(emu-cached)" : "split(WB+clflush)",
+             ncl_mem_node(), ncl_mem.mem_node >= 0 ? "(bound)" : "(default)", pool,
+             ncl_wb_mode_name());
     return buf;
 }
 
@@ -421,7 +560,7 @@ void ncl_data_writeback_nofence(const void *p, size_t len)
     case NCL_BACKEND_UC: /* data is cached in both */
         for (uintptr_t a = lo; a < hi; a += NCL_CACHELINE) {
             ncl_dev_delay();
-            ncl__flushopt((const void *)a);
+            ncl__wb((const void *)a);
         }
         break;
     case NCL_BACKEND_EMU: {

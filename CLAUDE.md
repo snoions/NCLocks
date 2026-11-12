@@ -46,6 +46,16 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   model-checked; `docs/hybrid.md`.
 - `-a aksrv`: (e) with AK's fast path; the home server runs AK's reset when its queue drains,
   while holding the top SLOW side. Not model-checked; `docs/hybrid.md`.
+- `-a pthread`: reference baseline, a process-shared `pthread_mutex_t` (futex, i.e. coherent
+  cross-node atomics) in the lock's metadata line. `-b coherent` and Phase 1 only (rejected
+  elsewhere: on uc it would be x86 bus locks, meaningless for CXL); `-m` gives every thread
+  direct access to the mutex.
+- NUMA/CXL hosts (`docs/cxl_host.md`): `--mem-node N` binds the shared regions to node N
+  with `mbind` and checks every page with `move_pages` (uc: the kmod's `nid=N` pool, checked
+  per page). `--cpus LIST` (`src/cpus.c`) sets the CPUs for pinned threads; the default is
+  the process affinity, so `numactl --cpunodebind` works. A warning is printed when pinned
+  threads share CPUs or span NUMA nodes. `--wb clwb` uses clwb for writebacks; invalidates
+  stay clflushopt. `NCL_MAX_NODES` is 64.
 - `src/server.c`: lock servers (c) and fast-path server (e), Phase 1 (fixed home =
   hash % N). Message and reply bit layouts are in `src/server.h`. Nodes must call
   `ncl_node_detach()` (an all-nodes barrier) before servers stop. (d) and (e) are **not

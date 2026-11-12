@@ -118,6 +118,9 @@ struct ncl_sys_cfg {
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
+    int mem_node;           /* NUMA node + 1 for the shared regions (meta, scan, data);
+                               0 = default placement (or env NCL_MEM_NODE). uc: the
+                               driver's pool must already be on that node (nid=) */
     uintptr_t base_addr;
     /* SERVER/FASTSRV */
     int server_pin;              /* 0: unpinned; NCL_SRV_PIN_NEXT: node n's server on CPU

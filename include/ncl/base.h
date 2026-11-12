@@ -22,6 +22,10 @@
  *                   home server runs AK's reset (statements 29-37) when its
  *                   queue drains, while still holding the top SLOW side;
  *                   grantees clear their own Obstacle (32). NOT model-checked.
+ *   PTHREAD         Reference baseline, NOT a non-coherent algorithm: a
+ *                   process-shared pthread_mutex_t (futex, i.e. coherent
+ *                   cross-node atomics) in the lock's first metadata line.
+ *                   Coherent backend and Phase 1 only (ncl_sys_create).
  *
  * Every variable is its own ncl_line_t. Each lock has two blocks of lines,
  * laid out by ncl_base_nlines()/ncl_base_nscan()/ncl_base_bind(): single
@@ -33,6 +37,8 @@
 
 #include "ncl/mem.h"
 
+#include <pthread.h>
+
 typedef enum {
     NCL_ALG_LAMPORT = 0,
     NCL_ALG_TOURNAMENT = 1,
@@ -41,6 +47,7 @@ typedef enum {
     NCL_ALG_FASTSRV = 4,
     NCL_ALG_AK = 5,
     NCL_ALG_AKSRV = 6,
+    NCL_ALG_PTHREAD = 7,
 } ncl_alg_t;
 
 /* (e)-style: fast path + lock-server slow path holding the top SLOW side. */
@@ -58,6 +65,7 @@ enum {
     NCL_PATH_FASTSRV_SLOW,     /* deflected: request/grant via the server */
     NCL_PATH_LOCAL_HANDOFF,    /* MODE_LOCAL/HANDOFF: submutex + global ownership passed in-node */
     NCL_PATH_GLOBAL_HANDOFF,   /* MODE_HANDOFF: owner field handed to this node by the releaser */
+    NCL_PATH_PTHREAD,          /* PTHREAD baseline */
     NCL_PATH__COUNT,
 };
 
@@ -78,6 +86,7 @@ struct ncl_base {
     ncl_line_t *ak;    /* AK: [X, Y, Reset, Infast, Name_Taken[P], Obstacle[P]] */
     int ak_k;          /* AK, node-local, holder only: fast path's y.indx */
     int ak_slow2;      /* AK, node-local, holder only: slow path is SLOW 2 */
+    pthread_mutex_t *mtx; /* PTHREAD: process-shared mutex in the lock's meta line */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -112,8 +121,12 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P); /* meta-region lines per lock */
 size_t ncl_base_nscan(ncl_alg_t alg, int P);  /* scan-region lines per lock */
 void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines,
                    ncl_line_t *scan);
+/* Creator only, after the region is mapped and before any node attaches:
+ * initial state that is not all-zero (PTHREAD: pthread_mutex_init with
+ * PTHREAD_PROCESS_SHARED). Returns 0 or -1. */
+int ncl_base_init_shared(ncl_alg_t alg, ncl_line_t *lines);
 
-/* LAMPORT/TOURNAMENT/HYBRID only. Acquire as participant i; returns the
+/* LAMPORT/TOURNAMENT/HYBRID/AK/PTHREAD only. Acquire as participant i; returns the
  * NCL_PATH_* taken. Release with the value ncl_base_lock returned. */
 int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st);
 void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats *st);

@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "ncl/lock.h"
+#include "ncl/cpus.h"
 
 struct lockdata {
     uint64_t counter;
@@ -104,11 +105,7 @@ static void *worker_main(void *arg)
     uint64_t tag = (uint64_t)w->node * (uint64_t)nthreads + (uint64_t)w->idx + 1;
 
     if (pin) {
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        cpu_set_t cs;
-        CPU_ZERO(&cs);
-        CPU_SET((int)((w->node * nthreads + w->idx) % ncpu), &cs);
-        pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+        ncl_pin_self(ncl_cpu_slot(w->node * nthreads + w->idx));
     }
 
     while (!ncl_uc_load(start_line()))
@@ -220,7 +217,7 @@ static void usage(const char *argv0)
             "  -i I          iterations per thread (default 100000)\n"
             "  -w W          data words per lock (default 16)\n"
             "  -d NS         max random delay in/out of CS, ns (default 200)\n"
-            "  -a ALG        lamport|tournament|hybrid|server|fastsrv|ak|aksrv (default lamport)\n"
+            "  -a ALG        lamport|tournament|hybrid|server|fastsrv|ak|aksrv|pthread (default lamport)\n"
             "  -b BACKEND    coherent|cached-flush|uc|emu (default emu)\n"
             "  -L NS         injected device latency, ns (default 0)\n"
             "  -m            ablation: no local submutex\n"
@@ -245,6 +242,11 @@ static void usage(const char *argv0)
             "  --debug-unsafe-reopen  DEBUG: (d)/(e) fast winner probes one present[] slot\n"
             "                and reopens on a miss (the old -F hint; reset race, must FAIL\n"
             "                with --reset-delay)\n"
+            "  --mem-node N  bind the shared regions (metadata, scan, data) to NUMA node N\n"
+            "                and verify every page (uc: driver must be loaded with nid=N)\n"
+            "  --cpus LIST   CPUs for pinned threads, e.g. 0-59,120-179 (default: this\n"
+            "                process's affinity, e.g. from numactl --cpunodebind)\n"
+            "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n"
             "  --timeout S   kill the nodes and FAIL after S seconds (default 0 = none)\n",
             argv0);
 }
@@ -257,6 +259,9 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     static struct option lopts[] = {
+        {"mem-node", required_argument, 0, 1001},
+        {"cpus", required_argument, 0, 1002},
+        {"wb", required_argument, 0, 1003},
         {"skip-wb", no_argument, 0, 1},
         {"skip-inv", no_argument, 0, 2},
         {"skip-meta-wb", no_argument, 0, 3},
@@ -343,6 +348,12 @@ int main(int argc, char **argv)
         case 5: timeout_s = atoi(optarg); break;
         case 6: reset_delay_ns = (unsigned)atoi(optarg); break;
         case 7: ncl_fast_release = NCL_FASTREL_HINT; break;
+        case 1001: cfg.mem_node = atoi(optarg) + 1; break;
+        case 1002: if (ncl_cpus_set(optarg) < 0) return 2; break;
+        case 1003:
+            if (!strcmp(optarg, "clwb")) { if (ncl_wb_mode_set(NCL_WB_CLWB) < 0) return 2; }
+            else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
+            break;
         case 1: cfg.debug_skip_data_wb = 1; break;
         case 2: cfg.debug_skip_data_inv = 1; break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;
@@ -369,6 +380,11 @@ int main(int argc, char **argv)
     if (ncl_sys_create(&cfg) < 0)
         return 2;
     printf("mem: %s\n", ncl_mem_describe());
+    if (pin) {
+        int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
+        ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
+        printf("cpus: %s\n", ncl_cpus_describe());
+    }
     delay_cycles = ncl_ns_to_cycles(max_delay_ns);
     ncl_debug_reset_delay = ncl_ns_to_cycles(reset_delay_ns);
 

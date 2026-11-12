@@ -3,7 +3,7 @@
  * ncl_uc: expose a pool of RAM to user space with an uncached (or WC/WB)
  * memory type, for the "uc" backend of the NCLocks memory-access layer.
  *
- *   insmod ncl_uc.ko [size_mb=64] [memtype=uc|wc|wb] [dev_mode=0600]
+ *   insmod ncl_uc.ko [size_mb=64] [memtype=uc|wc|wb] [nid=N] [dev_mode=0600]
  *   -> /dev/ncl_uc ; mmap(MAP_SHARED) offset 0..size
  *
  * Why set_pages_array_uc() and not just pgprot_noncached():
@@ -48,6 +48,11 @@ static char *memtype = "uc";
 module_param(memtype, charp, 0444);
 MODULE_PARM_DESC(memtype, "uc (default), wc, or wb (for comparison runs)");
 
+static int nid = NUMA_NO_NODE;
+module_param(nid, int, 0444);
+MODULE_PARM_DESC(nid, "NUMA node to allocate the pool on (default: any, usually the loading CPU's); "
+		 "every page is checked to be on it");
+
 static ushort dev_mode = 0600;
 module_param(dev_mode, ushort, 0444);
 MODULE_PARM_DESC(dev_mode, "Permissions of /dev/ncl_uc (default 0600)");
@@ -55,6 +60,7 @@ MODULE_PARM_DESC(dev_mode, "Permissions of /dev/ncl_uc (default 0600)");
 static struct page **pages;
 static unsigned long npages;
 static int pool_cm; /* NCL_UC_CM_* */
+static int pool_nid = NUMA_NO_NODE; /* node of every page, or NUMA_NO_NODE if mixed */
 static atomic_t busy = ATOMIC_INIT(0);
 
 static int decode_cache_mode(pte_t pte)
@@ -159,6 +165,7 @@ static long ncl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			.size = (u64)npages << PAGE_SHIFT,
 			.memtype = pool_cm,
 			.pat_enabled = pat_enabled(),
+			.nid = pool_nid,
 		};
 		return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
 	}
@@ -229,12 +236,35 @@ static int __init ncl_init(void)
 	pages = kvcalloc(npages, sizeof(*pages), GFP_KERNEL);
 	if (!pages)
 		return -ENOMEM;
+	if (nid != NUMA_NO_NODE && (nid < 0 || nid >= MAX_NUMNODES || !node_online(nid))) {
+		pr_err("ncl_uc: nid=%d is not an online NUMA node\n", nid);
+		ret = -EINVAL;
+		goto err_nowb;
+	}
 	for (i = 0; i < npages; i++) {
-		pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		/* __GFP_THISNODE: no fallback to another node. CXL memory onlined
+		 * into ZONE_NORMAL is reachable with GFP_KERNEL; memory onlined
+		 * as ZONE_MOVABLE is not, and the load fails here (-ENOMEM). */
+		if (nid != NUMA_NO_NODE)
+			pages[i] = alloc_pages_node(nid, GFP_KERNEL | __GFP_THISNODE | __GFP_ZERO, 0);
+		else
+			pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
 		if (!pages[i]) {
+			if (nid != NUMA_NO_NODE)
+				pr_err("ncl_uc: cannot allocate page %lu on node %d (ZONE_MOVABLE only, "
+				       "or full?)\n", i, nid);
 			ret = -ENOMEM;
 			goto err_nowb;
 		}
+		if (i == 0)
+			pool_nid = page_to_nid(pages[0]);
+		else if (page_to_nid(pages[i]) != pool_nid)
+			pool_nid = NUMA_NO_NODE;
+	}
+	if (nid != NUMA_NO_NODE && pool_nid != nid) {
+		pr_err("ncl_uc: pool pages not all on node %d\n", nid);
+		ret = -EIO;
+		goto err_nowb;
 	}
 
 	if (pool_cm == NCL_UC_CM_UC_MINUS)
@@ -252,8 +282,8 @@ static int __init ncl_init(void)
 	ret = misc_register(&ncl_misc);
 	if (ret)
 		goto err;
-	pr_info("ncl_uc: %lu MiB pool, memtype=%s, /dev/ncl_uc mode %o\n", size_mb, memtype,
-		dev_mode);
+	pr_info("ncl_uc: %lu MiB pool, memtype=%s, node=%d, /dev/ncl_uc mode %o\n", size_mb,
+		memtype, pool_nid, dev_mode);
 	return 0;
 
 err_nowb:

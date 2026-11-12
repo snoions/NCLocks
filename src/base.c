@@ -19,6 +19,7 @@ const char *const ncl_path_names[NCL_PATH__COUNT] = {
     [NCL_PATH_FASTSRV_SLOW] = "fastsrv_slow",
     [NCL_PATH_LOCAL_HANDOFF] = "local_handoff",
     [NCL_PATH_GLOBAL_HANDOFF] = "global_handoff",
+    [NCL_PATH_PTHREAD] = "pthread",
 };
 
 static int pow2ceil(int n)
@@ -45,6 +46,7 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
     case NCL_ALG_FASTSRV: return split_lines(P) + top_lines();
     case NCL_ALG_AK: return ak_lines(P) + tree_lines(P) + top_lines();
     case NCL_ALG_AKSRV: return ak_lines(P) + top_lines();
+    case NCL_ALG_PTHREAD: return 1;
     }
     return 0;
 }
@@ -58,7 +60,8 @@ size_t ncl_base_nscan(ncl_alg_t alg, int P)
     case NCL_ALG_TOURNAMENT:
     case NCL_ALG_SERVER:
     case NCL_ALG_AK:
-    case NCL_ALG_AKSRV: return 0;
+    case NCL_ALG_AKSRV:
+    case NCL_ALG_PTHREAD: return 0;
     }
     return 0;
 }
@@ -102,7 +105,28 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
         b->ak = lines;
         b->top = lines + ak_lines(P);
         break;
+    case NCL_ALG_PTHREAD:
+        b->mtx = (pthread_mutex_t *)(void *)lines;
+        break;
     }
+}
+
+_Static_assert(sizeof(pthread_mutex_t) <= sizeof(ncl_line_t), "pthread_mutex_t must fit one line");
+
+int ncl_base_init_shared(ncl_alg_t alg, ncl_line_t *lines)
+{
+    if (alg != NCL_ALG_PTHREAD)
+        return 0;
+    pthread_mutexattr_t a;
+    int rc = pthread_mutexattr_init(&a);
+    if (!rc)
+        rc = pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
+    if (!rc)
+        rc = pthread_mutex_init((pthread_mutex_t *)(void *)lines, &a);
+    pthread_mutexattr_destroy(&a);
+    if (rc)
+        fprintf(stderr, "ncl: pthread_mutex_init: %s\n", strerror(rc));
+    return rc ? -1 : 0;
 }
 
 static void await_eq(ncl_line_t *l, uint64_t v)
@@ -610,6 +634,10 @@ int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     case NCL_ALG_TOURNAMENT: tournament_lock(b, i); return NCL_PATH_TOURNAMENT;
     case NCL_ALG_HYBRID: return hybrid_lock(b, i, st);
     case NCL_ALG_AK: return ak_lock(b, i, st);
+    case NCL_ALG_PTHREAD:
+        if (pthread_mutex_lock(b->mtx))
+            abort();
+        return NCL_PATH_PTHREAD;
     case NCL_ALG_SERVER:
     case NCL_ALG_FASTSRV:
     case NCL_ALG_AKSRV: break; /* handled in src/server.c */
@@ -624,6 +652,10 @@ void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats 
     case NCL_ALG_TOURNAMENT: ncl_fence(); tournament_unlock_nofence(b, i); break;
     case NCL_ALG_HYBRID: hybrid_unlock(b, i, path, st); break;
     case NCL_ALG_AK: ak_unlock(b, i, path, st); break;
+    case NCL_ALG_PTHREAD:
+        if (pthread_mutex_unlock(b->mtx))
+            abort();
+        break;
     case NCL_ALG_SERVER:
     case NCL_ALG_FASTSRV:
     case NCL_ALG_AKSRV: break;
@@ -638,6 +670,7 @@ const char *ncl_alg_name(ncl_alg_t a)
     case NCL_ALG_HYBRID: return "hybrid";
     case NCL_ALG_AK: return "ak";
     case NCL_ALG_AKSRV: return "aksrv";
+    case NCL_ALG_PTHREAD: return "pthread";
     case NCL_ALG_SERVER: return "server";
     case NCL_ALG_FASTSRV: return "fastsrv";
     }
@@ -651,6 +684,7 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out)
     else if (!strcmp(s, "hybrid") || !strcmp(s, "d")) *out = NCL_ALG_HYBRID;
     else if (!strcmp(s, "ak")) *out = NCL_ALG_AK;
     else if (!strcmp(s, "aksrv")) *out = NCL_ALG_AKSRV;
+    else if (!strcmp(s, "pthread")) *out = NCL_ALG_PTHREAD;
     else if (!strcmp(s, "server") || !strcmp(s, "c")) *out = NCL_ALG_SERVER;
     else if (!strcmp(s, "fastsrv") || !strcmp(s, "e")) *out = NCL_ALG_FASTSRV;
     else return -1;

@@ -7,9 +7,10 @@
 
 #define NCL_CACHELINE 64
 
-/* Max nodes sharing the device (design §1: target N <= 16, kept a parameter). */
+/* Max nodes sharing the device (design §1: target N <= 16, kept a parameter;
+ * 64 for runs on large hosts). */
 #ifndef NCL_MAX_NODES
-#define NCL_MAX_NODES 16
+#define NCL_MAX_NODES 64
 #endif
 
 /* Max participants in a global algorithm. Normally == nnodes; in the

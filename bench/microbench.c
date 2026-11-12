@@ -50,6 +50,7 @@
 
 #include "hist.h"
 #include "ncl/lock.h"
+#include "ncl/cpus.h"
 
 enum { ARR_CLOSED, ARR_POISSON, ARR_UNIFORM, ARR_ONOFF };
 static const char *const arr_names[] = {"closed", "poisson", "uniform", "onoff"};
@@ -184,11 +185,7 @@ static void *worker_main(void *arg)
     uint64_t rng = splitmix64(seed);
 
     if (pin) {
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        cpu_set_t cs;
-        CPU_ZERO(&cs);
-        CPU_SET((int)((w->node * nthreads + w->idx) % ncpu), &cs);
-        pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+        ncl_pin_self(ncl_cpu_slot(w->node * nthreads + w->idx));
     }
 
     uint64_t start_ns;
@@ -338,7 +335,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [options]\n"
             "  -n N        nodes (default 2)            -t T   threads per node (default 1)\n"
-            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv|ak|aksrv\n"
+            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv|ak|aksrv|pthread\n"
             "  -b BACKEND  coherent|cached-flush|uc|emu (default cached-flush)\n"
             "  -L NS       injected device latency      -m     no submutex (ablation)\n"
             "  -s SECS     duration (default 2)         -W SECS warmup, not recorded (0.2)\n"
@@ -373,7 +370,12 @@ static void usage(const char *argv0)
             "  -Y PLACE    server thread placement: next (CPU N*T+n, default) | sibling\n"
             "              (SMT sibling of node n's first worker)\n"
             "  -F MODE     ak: fair (default; reopen only if no slow waiter at the top\n"
-            "              lock) | always (Anderson-Kim as published; unfair)\n",
+            "              lock) | always (Anderson-Kim as published; unfair)\n"
+            "  --mem-node N bind the shared regions (metadata, scan, data) to NUMA node N\n"
+            "                and verify every page (uc: driver must be loaded with nid=N)\n"
+            "  --cpus LIST   CPUs for pinned threads, e.g. 0-59,120-179 (default: this\n"
+            "                process's affinity, e.g. from numactl --cpunodebind)\n"
+            "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n",
             argv0);
 }
 
@@ -382,7 +384,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus"
 
 int main(int argc, char **argv)
 {
@@ -392,7 +394,15 @@ int main(int argc, char **argv)
         .mode = NCL_MODE_PHASE1,
     };
     int c, arrival_given = 0;
-    while ((c = getopt(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:X:R:Q:O:U:mCHPh")) != -1) {
+    static struct option lopts[] = {
+        {"mem-node", required_argument, 0, 1001},
+        {"cpus", required_argument, 0, 1002},
+        {"wb", required_argument, 0, 1003},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0},
+    };
+    while ((c = getopt_long(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:X:R:Q:O:U:mCHPh", lopts,
+                            NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -473,6 +483,12 @@ int main(int argc, char **argv)
         case 'C': csv = 1; break;
         case 'H': printf("%s\n", CSV_HEADER); return 0;
         case 'P': pin = 0; break;
+        case 1001: cfg.mem_node = atoi(optarg) + 1; break;
+        case 1002: if (ncl_cpus_set(optarg) < 0) return 2; break;
+        case 1003:
+            if (!strcmp(optarg, "clwb")) { if (ncl_wb_mode_set(NCL_WB_CLWB) < 0) return 2; }
+            else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
+            break;
         case 'S': cfg.server_backoff_cap = (unsigned)atoi(optarg); break;
         case 'Y':
             if (!strcmp(optarg, "next"))
@@ -513,6 +529,11 @@ int main(int argc, char **argv)
     cfg.server_pin = pin ? srv_place : NCL_SRV_PIN_NONE;
     if (ncl_sys_create(&cfg) < 0)
         return 2;
+    if (pin) {
+        int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
+        ncl_cpus_check(nnodes * nthreads + (srv && srv_place == NCL_SRV_PIN_NEXT ? nnodes : 0),
+                       nnodes, nthreads, srv && srv_place == NCL_SRV_PIN_SIBLING);
+    }
     for (int l = 0; l < nlocks; l++)
         if (footprint && ncl_lock_set_data(l, (ncl_off_t)l * stride, footprint) < 0)
             return 2;
@@ -612,9 +633,14 @@ int main(int argc, char **argv)
     else
         snprintf(arrdesc, sizeof arrdesc, "%s", arr_names[arrival]);
 
+    char cpus_csv[512]; /* the CPU list with ';' for ',' (CSV-safe) */
+    snprintf(cpus_csv, sizeof cpus_csv, "%s", ncl_cpus_describe());
+    for (char *q = cpus_csv; *q; q++)
+        if (*q == ',')
+            *q = ';';
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -638,7 +664,9 @@ int main(int argc, char **argv)
                PER(tot->ho.announce_loads),
                ncl_chain_window(), !ncl_meta_batching() ? "serial" : ncl_meta_batch == NCL_META_PROBE ? "probe" : "batch",
                cfg.mode != NCL_MODE_HANDOFF ? "-" : ncl_wb_overlap ? "on" : "off",
-               cfg.meta_split ? "split" : "uniform");
+               cfg.meta_split ? "split" : "uniform", ncl_mem_node(),
+               cfg.backend == NCL_BACKEND_UC ? ncl_mem.uc_pool_node : -1, ncl_wb_mode_name(),
+               pin ? cpus_csv : "none");
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -646,6 +674,7 @@ int main(int argc, char **argv)
                cfg.no_submutex ? "+no_submutex" : "", nnodes, nthreads, nlocks, cs_ns, footprint,
                cfg.dev_lat_ns, secs, warmup);
         printf("mem: %s\n", ncl_mem_describe());
+        printf("cpus: %s\n", pin ? ncl_cpus_describe() : "unpinned");
         if (arrival == ARR_CLOSED)
             printf("loop=closed think=%uns throughput=%.0f req/s\n", think_ns, achieved);
         else

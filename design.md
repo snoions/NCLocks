@@ -375,7 +375,7 @@ Look for: the (a)/(b) crossover vs N and burstiness; whether (d) tracks the bett
 ### 6.5 Baselines
 
 - Same locks on a **coherent NUMA** machine (separates algorithm cost from the cost of non-coherence)
-- An **atomic-based lock** (ticket/MCS in device memory), if cross-host atomics are available
+- An **atomic-based lock** (ticket/MCS in device memory), if cross-host atomics are available. *Implemented:* `-a pthread`, a process-shared futex mutex on `-b coherent` (Phase 1, with or without the submutex), as the "coherent atomics available" reference point; ticket/MCS not yet.
 - A **no-lock / single-thread** upper bound
 - **Data-movement cost references:** (i) microbenchmark runs with zero-footprint critical sections, to isolate lock overhead from data movement; (ii) the same microbenchmark with all threads on one node, as an approximate best case for keeping data in one place
 

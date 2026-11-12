@@ -29,6 +29,8 @@ struct ncl_uc_info {
     __u64 size;         /* pool size in bytes */
     __s32 memtype;      /* NCL_UC_CM_* the pool was converted to */
     __s32 pat_enabled;  /* 0 => PAT off: cache-mode requests are not honored */
+    __s32 nid;          /* NUMA node of every pool page; -1 = pages on several nodes */
+    __s32 pad;
 };
 
 struct ncl_uc_probe {

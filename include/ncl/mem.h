@@ -102,6 +102,9 @@ struct ncl_mem_cfg {
     int meta_split;        /* 1: scan region cached (uc, emu only); 0: uniform */
     uintptr_t base_addr;   /* fixed VA for the region; 0 = default */
     uint32_t dev_lat_ns;   /* injected latency per device access (0 = none) */
+    int mem_node;          /* NUMA node + 1 for the shared (device) regions; 0 = the
+                              NCL_MEM_NODE environment variable if set, else default
+                              placement. Node-private memory is never bound. */
 };
 
 /* Per-process view of the region. Filled by ncl_mem_init, inherited by fork. */
@@ -129,6 +132,9 @@ struct ncl_mem {
                               weakly ordered (cached-flush: clflushopt after each
                               store; uc: verified PTE type is WC or unknown) */
     double meta_load_ns;   /* measured mean latency of a metadata load */
+    int mem_node;          /* NUMA node of the shared regions (verified), -1 = not bound */
+    int uc_pool_node;      /* uc: node of every pool page (kmod), -1 = mixed/unknown */
+    int wb_clwb;           /* writebacks use clwb instead of clflushopt (ncl_wb_mode) */
 };
 
 extern struct ncl_mem ncl_mem;
@@ -140,6 +146,8 @@ void ncl_mem_fini(void);
 
 /* One-line description of the metadata mapping (backend, memtype, latency). */
 const char *ncl_mem_describe(void);
+/* NUMA node of the shared regions (bound, else observed; -1 = unknown). */
+int ncl_mem_node(void);
 
 /* Called in each node process after fork: drops any inherited node-view data
  * (EMU) by re-reading the device copy. */
@@ -195,9 +203,28 @@ static inline void ncl_fence_ss(void)
 #error "build with -mclflushopt (CMake adds it on x86-64)"
 #endif
 static inline void ncl__flushopt(const void *p) { _mm_clflushopt((void *)p); }
+/* Writeback-only flush: clwb (line may stay cached, clean) if selected, else
+ * clflushopt. Never used where the line must be INVALIDATED (loads of what
+ * another node wrote): those keep clflushopt. Same ordering rules as
+ * clflushopt (weakly ordered; sfence/mfence orders it). */
+static inline void ncl__wb(const void *p)
+{
+    if (ncl_mem.wb_clwb)
+        __asm__ __volatile__("clwb %0" : "+m"(*(volatile char *)p));
+    else
+        _mm_clflushopt((void *)p);
+}
 #else
 static inline void ncl__flushopt(const void *p) { (void)p; }
+static inline void ncl__wb(const void *p) { (void)p; }
 #endif
+
+/* Writeback instruction for data/metadata writebacks. Set before
+ * ncl_mem_init's callers fork (inherited). Returns -1 (with a message) if the
+ * CPU lacks clwb. */
+enum { NCL_WB_CLFLUSHOPT = 0, NCL_WB_CLWB = 1 };
+int ncl_wb_mode_set(int mode);
+const char *ncl_wb_mode_name(void);
 
 /* Is this metadata line cached (explicit invalidate/writeback)? Everything on
  * cached-flush; the scan region in a split layout; nothing otherwise. */
@@ -262,7 +289,7 @@ static inline void ncl_uc_store(ncl_line_t *l, uint64_t v)
         if (ncl_mem.backend == NCL_BACKEND_EMU)
             atomic_store_explicit(ncl__emu_dev(l), v, memory_order_relaxed);
         else
-            ncl__flushopt(l);
+            ncl__wb(l);
     }
 }
 
