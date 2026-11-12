@@ -28,11 +28,33 @@
  *                         writeback or invalidate therefore yields stale data,
  *                         which the stress test detects.
  *
+ * Metadata layout (cfg.meta_split, docs/backends.md "Per-region memory types"):
+ * metadata is split into two regions by access pattern.
+ *   meta  words that are polled, stored or handed off one at a time (owner,
+ *         grant slots, x/y, Peterson flag/turn, door/race, succ[]) + config.
+ *   scan  arrays read as scans (Lamport b[], present[], announce[], server
+ *         queue rings). Every scan-region line has a single writer.
+ * Uniform (meta_split = 0): both regions get the backend's metadata type.
+ * Split (uc and emu only): meta keeps the backend's uncached type; scan is
+ * CACHED and accessed with explicit invalidate / writeback, batched like
+ * cached-flush metadata:
+ *   uc   scan = ordinary WB memory + clflushopt. On this (coherent) host that
+ *        measures cost only, like cached-flush.
+ *   emu  scan = a PRIVATE per-node view (the node's "cache") plus a device
+ *        view; a load reads the private copy, so a missing invalidate reads
+ *        stale data and a missing writeback never reaches other nodes. This
+ *        is the correctness check for the split. It cannot expose missing
+ *        fences (copies are synchronous), as for the rest of emu.
+ * Which region a line is in is decided by its address, so the algorithms use
+ * the same ncl_uc_* calls for both.
+ *
  * Region layout (same virtual address in every node, design §1 option 1):
  *
  *   base                     meta   (shared, "uncached" hot metadata + config)
- *   base+meta_size           data   (node view; what applications dereference)
- *   base+meta_size+data_size data device view (EMU only)
+ *   +meta_size               scan   (scan metadata; node view if emu split)
+ *   +scan_size               data   (node view; what applications dereference)
+ *   +data_size               data device view (EMU only)
+ *   +data_size               scan device view (EMU split only)
  *
  * Shared structures still store offsets (ncl_off_t) rather than pointers so a
  * per-node-address backend (design §1 option 2) can be added later.
@@ -76,6 +98,8 @@ struct ncl_mem_cfg {
     ncl_backend_t backend;
     size_t meta_size;      /* bytes, rounded up to page size */
     size_t data_size;      /* bytes, rounded up to page size */
+    size_t scan_size;      /* bytes of scan metadata, rounded up to page size */
+    int meta_split;        /* 1: scan region cached (uc, emu only); 0: uniform */
     uintptr_t base_addr;   /* fixed VA for the region; 0 = default */
     uint32_t dev_lat_ns;   /* injected latency per device access (0 = none) */
 };
@@ -86,6 +110,14 @@ struct ncl_mem {
     char *meta;            /* hot metadata + static config */
     char *data;            /* node view of protected data */
     char *data_dev;        /* device view of data (== data unless EMU) */
+    char *scan;            /* scan metadata (node view if EMU split) */
+    char *scan_dev;        /* device view of scan (== scan unless EMU split) */
+    size_t scan_size;
+    int split;             /* scan region is cached (meta_split) */
+    uintptr_t cm_lo;       /* [cm_lo, cm_lo + cm_len): cached metadata lines in */
+    size_t cm_len;         /*   a split layout (0 otherwise) */
+    int debug_skip_meta_wb;  /* DEBUG: split scan stores not written back */
+    int debug_skip_meta_inv; /* DEBUG: split scan loads not invalidated first */
     size_t meta_size;
     size_t data_size;
     uint32_t dev_lat_ns;
@@ -167,15 +199,50 @@ static inline void ncl__flushopt(const void *p) { _mm_clflushopt((void *)p); }
 static inline void ncl__flushopt(const void *p) { (void)p; }
 #endif
 
+/* Is this metadata line cached (explicit invalidate/writeback)? Everything on
+ * cached-flush; the scan region in a split layout; nothing otherwise. */
+static inline int ncl_meta_cached(const ncl_line_t *l)
+{
+    return ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH ||
+           (uintptr_t)l - ncl_mem.cm_lo < ncl_mem.cm_len;
+}
+
+/* EMU split: the device copy of a scan-region line's word. */
+static inline _Atomic uint64_t *ncl__emu_dev(const ncl_line_t *l)
+{
+    return (_Atomic uint64_t *)((uintptr_t)&l->v - (uintptr_t)ncl_mem.scan + (uintptr_t)ncl_mem.scan_dev);
+}
+
+/* Issue an invalidate of a cached metadata line (no fence). EMU refreshes the
+ * private copy from the device. Each line holds one word (ncl_line_t); the
+ * pad is never written, so copying the word is copying the line. */
+static inline void ncl__meta_inv(ncl_line_t *l)
+{
+    if (NCL_UNLIKELY(ncl_mem.debug_skip_meta_inv) && ncl_mem.split)
+        return;
+    if (ncl_mem.backend == NCL_BACKEND_EMU)
+        atomic_store_explicit(&l->v, atomic_load_explicit(ncl__emu_dev(l), memory_order_relaxed),
+                              memory_order_relaxed);
+    else
+        ncl__flushopt(l);
+}
+
+/* Fence after invalidates, before the loads (EMU copies synchronously). */
+static inline void ncl__meta_inv_fence(void)
+{
+#if defined(__x86_64__)
+    if (ncl_mem.backend != NCL_BACKEND_EMU)
+        _mm_mfence();
+#endif
+}
+
 static inline uint64_t ncl_uc_load(ncl_line_t *l)
 {
     ncl_dev_delay();
-    if (ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH) {
+    if (ncl_meta_cached(l)) {
         /* Cached mapping: invalidate before reading what another node wrote. */
-        ncl__flushopt(l);
-#if defined(__x86_64__)
-        _mm_mfence();
-#endif
+        ncl__meta_inv(l);
+        ncl__meta_inv_fence();
     }
     return atomic_load_explicit(&l->v, memory_order_relaxed);
 }
@@ -184,17 +251,30 @@ static inline void ncl_uc_store(ncl_line_t *l, uint64_t v)
 {
     ncl_dev_delay();
     atomic_store_explicit(&l->v, v, memory_order_relaxed);
-    if (ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH)
-        ncl__flushopt(l); /* write back so other nodes can see it */
+    if (ncl_meta_cached(l)) {
+        /* Write back so other nodes can see it. EMU stores the VALUE to the
+         * device (not a re-read of the private copy): a same-node thread's
+         * concurrent invalidate may have refreshed the private copy in
+         * between, which real hardware (coherent within the node, clflushopt
+         * writes back dirty data) never loses. */
+        if (NCL_UNLIKELY(ncl_mem.debug_skip_meta_wb) && ncl_mem.split)
+            return;
+        if (ncl_mem.backend == NCL_BACKEND_EMU)
+            atomic_store_explicit(ncl__emu_dev(l), v, memory_order_relaxed);
+        else
+            ncl__flushopt(l);
+    }
 }
 
 /* ---- batched metadata reads -------------------------------------------- */
 
-/* Batch invalidates for multi-line reads (cached-flush only): clflushopt every
+/* Batch invalidates for multi-line reads of CACHED lines (cached-flush, or the
+ * scan region of a split layout): clflushopt every
  * line, ONE mfence, then all loads, which miss in parallel (about 2 round trips
  * instead of n). On uc (UC loads execute one at a time), emu and coherent the
  * loads stay serial, with early exit where the caller allows it, so behavior
  * there is unchanged. ncl_meta_batch = 0 forces serial everywhere (A/B).
+ * All lines of one call must be in the same region (callers pass one array). 
  *
  * Ordering: the batch starts after earlier fences, so it is ordered after
  * earlier stores the same way a single ncl_uc_load is. Loads WITHIN a batch
@@ -208,21 +288,25 @@ static inline void ncl_uc_store(ncl_line_t *l, uint64_t v)
 enum { NCL_META_SERIAL = 0, NCL_META_BATCH = 1, NCL_META_PROBE = 2 };
 extern int ncl_meta_batch;
 
+/* Batched reads happen anywhere (cached-flush, or a split layout). */
 static inline int ncl_meta_batching(void)
 {
-    return ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH && ncl_meta_batch;
+    return (ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH || ncl_mem.split) && ncl_meta_batch;
+}
+/* Reads of l's region are batched. */
+static inline int ncl_meta_batching_for(const ncl_line_t *l)
+{
+    return ncl_meta_batch && ncl_meta_cached(l);
 }
 
 /* out[k] = *ls[k] for k < n (all n loads, any backend). */
 static inline void ncl_uc_load_many(ncl_line_t *const *ls, int n, uint64_t *out)
 {
-    if (ncl_meta_batching()) {
+    if (n > 0 && ncl_meta_batching_for(ls[0])) {
         ncl_dev_delay();
         for (int k = 0; k < n; k++)
-            ncl__flushopt(ls[k]);
-#if defined(__x86_64__)
-        _mm_mfence();
-#endif
+            ncl__meta_inv(ls[k]);
+        ncl__meta_inv_fence();
         for (int k = 0; k < n; k++)
             out[k] = atomic_load_explicit(&ls[k]->v, memory_order_relaxed);
     } else {
@@ -237,7 +321,7 @@ static inline void ncl_uc_load_many(ncl_line_t *const *ls, int n, uint64_t *out)
 static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count, int skip,
                                     uint64_t *nloads)
 {
-    if (ncl_meta_batching()) {
+    if (ncl_meta_batching_for(arr)) {
         ncl_line_t *ls[NCL_MAX_PARTICIPANTS];
         int idx[NCL_MAX_PARTICIPANTS];
         uint64_t v[NCL_MAX_PARTICIPANTS];
@@ -305,5 +389,6 @@ static inline ncl_off_t ncl_data_off(const void *p)
     return (ncl_off_t)((const char *)p - ncl_mem.data);
 }
 static inline void *ncl_meta_ptr(ncl_off_t off) { return ncl_mem.meta + off; }
+static inline void *ncl_scan_ptr(ncl_off_t off) { return ncl_mem.scan + off; }
 
 #endif

@@ -2,7 +2,9 @@
  * Per-operation cost of metadata access patterns on the uc and cached-flush
  * backends (docs/backends.md): single load, store + fence, a K-line scan read
  * serially vs batched (K clflushopt, one mfence, K loads), and one Dekker step.
- * Single process, one core; usage: ncl_memlat uc|cached-flush [K]
+ * Single process, one core; usage: ncl_memlat uc|cached-flush [K] [split]
+ * "split" (uc only) adds the mixed-layout rows: a cached scan-region store
+ * (store + clflushopt) followed by uncached accesses.
  * The "merged" row (invalidate issued before the fence that orders the store)
  * is shown for its cost only: it is NOT safe on non-coherent memory.
  */
@@ -26,7 +28,9 @@ int main(int argc, char **argv) {
     }
     int K = argc > 2 ? atoi(argv[2]) : 7;
     if (K < 1 || K > 64) return 2;
-    struct ncl_mem_cfg c = {.backend = be, .meta_size = 1<<20, .data_size = 1<<20};
+    int split = argc > 3 && !strcmp(argv[3], "split");
+    struct ncl_mem_cfg c = {.backend = be, .meta_size = 1<<20, .scan_size = 1<<16,
+                            .meta_split = split, .data_size = 1<<20};
     if (ncl_mem_init(&c)) return 1;
     ns_per_cycle = tsc_ns();
     L = (ncl_line_t *)ncl_mem.meta + 64; /* skip header area */
@@ -55,6 +59,19 @@ int main(int argc, char **argv) {
         for (int k=0;k<K;k++) dat[k*64] = (char)it;
         for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
         sink += ncl_uc_load(&L[0]); _mm_mfence(); });
+    if (split) {
+        ncl_line_t *SL = (ncl_line_t *)ncl_mem.scan;
+        TIME("split: UC store; UC load (no fence)", { ncl_uc_store(&L[1], it); sink += ncl_uc_load(&L[0]); });
+        TIME("split: cached store+flush; UC load (no fence)", { ncl_uc_store(&SL[1], it); sink += ncl_uc_load(&L[0]); });
+        TIME("split: cached store+flush; UC store", { ncl_uc_store(&SL[1], it); ncl_uc_store(&L[1], it); });
+        TIME("split: UC store; mfence; UC load", { ncl_uc_store(&L[1], it); ncl_fence(); sink += ncl_uc_load(&L[0]); });
+        TIME("split: cached store+flush; mfence; UC load", { ncl_uc_store(&SL[1], it); ncl_fence(); sink += ncl_uc_load(&L[0]); });
+        TIME("split: K-line scan, batched (scan region)", {
+            ncl_line_t *ls[64]; uint64_t v[64];
+            for (int k=0;k<K;k++) ls[k] = &SL[2+k*2];
+            ncl_uc_load_many(ls, K, v); sink += v[0]; });
+        TIME("split: 1 load (scan region)", sink += ncl_uc_load(&SL[0]));
+    }
     TIME("store; mfence; load (Dekker step, backend)", { ncl_uc_store(&L[1], it); ncl_fence(); sink += ncl_uc_load(&L[0]); });
     ncl_mem_fini();
     return 0;

@@ -26,8 +26,8 @@ static int pow2ceil(int n)
     return p;
 }
 
-static size_t lam_lines(int P) { return 2 + (size_t)P; }
-static size_t split_lines(int P) { return 2 + (size_t)P; }
+static size_t lam_lines(int P) { (void)P; return 2; }   /* x, y; b[] is in scan */
+static size_t split_lines(int P) { (void)P; return 2; } /* race, door; present[] in scan */
 static size_t tree_lines(int P) { return 3 * (size_t)(pow2ceil(P) - 1); }
 static size_t top_lines(void) { return 3; }
 
@@ -43,7 +43,19 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
     return 0;
 }
 
-void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines)
+size_t ncl_base_nscan(ncl_alg_t alg, int P)
+{
+    switch (alg) {
+    case NCL_ALG_LAMPORT:            /* b[] */
+    case NCL_ALG_HYBRID:             /* present[] */
+    case NCL_ALG_FASTSRV: return (size_t)P;
+    case NCL_ALG_TOURNAMENT:
+    case NCL_ALG_SERVER: return 0;
+    }
+    return 0;
+}
+
+void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, ncl_line_t *scan)
 {
     memset(b, 0, sizeof *b);
     b->alg = alg;
@@ -53,12 +65,14 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines)
     switch (alg) {
     case NCL_ALG_LAMPORT:
         b->lam = lines;
+        b->lam_b = scan;
         break;
     case NCL_ALG_TOURNAMENT:
         b->tree = lines;
         break;
     case NCL_ALG_HYBRID:
         b->split = lines;
+        b->present = scan;
         b->tree = lines + split_lines(P);
         b->top = b->tree + tree_lines(P);
         break;
@@ -66,6 +80,7 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines)
         break;
     case NCL_ALG_FASTSRV:
         b->split = lines;
+        b->present = scan;
         b->top = lines + split_lines(P);
         break;
     }
@@ -83,7 +98,7 @@ static void await_eq(ncl_line_t *l, uint64_t v)
 
 #define LAM_X(b) (&(b)->lam[0])
 #define LAM_Y(b) (&(b)->lam[1])
-#define LAM_B(b, i) (&(b)->lam[2 + (i)])
+#define LAM_B(b, i) (&(b)->lam_b[(i)])
 
 static int lamport_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
@@ -145,7 +160,7 @@ static void peterson_announce(ncl_line_t *flag_me, ncl_line_t *turn, uint64_t si
 
 static int peterson_may_enter(ncl_line_t *flag_other, ncl_line_t *turn, uint64_t side)
 {
-    if (ncl_meta_batching()) { /* both reads in one batch; either order is safe */
+    if (ncl_meta_batching_for(flag_other)) { /* both reads in one batch; either order is safe */
         ncl_line_t *ls[2] = {flag_other, turn};
         uint64_t v[2];
         ncl_uc_load_many(ls, 2, v);
@@ -194,7 +209,7 @@ static void tournament_unlock_nofence(struct ncl_base *b, int i)
 
 #define SP_RACE(b) (&(b)->split[0])
 #define SP_DOOR(b) (&(b)->split[1])
-#define SP_PRESENT(b, i) (&(b)->split[2 + (i)])
+#define SP_PRESENT(b, i) (&(b)->present[(i)])
 #define TOP_FLAG(b, s) (&(b)->top[(s)])
 #define TOP_TURN(b) (&(b)->top[2])
 enum { DOOR_OPEN = 0, DOOR_CLOSED = 1 };

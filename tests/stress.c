@@ -22,7 +22,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ncl/lock.h"
@@ -35,6 +37,7 @@ struct lockdata {
 
 static int nnodes = 4, nthreads = 2, nlocks = 4, nwords = 16, pin = 0, precise = 0;
 static long iters = 100000;
+static int timeout_s = 0;
 static unsigned max_delay_ns = 200;
 static size_t stride;
 static uint64_t delay_cycles;
@@ -227,12 +230,17 @@ static void usage(const char *argv0)
             "                (server: adaptive = follow the grant's hint bit, scan = always read succ[])\n"
             "  -R LINES      server handoff: chain window, power of two (default 4N rounded up)\n"
             "  -O on|off     handoff: overlap release data writeback with its loads (default on)\n"
-            "  -Q MODE       multi-line metadata reads (cached-flush only): probe (default) | batch | serial\n"
+            "  -U LAYOUT     metadata layout: uniform (default) | split (scanned arrays in a\n"
+            "                cached region; uc, emu)\n"
+            "  -Q MODE       multi-line reads of cached metadata (cached-flush, split): probe (default) | batch | serial\n"
             "  -F MODE       (d)/(e) fast-release check: hint (default) | scan\n"
             "  -H            precise dirty-range hints on release\n"
             "  -p            pin threads to CPUs\n"
             "  --skip-wb     DEBUG: skip data writeback (emu must fail)\n"
-            "  --skip-inv    DEBUG: skip data invalidate (emu must fail)\n",
+            "  --skip-inv    DEBUG: skip data invalidate (emu must fail)\n"
+            "  --skip-meta-wb / --skip-meta-inv\n"
+            "                DEBUG: split layout: skip scan-region writeback / invalidate\n"
+            "  --timeout S   kill the nodes and FAIL after S seconds (default 0 = none)\n",
             argv0);
 }
 
@@ -246,11 +254,14 @@ int main(int argc, char **argv)
     static struct option lopts[] = {
         {"skip-wb", no_argument, 0, 1},
         {"skip-inv", no_argument, 0, 2},
+        {"skip-meta-wb", no_argument, 0, 3},
+        {"skip-meta-inv", no_argument, 0, 4},
+        {"timeout", required_argument, 0, 5},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:X:R:Q:O:mHph", lopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:X:R:Q:O:U:mHph", lopts, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -312,6 +323,17 @@ int main(int argc, char **argv)
             break;
         case 'H': precise = 1; break;
         case 'p': pin = 1; cfg.server_pin = 1; break;
+        case 'U':
+            if (!strcmp(optarg, "split"))
+                cfg.meta_split = 1;
+            else if (strcmp(optarg, "uniform")) {
+                usage(argv[0]);
+                return 2;
+            }
+            break;
+        case 3: cfg.debug_skip_meta_wb = 1; break;
+        case 4: cfg.debug_skip_meta_inv = 1; break;
+        case 5: timeout_s = atoi(optarg); break;
         case 1: cfg.debug_skip_data_wb = 1; break;
         case 2: cfg.debug_skip_data_inv = 1; break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;
@@ -349,11 +371,13 @@ int main(int argc, char **argv)
     }
 
     printf("stress: alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d participants=%d "
-           "locks=%d iters/thread=%ld words=%d delay<=%uns lat=%uns%s%s%s\n",
+           "locks=%d iters/thread=%ld words=%d delay<=%uns lat=%uns%s%s%s%s%s\n",
            ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), ncl_mode_name(cfg.mode),
            cfg.no_submutex ? "+no_submutex" : "", nnodes, nthreads, ncl_participants(),
            nlocks, iters, nwords, max_delay_ns, cfg.dev_lat_ns, precise ? " precise-hints" : "",
-           cfg.debug_skip_data_wb ? " SKIP-WB" : "", cfg.debug_skip_data_inv ? " SKIP-INV" : "");
+           cfg.debug_skip_data_wb ? " SKIP-WB" : "", cfg.debug_skip_data_inv ? " SKIP-INV" : "",
+           cfg.debug_skip_meta_wb ? " SKIP-META-WB" : "",
+           cfg.debug_skip_meta_inv ? " SKIP-META-INV" : "");
     fflush(stdout);
 
     pid_t *pids = calloc((size_t)nnodes, sizeof *pids);
@@ -370,14 +394,42 @@ int main(int argc, char **argv)
     ncl_uc_store(start_line(), 1);
     ncl_fence();
 
-    int bad_exit = 0;
+    int bad_exit = 0, timed_out = 0;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int n = 0; n < nnodes; n++) {
         int status;
-        waitpid(pids[n], &status, 0);
+        if (timeout_s > 0 && !timed_out) {
+            /* Watchdog: a lost message or invisible store hangs rather than
+             * corrupting data; count that as a failure. */
+            pid_t r;
+            while ((r = waitpid(pids[n], &status, WNOHANG)) == 0) {
+                struct timespec t1;
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                if (t1.tv_sec - t0.tv_sec >= timeout_s) {
+                    fprintf(stderr, "stress: timeout after %d s: killing nodes -> FAIL\n",
+                            timeout_s);
+                    for (int k = 0; k < nnodes; k++)
+                        kill(pids[k], SIGKILL);
+                    timed_out = 1;
+                    break;
+                }
+                usleep(10000);
+            }
+            if (r == 0)
+                waitpid(pids[n], &status, 0);
+        } else {
+            waitpid(pids[n], &status, 0);
+        }
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            fprintf(stderr, "node %d exited abnormally (status %#x)\n", n, status);
+            if (!timed_out)
+                fprintf(stderr, "node %d exited abnormally (status %#x)\n", n, status);
             bad_exit = 1;
         }
+    }
+    if (timed_out) {
+        printf("total: TIMEOUT -> FAIL\n");
+        return 1;
     }
 
     uint64_t acq = 0, viol = 0, ck = 0, sum = 0, final_ck_bad = 0;

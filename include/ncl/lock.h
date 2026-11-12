@@ -111,6 +111,10 @@ struct ncl_sys_cfg {
     int pick_policy;        /* HANDOFF: pick_waiter policy, NCL_PICK_*; 0 = adaptive */
     int chain_lines;        /* SERVER HANDOFF: succ[] ring = assignment window, power of
                                two in [2, NCL_SRV_CHAIN_MAX]; 0 = 4N rounded up */
+    int meta_split;         /* 1: scanned arrays (b[], present[], announce[], server
+                               queues) in a CACHED metadata region, batched reads;
+                               single words stay uncached. uc and emu only. 0: all
+                               metadata the backend's type (ncl/mem.h) */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
@@ -123,6 +127,8 @@ struct ncl_sys_cfg {
     /* Debug knobs to show the emulator catches protocol bugs. */
     int debug_skip_data_wb;
     int debug_skip_data_inv;
+    int debug_skip_meta_wb;  /* split layout: scan-region stores not written back */
+    int debug_skip_meta_inv; /* split layout: scan-region loads not invalidated */
 };
 
 struct ncl_range {

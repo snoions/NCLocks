@@ -86,7 +86,8 @@ static uint32_t pow2ceil32(uint32_t n)
     return p;
 }
 
-size_t ncl_srv_layout(const struct ncl_sys_cfg *c, struct ncl_srv_layout *L, ncl_off_t base_off)
+size_t ncl_srv_layout(const struct ncl_sys_cfg *c, struct ncl_srv_layout *L, ncl_off_t base_off,
+                      ncl_off_t scan_off, size_t *scan_bytes)
 {
     memset(L, 0, sizeof *L);
     if (c->nlocks > (1 << NCL_SRV_LOCK_BITS) || c->threads_per_node < 1 ||
@@ -99,7 +100,7 @@ size_t ncl_srv_layout(const struct ncl_sys_cfg *c, struct ncl_srv_layout *L, ncl
     for (int l = 0; l < c->nlocks; l++)
         homed[ncl_srv_home(l, c->nnodes)]++;
 
-    ncl_off_t off = base_off;
+    ncl_off_t off = scan_off; /* queue rings: read by a batched poll, scan region */
     for (int h = 0; h < c->nnodes; h++) {
         L->cap[h] = pow2ceil32(2 * homed[h]);
         if (L->cap[h] > NCL_SRV_MAX_CAP) {
@@ -110,6 +111,8 @@ size_t ncl_srv_layout(const struct ncl_sys_cfg *c, struct ncl_srv_layout *L, ncl
         L->q_off[h] = off;
         off += (ncl_off_t)c->nnodes * L->cap[h] * NCL_CACHELINE;
     }
+    *scan_bytes = (size_t)(off - scan_off);
+    off = base_off; /* grant slots: polled one word at a time, meta region */
     L->grants_per_node = (uint32_t)c->threads_per_node;
     L->grant_off = off;
     off += (ncl_off_t)c->nnodes * L->grants_per_node * NCL_CACHELINE;
@@ -174,7 +177,7 @@ static struct {
 
 static ncl_line_t *q_slot(int src, int h, uint64_t pos)
 {
-    ncl_line_t *base = (ncl_line_t *)ncl_meta_ptr(S.L.q_off[h]);
+    ncl_line_t *base = (ncl_line_t *)ncl_scan_ptr(S.L.q_off[h]);
     return base + (size_t)src * S.L.cap[h] + (pos & (S.L.cap[h] - 1));
 }
 
@@ -453,11 +456,12 @@ static void *server_main(void *arg)
         S.st.rounds++;
         /* At most one message per source per round: round-robin fairness. */
         /* One poll round over the expected slot of every source queue.
-         * Batched (cached-flush): all N slots in one batch, then process.
+         * Batched (cached queue lines: cached-flush, or the split layout's
+         * scan region): all N slots in one batch, then process.
          * Serial (uc etc.): load and process one at a time, so a message is
          * acted on without waiting for the remaining N-1 uncached loads
          * (loading all first cost ~30% capacity on uc at N=8). */
-        int batch = ncl_meta_batching();
+        int batch = ncl_meta_batching_for(q_slot(0, S.node, 0));
         ncl_line_t *slots[NCL_MAX_NODES];
         uint64_t words[NCL_MAX_NODES];
         if (batch) {
@@ -491,7 +495,8 @@ static void *server_main(void *arg)
 }
 
 int ncl_srv_node_start(const struct ncl_sys_cfg *c, const struct ncl_srv_layout *L, int node,
-                       ncl_line_t *blocks, size_t lines_per_lock)
+                       ncl_line_t *blocks, size_t lines_per_lock, ncl_line_t *sblocks,
+                       size_t scan_per_lock)
 {
     memset(&S, 0, sizeof S);
     S.cfg = *c;
@@ -521,7 +526,8 @@ int ncl_srv_node_start(const struct ncl_sys_cfg *c, const struct ncl_srv_layout 
         struct srv_lock *sl = &S.slocks[S.local_idx[l]];
         sl->lock = (uint32_t)l;
         if (S.fast)
-            ncl_base_bind(&sl->b, c->alg, S.N, blocks + (size_t)l * lines_per_lock);
+            ncl_base_bind(&sl->b, c->alg, S.N, blocks + (size_t)l * lines_per_lock,
+                          sblocks + (size_t)l * scan_per_lock);
         if (S.chain)
             sl->succ = blocks + (size_t)l * lines_per_lock; /* SERVER has no base lines */
     }

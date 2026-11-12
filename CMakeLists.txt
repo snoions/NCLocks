@@ -155,3 +155,40 @@ set_tests_properties(emu_detects_missing_writeback PROPERTIES WILL_FAIL TRUE)
 add_test(NAME emu_detects_missing_invalidate
   COMMAND ncl_stress -a lamport -b emu -n 4 -t 1 -l 1 -i 5000 --skip-inv)
 set_tests_properties(emu_detects_missing_invalidate PROPERTIES WILL_FAIL TRUE)
+# Split metadata layout (-U split, docs/backends.md "Per-region memory types"):
+# scanned arrays in a cached region, single words uncached. On emu the scan
+# region has per-node private views, so these runs check the cached-metadata
+# accesses (batched/probe scans included); on uc they run the real mix.
+foreach(be emu uc)
+  foreach(alg lamport tournament hybrid server fastsrv)
+    add_test(NAME stress_${alg}_${be}_split
+      COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 3 -i 20000 -F scan --timeout 100)
+    list(APPEND split_tests_${be} stress_${alg}_${be}_split)
+  endforeach()
+  foreach(alg lamport tournament hybrid server)
+    add_test(NAME stress_${alg}_${be}_split_handoff_cap1
+      COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff -K 1 -X scan --timeout 100)
+    list(APPEND split_tests_${be} stress_${alg}_${be}_split_handoff_cap1)
+  endforeach()
+  add_test(NAME stress_hybrid_${be}_split_n8_batch
+    COMMAND ncl_stress -a hybrid -b ${be} -U split -n 8 -t 2 -l 2 -i 10000 -F scan -Q batch --timeout 100)
+  add_test(NAME stress_lamport_${be}_split_local
+    COMMAND ncl_stress -a lamport -b ${be} -U split -n 4 -t 3 -l 2 -i 10000 -M local -H --timeout 100)
+  list(APPEND split_tests_${be} stress_hybrid_${be}_split_n8_batch stress_lamport_${be}_split_local)
+endforeach()
+set_tests_properties(${split_tests_uc} PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+add_test(NAME split_rejects_cached_flush
+  COMMAND ncl_stress -a lamport -b cached-flush -U split -i 100)
+set_tests_properties(split_rejects_cached_flush PROPERTIES WILL_FAIL TRUE)
+# The emulator must catch missing cache maintenance on the scan region:
+# present[] is safety-critical for the hybrid splitter reset (mutex
+# violations); a lost queue message hangs the lock server (watchdog FAIL).
+# (2b tolerates lost announces by design: waiters recover through the gate.)
+foreach(k wb inv)
+  add_test(NAME emu_split_detects_missing_meta_${k}_hybrid
+    COMMAND ncl_stress -a hybrid -b emu -U split -n 4 -t 2 -l 2 -i 5000 --skip-meta-${k} --timeout 20)
+  add_test(NAME emu_split_detects_missing_meta_${k}_server
+    COMMAND ncl_stress -a server -b emu -U split -n 4 -t 2 -l 2 -i 5000 --skip-meta-${k} --timeout 5)
+  set_tests_properties(emu_split_detects_missing_meta_${k}_hybrid
+    emu_split_detects_missing_meta_${k}_server PROPERTIES WILL_FAIL TRUE)
+endforeach()

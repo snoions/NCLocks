@@ -25,6 +25,14 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
     unordered. 2b and the (c) chain issue the release's data writeback without a fence
     and rely on their fence before the handoff store (`-O on|off`). Notes and uc vs
     cached-flush measurements: `docs/backends.md`.
+  - Metadata layout (`-U uniform|split`, `cfg.meta_split`): metadata lives in two regions,
+    `meta` (single words: owner, grant slots, x/y, flag/turn, door/race, `succ[]`) and `scan`
+    (the scanned, single-writer arrays: Lamport `b[]`, `present[]`, `announce[]`, server
+    queue rings). Uniform gives both the backend's type. Split (uc, emu only) makes `scan`
+    cached with explicit invalidate/writeback and batched reads. The `ncl_uc_*` calls pick
+    the access pattern from the line's address. On emu the split scan region has per-node
+    private views, and `--skip-meta-wb` / `--skip-meta-inv` must make stress FAIL (hybrid:
+    mutex violations; server: hang caught by `--timeout`).
   - `coherent`: baseline.
 - `include/ncl/submutex.h`: MCS submutex with local-waiter detection.
 - `include/ncl/base.h`, `src/base.c`: Lamport (a), tournament (b), hybrid (d) per design §4d

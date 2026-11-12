@@ -4,7 +4,7 @@
  *
  * Phase 1: fixed home = hash(lock) % N, no migration, no local passing.
  *
- * Queues: for every (source node s, server node h) a ring of cap[h] uncached
+ * Queues: for every (source node s, server node h) a ring of cap[h] scan-region
  * lines, written only by node s, read only by h's server thread. Producers on
  * s reserve a position with a coherent fetch-and-add on a node-local tail and
  * publish with ONE 8-byte store:
@@ -51,18 +51,23 @@
 struct ncl_srv_layout {
     uint32_t grants_per_node;          /* = threads_per_node */
     uint32_t cap[NCL_MAX_NODES];       /* ring capacity of each queue into h */
-    ncl_off_t q_off[NCL_MAX_NODES];    /* meta offset of h's N incoming rings */
+    ncl_off_t q_off[NCL_MAX_NODES];    /* SCAN-region offset of h's N incoming rings */
     ncl_off_t grant_off;               /* meta offset of grant[N][G] */
 };
 
-/* Fill `L` with offsets starting at base_off; returns bytes needed, 0 on error. */
-size_t ncl_srv_layout(const struct ncl_sys_cfg *c, struct ncl_srv_layout *L, ncl_off_t base_off);
+/* Fill `L`: grant slots from meta offset base_off, queue rings (read by the
+ * batched poll) from scan offset scan_off. Returns meta bytes needed (0 on
+ * error) and the scan bytes in *scan_bytes. */
+size_t ncl_srv_layout(const struct ncl_sys_cfg *c, struct ncl_srv_layout *L, ncl_off_t base_off,
+                      ncl_off_t scan_off, size_t *scan_bytes);
 int ncl_srv_home(int lock, int nnodes);
 
-/* blocks/lines_per_lock locate each lock's lines: FASTSRV top lock and
- * splitter; SERVER in MODE_HANDOFF: the succ[] ring. */
+/* blocks/lines_per_lock locate each lock's meta lines: FASTSRV top lock and
+ * splitter; SERVER in MODE_HANDOFF: the succ[] ring. sblocks/scan_per_lock:
+ * its scan lines (FASTSRV present[]). */
 int ncl_srv_node_start(const struct ncl_sys_cfg *c, const struct ncl_srv_layout *L, int node,
-                       ncl_line_t *blocks, size_t lines_per_lock);
+                       ncl_line_t *blocks, size_t lines_per_lock, ncl_line_t *sblocks,
+                       size_t scan_per_lock);
 void ncl_srv_node_stop(void);
 
 /* (c). Returns the grant word (chain mode needs it at release). */

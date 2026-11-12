@@ -14,8 +14,10 @@ struct ncl_hdr {
     uint64_t magic;
     struct ncl_sys_cfg cfg;
     int32_t participants;
-    uint64_t lines_per_lock;
+    uint64_t lines_per_lock;  /* meta-region lines per lock */
+    uint64_t scan_per_lock;   /* scan-region lines per lock (b[], present[], announce[]) */
     ncl_off_t locks_off;  /* meta offset of first lock block */
+    ncl_off_t slocks_off; /* scan offset of first lock's scan block */
     ncl_off_t user_off;   /* meta offset of user lines */
     ncl_off_t descs_off;  /* meta offset of struct ncl_lock_desc[nlocks] */
     ncl_off_t done_off;   /* meta offset of per-node "done" lines (detach barrier) */
@@ -42,7 +44,7 @@ struct ncl_local_lock {
     void *data;
     size_t data_len;
     ncl_line_t *owner;    /* HANDOFF: uncached owner word (0 = FREE, node+1) */
-    ncl_line_t *announce; /* HANDOFF: announce[P], one line per node */
+    ncl_line_t *announce; /* HANDOFF: announce[P], one line per node (scan region) */
     int pw_next;          /* HANDOFF, pick_policy: next announce[] slot to probe */
     int acq_contended;    /* HANDOFF: this global acquisition waited or got a handoff */
     uint64_t srv_grant;   /* SERVER in HANDOFF: grant word (seq + hint) for the release */
@@ -61,14 +63,23 @@ static int is_server(void) { return cfg.alg == NCL_ALG_SERVER || cfg.alg == NCL_
 /* Modes with local cohort passing (Phase 2a and 2b). */
 static int cohort(void) { return cfg.mode == NCL_MODE_LOCAL || cfg.mode == NCL_MODE_HANDOFF; }
 
-/* MODE_HANDOFF lines appended to each lock's base-algorithm block. */
+/* MODE_HANDOFF lines appended to each lock's base-algorithm blocks: meta
+ * (owner, or the chain's succ[] ring, read one entry at a time) and scan
+ * (announce[]). */
 static size_t handoff_lines(const struct ncl_sys_cfg *c, int P)
 {
+    (void)P;
     if (c->mode != NCL_MODE_HANDOFF)
         return 0;
     if (c->alg == NCL_ALG_SERVER)
         return ncl_srv_chain_lines(c); /* succ[] ring */
-    return 1 + (size_t)P;
+    return 1; /* owner */
+}
+static size_t handoff_scan_lines(const struct ncl_sys_cfg *c, int P)
+{
+    if (c->mode != NCL_MODE_HANDOFF || c->alg == NCL_ALG_SERVER)
+        return 0;
+    return (size_t)P; /* announce[] */
 }
 #define OWNER_FREE 0ull
 
@@ -114,6 +125,10 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
                         "(always read succ[])\n");
         return -1;
     }
+    if ((c->debug_skip_meta_wb || c->debug_skip_meta_inv) && !c->meta_split) {
+        fprintf(stderr, "ncl: --skip-meta-wb/--skip-meta-inv apply to the split layout only\n");
+        return -1;
+    }
     if (c->nnodes < 1 || c->nnodes > NCL_MAX_NODES || c->nlocks < 1) {
         fprintf(stderr, "ncl: bad nnodes=%d / nlocks=%d\n", c->nnodes, c->nlocks);
         return -1;
@@ -131,6 +146,7 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     }
 
     size_t lines_per_lock = ncl_base_nlines(c->alg, P) + handoff_lines(c, P);
+    size_t scan_per_lock = ncl_base_nscan(c->alg, P) + handoff_scan_lines(c, P);
     size_t hdr_sz = round_line(sizeof(struct ncl_hdr));
     size_t descs_sz = round_line(sizeof(struct ncl_lock_desc) * (size_t)c->nlocks);
     size_t locks_sz = lines_per_lock * NCL_CACHELINE * (size_t)c->nlocks;
@@ -140,12 +156,16 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     struct ncl_srv_layout srv;
     memset(&srv, 0, sizeof srv);
     size_t srv_sz = 0;
-    if (server && !(srv_sz = ncl_srv_layout(c, &srv, srv_off)))
+    size_t slocks_sz = scan_per_lock * NCL_CACHELINE * (size_t)c->nlocks;
+    size_t srv_scan_sz = 0;
+    if (server && !(srv_sz = ncl_srv_layout(c, &srv, srv_off, slocks_sz, &srv_scan_sz)))
         return -1;
 
     struct ncl_mem_cfg mc = {
         .backend = c->backend,
         .meta_size = srv_off + srv_sz,
+        .scan_size = slocks_sz + srv_scan_sz,
+        .meta_split = c->meta_split,
         .data_size = c->data_size,
         .base_addr = c->base_addr,
         .dev_lat_ns = c->dev_lat_ns,
@@ -158,6 +178,8 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     hdr->cfg = *c;
     hdr->participants = P;
     hdr->lines_per_lock = lines_per_lock;
+    hdr->scan_per_lock = scan_per_lock;
+    hdr->slocks_off = 0;
     hdr->descs_off = hdr_sz;
     hdr->locks_off = hdr_sz + descs_sz;
     hdr->user_off = hdr_sz + descs_sz + locks_sz;
@@ -211,6 +233,8 @@ int ncl_node_attach(int node_id)
     if (node_id < 0 || node_id >= cfg.nnodes)
         return -1;
     my_node = node_id;
+    ncl_mem.debug_skip_meta_wb = cfg.debug_skip_meta_wb;
+    ncl_mem.debug_skip_meta_inv = cfg.debug_skip_meta_inv;
     ncl_mem_node_attach();
 
     local = aligned_alloc(NCL_CACHELINE, sizeof(*local) * (size_t)cfg.nlocks);
@@ -220,21 +244,22 @@ int ncl_node_attach(int node_id)
 
     const struct ncl_lock_desc *d = (const struct ncl_lock_desc *)ncl_meta_ptr(hdr->descs_off);
     ncl_line_t *blocks = (ncl_line_t *)ncl_meta_ptr(hdr->locks_off);
+    ncl_line_t *sblocks = (ncl_line_t *)ncl_scan_ptr(hdr->slocks_off);
     for (int l = 0; l < cfg.nlocks; l++) {
+        ncl_line_t *mb = blocks + (size_t)l * hdr->lines_per_lock;
+        ncl_line_t *sb = sblocks + (size_t)l * hdr->scan_per_lock;
         ncl_sub_init(&local[l].sub);
-        ncl_base_bind(&local[l].base, cfg.alg, hdr->participants,
-                      blocks + (size_t)l * hdr->lines_per_lock);
+        ncl_base_bind(&local[l].base, cfg.alg, hdr->participants, mb, sb);
         if (cfg.mode == NCL_MODE_HANDOFF && !is_server()) {
-            ncl_line_t *ho = blocks + (size_t)l * hdr->lines_per_lock +
-                             ncl_base_nlines(cfg.alg, hdr->participants);
-            local[l].owner = ho;
-            local[l].announce = ho + 1;
+            local[l].owner = mb + ncl_base_nlines(cfg.alg, hdr->participants);
+            local[l].announce = sb + ncl_base_nscan(cfg.alg, hdr->participants);
             local[l].pw_next = (node_id + 1) % hdr->participants;
         }
         local[l].data = d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL;
         local[l].data_len = d[l].data_len;
     }
-    if (is_server() && ncl_srv_node_start(&cfg, &hdr->srv, node_id, blocks, hdr->lines_per_lock) < 0)
+    if (is_server() && ncl_srv_node_start(&cfg, &hdr->srv, node_id, blocks, hdr->lines_per_lock,
+                                          sblocks, hdr->scan_per_lock) < 0)
         return -1;
     return 0;
 }

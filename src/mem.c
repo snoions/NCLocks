@@ -28,6 +28,7 @@ struct ncl_mem ncl_mem;
 #define NCL_DEFAULT_BASE ((uintptr_t)0x600000000000ULL)
 
 static double tsc_per_ns = 1.0;
+static void emu_copy_lines(char *dst, const char *src, size_t len);
 
 static uint64_t now_ns(void)
 {
@@ -133,7 +134,7 @@ static double measure_meta_load_ns(void)
 /* Below this a metadata load is certainly being served from cache. */
 #define NCL_UC_MIN_LOAD_NS 20.0
 
-static int map_uc_meta(uintptr_t base)
+static int map_uc_meta(uintptr_t base, size_t len)
 {
     const char *path = getenv("NCL_UC_DEV") ? getenv("NCL_UC_DEV") : NCL_UC_DEV_PATH;
     int accept_any = getenv("NCL_UC_ACCEPT_ANY_MEMTYPE") != NULL;
@@ -155,22 +156,22 @@ static int map_uc_meta(uintptr_t base)
         perror("ncl: NCL_UC_IOC_INFO");
         return -1;
     }
-    if (info.size < ncl_mem.meta_size) {
+    if (info.size < len) {
         fprintf(stderr, "ncl: uc pool %llu B < metadata %zu B; reload with larger size_mb\n",
-                (unsigned long long)info.size, ncl_mem.meta_size);
+                (unsigned long long)info.size, len);
         return -1;
     }
     if (!info.pat_enabled && !accept_any) {
         fprintf(stderr, "ncl: PAT disabled on this kernel; mapping would not be uncached\n");
         return -1;
     }
-    uint64_t zlen = ncl_mem.meta_size;
+    uint64_t zlen = len;
     if (ioctl(fd, NCL_UC_IOC_ZERO, &zlen) < 0) {
         perror("ncl: NCL_UC_IOC_ZERO");
         return -1;
     }
 
-    ncl_mem.meta = map_fixed(base, ncl_mem.meta_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0,
+    ncl_mem.meta = map_fixed(base, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0,
                              "metadata (uc)");
     if (!ncl_mem.meta)
         return -1;
@@ -178,7 +179,7 @@ static int map_uc_meta(uintptr_t base)
     /* Verify the live PTEs, not what we asked for. */
     int cm = NCL_UC_CM_UNKNOWN;
     size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-    for (size_t off = 0; off < ncl_mem.meta_size; off += pg) {
+    for (size_t off = 0; off < len; off += pg) {
         struct ncl_uc_probe pr = {.addr = (uint64_t)(uintptr_t)(ncl_mem.meta + off)};
         if (ioctl(fd, NCL_UC_IOC_PROBE, &pr) < 0) {
             perror("ncl: NCL_UC_IOC_PROBE");
@@ -211,18 +212,26 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
     memset(&ncl_mem, 0, sizeof ncl_mem);
     ncl_mem.backend = cfg->backend;
     ncl_mem.meta_size = round_page(cfg->meta_size);
+    ncl_mem.scan_size = round_page(cfg->scan_size ? cfg->scan_size : 1);
+    ncl_mem.split = cfg->meta_split;
     ncl_mem.data_size = round_page(cfg->data_size ? cfg->data_size : 1);
     ncl_mem.dev_lat_ns = cfg->dev_lat_ns;
     ncl_mem.memfd = -1;
     ncl_mem.uc_fd = -1;
     ncl_mem.meta_memtype = "WB";
     ncl_mem.meta_store_sfence = cfg->backend == NCL_BACKEND_CACHED_FLUSH;
+    if (cfg->meta_split && cfg->backend != NCL_BACKEND_UC && cfg->backend != NCL_BACKEND_EMU) {
+        fprintf(stderr, "ncl: split metadata needs the uc or emu backend (%s metadata is "
+                        "uniform by definition)\n", ncl_backend_name(cfg->backend));
+        return -1;
+    }
 
     calibrate_tsc();
     ncl_mem.lat_cycles = cfg->dev_lat_ns ? ncl_ns_to_cycles(cfg->dev_lat_ns) : 0;
 
-    /* memfd layout: [meta (unused by UC backend)] [data] */
-    size_t dev_size = ncl_mem.meta_size + ncl_mem.data_size;
+    /* memfd layout: [meta (unused by UC backend)] [scan (unused by uniform UC)] [data] */
+    size_t meta_all = ncl_mem.meta_size + ncl_mem.scan_size;
+    size_t dev_size = meta_all + ncl_mem.data_size;
     int fd = memfd_create("ncl-device", 0);
     if (fd < 0) {
         perror("ncl: memfd_create");
@@ -238,16 +247,44 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
     uintptr_t base = cfg->base_addr ? cfg->base_addr : NCL_DEFAULT_BASE;
     int prot = PROT_READ | PROT_WRITE;
 
+    /* Uniform: meta and scan are one mapping of the backend's metadata type.
+     * Split: meta alone, then scan mapped cached (see mem.h). */
+    size_t meta_map = ncl_mem.split ? ncl_mem.meta_size : meta_all;
     if (cfg->backend == NCL_BACKEND_UC) {
-        if (map_uc_meta(base) < 0)
+        if (map_uc_meta(base, meta_map) < 0)
             goto fail;
     } else {
-        ncl_mem.meta = map_fixed(base, ncl_mem.meta_size, prot, MAP_SHARED, fd, 0, "metadata");
+        ncl_mem.meta = map_fixed(base, meta_map, prot, MAP_SHARED, fd, 0, "metadata");
         if (!ncl_mem.meta)
             goto fail;
     }
+    uintptr_t scan_va = base + ncl_mem.meta_size;
+    uintptr_t data_va = scan_va + ncl_mem.scan_size;
+    if (!ncl_mem.split) {
+        ncl_mem.scan = ncl_mem.scan_dev = ncl_mem.meta + ncl_mem.meta_size;
+    } else if (cfg->backend == NCL_BACKEND_EMU) {
+        ncl_mem.scan = map_fixed(scan_va, ncl_mem.scan_size, prot, MAP_PRIVATE | MAP_ANONYMOUS,
+                                 -1, 0, "scan metadata (node view)");
+        if (!ncl_mem.scan)
+            goto fail;
+        ncl_mem.scan_dev = map_fixed(data_va + 2 * ncl_mem.data_size, ncl_mem.scan_size, prot,
+                                     MAP_SHARED, fd, (off_t)ncl_mem.meta_size,
+                                     "scan metadata (device view)");
+        if (!ncl_mem.scan_dev)
+            goto fail;
+    } else {
+        ncl_mem.scan = ncl_mem.scan_dev = map_fixed(scan_va, ncl_mem.scan_size, prot, MAP_SHARED,
+                                                    fd, (off_t)ncl_mem.meta_size,
+                                                    "scan metadata (cached)");
+        if (!ncl_mem.scan)
+            goto fail;
+    }
+    if (ncl_mem.split) {
+        ncl_mem.cm_lo = (uintptr_t)ncl_mem.scan;
+        ncl_mem.cm_len = ncl_mem.scan_size;
+        ncl_mem.meta_store_sfence = 1; /* clflushopt is weakly ordered with later stores */
+    }
 
-    uintptr_t data_va = base + ncl_mem.meta_size;
     if (cfg->backend == NCL_BACKEND_EMU) {
         /* Node view = private anonymous memory (the node's "cache"); each
          * forked node gets its own copy-on-write image. */
@@ -256,13 +293,12 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
         if (!ncl_mem.data)
             goto fail;
         ncl_mem.data_dev = map_fixed(data_va + ncl_mem.data_size, ncl_mem.data_size, prot,
-                                     MAP_SHARED, fd, (off_t)ncl_mem.meta_size,
-                                     "data (device view)");
+                                     MAP_SHARED, fd, (off_t)meta_all, "data (device view)");
         if (!ncl_mem.data_dev)
             goto fail;
     } else {
         ncl_mem.data = map_fixed(data_va, ncl_mem.data_size, prot, MAP_SHARED, fd,
-                                 (off_t)ncl_mem.meta_size, "data");
+                                 (off_t)meta_all, "data");
         if (!ncl_mem.data)
             goto fail;
         ncl_mem.data_dev = ncl_mem.data;
@@ -286,15 +322,21 @@ fail:
 const char *ncl_mem_describe(void)
 {
     static char buf[160];
-    snprintf(buf, sizeof buf, "backend=%s meta_memtype=%s meta_load=%.1fns",
-             ncl_backend_name(ncl_mem.backend), ncl_mem.meta_memtype, ncl_mem.meta_load_ns);
+    snprintf(buf, sizeof buf, "backend=%s meta_memtype=%s meta_load=%.1fns scan=%s",
+             ncl_backend_name(ncl_mem.backend), ncl_mem.meta_memtype, ncl_mem.meta_load_ns,
+             !ncl_mem.split ? "uniform"
+             : ncl_mem.backend == NCL_BACKEND_EMU ? "split(emu-cached)" : "split(WB+clflushopt)");
     return buf;
 }
 
 void ncl_mem_fini(void)
 {
     if (ncl_mem.meta)
-        munmap(ncl_mem.meta, ncl_mem.meta_size);
+        munmap(ncl_mem.meta, ncl_mem.split ? ncl_mem.meta_size : ncl_mem.meta_size + ncl_mem.scan_size);
+    if (ncl_mem.split && ncl_mem.scan)
+        munmap(ncl_mem.scan, ncl_mem.scan_size);
+    if (ncl_mem.split && ncl_mem.scan_dev && ncl_mem.scan_dev != ncl_mem.scan)
+        munmap(ncl_mem.scan_dev, ncl_mem.scan_size);
     if (ncl_mem.data)
         munmap(ncl_mem.data, ncl_mem.data_size);
     if (ncl_mem.data_dev && ncl_mem.data_dev != ncl_mem.data)
@@ -312,6 +354,8 @@ void ncl_mem_node_attach(void)
 {
     if (ncl_mem.backend == NCL_BACKEND_EMU)
         ncl_data_invalidate(ncl_mem.data, ncl_mem.data_size);
+    if (ncl_mem.backend == NCL_BACKEND_EMU && ncl_mem.split)
+        emu_copy_lines(ncl_mem.scan, ncl_mem.scan_dev, ncl_mem.scan_size);
 }
 
 const char *ncl_backend_name(ncl_backend_t b)

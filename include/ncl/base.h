@@ -13,9 +13,10 @@
  *                   holds the top lock's SLOW side (src/server.c). NOT yet
  *                   model-checked.
  *
- * Every variable is its own ncl_line_t. The per-lock block of lines is laid
- * out by ncl_base_nlines()/ncl_base_bind(); callers place it in the metadata
- * region.
+ * Every variable is its own ncl_line_t. Each lock has two blocks of lines,
+ * laid out by ncl_base_nlines()/ncl_base_nscan()/ncl_base_bind(): single
+ * words in the meta region, the scanned arrays (Lamport b[], present[]) in
+ * the scan region (ncl/mem.h).
  */
 #ifndef NCL_BASE_H
 #define NCL_BASE_H
@@ -52,8 +53,10 @@ struct ncl_base {
     ncl_alg_t alg;
     int P;             /* participants */
     int leaves;        /* tournament leaves: next power of two >= P */
-    ncl_line_t *lam;   /* LAMPORT: [x, y, b[0..P-1]] */
-    ncl_line_t *split; /* HYBRID/FASTSRV: [race, door, present[0..P-1]] */
+    ncl_line_t *lam;   /* LAMPORT: [x, y] */
+    ncl_line_t *lam_b; /* LAMPORT: b[0..P-1] (scan region) */
+    ncl_line_t *split; /* HYBRID/FASTSRV: [race, door] */
+    ncl_line_t *present; /* HYBRID/FASTSRV: present[0..P-1] (scan region) */
     ncl_line_t *tree;  /* TOURNAMENT/HYBRID: 3 lines per internal node */
     ncl_line_t *top;   /* HYBRID/FASTSRV: [flag[FAST], flag[SLOW], turn] */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
@@ -82,8 +85,10 @@ static inline void ncl_base_stats_add(struct ncl_base_stats *d, const struct ncl
         dp[k] += sp[k];
 }
 
-size_t ncl_base_nlines(ncl_alg_t alg, int P);
-void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines);
+size_t ncl_base_nlines(ncl_alg_t alg, int P); /* meta-region lines per lock */
+size_t ncl_base_nscan(ncl_alg_t alg, int P);  /* scan-region lines per lock */
+void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines,
+                   ncl_line_t *scan);
 
 /* LAMPORT/TOURNAMENT/HYBRID only. Acquire as participant i; returns the
  * NCL_PATH_* taken. Release with the value ncl_base_lock returned. */

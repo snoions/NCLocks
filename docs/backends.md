@@ -109,8 +109,9 @@ Raw data: `results/backends_batch_uc_cf.csv` (`variant` column; `cf` = cached-fl
   - cached + batched flush for arrays that are scanned (`present[]`, `announce[]`, `b[]`,
     server queues).
 
-  This would bring in the cached-metadata requirements of design §1: no clean writebacks,
-  and padding to the host's writeback granularity. Not implemented.
+  This brings in the cached-metadata requirements of design §1: no clean writebacks,
+  and padding to the host's writeback granularity. Implemented as `-U split`; see
+  "Per-region memory types" below.
 
 ## Probe first, then batch (`-Q probe`, the default)
 
@@ -237,3 +238,61 @@ were older stores (UC is strongly ordered). So on `uc` there is nothing to overl
   by mistake. The medians are unaffected.
 
 The default stays on: neutral on `uc`, and on cached-flush it saves a fence.
+
+## Per-region memory types (`-U split`)
+
+`-U split` (uc and emu) keeps single words uncached and moves the scanned arrays
+(Lamport `b[]`, `present[]`, `announce[]`, server queue rings) to a cached region with
+explicit writeback after each store and invalidate before each batched or probe-first
+read (design §2, the option below the region table). On uc that region is ordinary WB
+memory plus `clflushopt`; on this coherent host it measures cost only. Correctness comes
+from emu, where the region has per-node private views and `--skip-meta-wb` /
+`--skip-meta-inv` make stress fail (ctest `emu_split_detects_*`).
+
+**Per operation** (`ncl_memlat uc 7 split`, one core):
+
+| | ns |
+|---|---|
+| UC store; UC load | 89 |
+| cached store + flush; UC load | **185** |
+| UC store; mfence; UC load | 119 |
+| cached store + flush; mfence; UC load | **191** |
+| 1 load, scan region (flush, mfence, load) | 96 (UC: 86) |
+| 7-line scan, scan region batched | **112** (UC serial: 540) |
+
+A UC access waits for earlier `clflushopt`s to finish writing to memory, so every cached
+store costs about 100 ns more than a UC store as soon as an uncached access follows,
+which it always does. Batched scans save about 430 ns, but only when a scan reads many
+lines (a scan that finds nobody, or the server poll).
+
+**Locks** (N=8 x 1, 200 ns CS, defaults, 3 interleaved reps, medians;
+`results/split_layout_uc_n8.csv`):
+
+| | capacity uc / split / cf (Mops/s) | 100k sojourn p50 uc / split / cf (ns) | 600k acquire p50 uc / split / cf (us) |
+|---|---|---|---|
+| Lamport | 0.50 / 0.50 / 0.48 | 767 / 863 / 991 | saturated |
+| tournament | 1.69 / 1.68 / 1.65 | 991 / 991 / 1343 | 0.6 / 0.6 / 0.9 |
+| hybrid | 1.12 / 1.04 / 0.87 | 1087 / 1215 / 1407 | 1.0 / 1.0 / 2.8 |
+| server | 1.23 / **1.32** / 1.20 | 2175 / 3071 / 3199 | 1.1 / 1.1 / 1.2 |
+| fastsrv | 1.03 / 0.98 / 0.96 | 1087 / 1215 / 1407 | 1.6 / 1.7 / 2.2 |
+| Lamport-2b | 0.89 / 0.83 / 0.98 | 1343 / 1599 / 1535 | 2.3 / 2.7 / 2.6 |
+| tournament-2b | 0.93 / 0.86 / 1.01 | 1535 / 1727 / 1919 | 1.7 / 2.2 / 1.9 |
+| hybrid-2b | 0.93 / 0.87 / 1.03 | 1599 / 1855 / 1983 | 2.8 / 3.6 / 5.1 |
+| server chain | 1.66 / 1.67 / 1.54 | 2175 / 3071 / 3199 | 1.2 / 1.0 / 1.2 |
+
+Fairness matches the uc column except Lamport (0.92 uc, 0.82 split).
+
+- **On this host split is not the best of both.** Only the lock server gains capacity
+  (+7%, from the batched poll). The tournament has no scanned arrays and is unchanged.
+  Everything else is slower than uniform uc: uncontended by 100-250 ns (one or two
+  cached stores per acquisition, each followed by uncached accesses), and the 2b
+  variants by 6-8% in capacity. With 2b under contention, the adaptive `pick_waiter` probes one slot,
+  so there is no long scan to save.
+- **The lock servers lose about 900 ns uncontended** on split, as on cached-flush (3199
+  ns). Not yet explained; the poll itself is cheaper.
+- **What would change the verdict:** the 100 ns penalty is the time to write a flushed
+  line to memory before a UC access may proceed. On a CXL device both costs grow with the
+  link latency, and so does the cost of each extra serialized uncached load, so the
+  balance at larger N and on real hardware is open. A store path that does not wait (a
+  cached store whose flush is not followed by an uncached access before the next fence)
+  would need protocol changes, not a layout change.

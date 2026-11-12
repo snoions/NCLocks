@@ -31,6 +31,8 @@ Three kinds of shared state, plus node-local state:
 | Data | Cached | Data protected by the locks |
 | Node-local (not shared across nodes) | Ordinary coherent memory | Local submutexes, per-acquisition path info (e.g. hybrid fast/tournament), local queue tail counters, local handoff counts |
 
+**Option (implemented, `-U split`): split hot metadata by access pattern.** Uncached loads cannot overlap, so a scan of N uncached lines costs N serialized round trips, while N cached lines can be invalidated together and read in parallel after one fence. The split keeps single words that are polled, stored or handed off (owner, grant slots, `x`/`y`, Peterson flags/turn, splitter door/race, the chain's `succ[]`) uncached and moves the scanned arrays (Lamport `b[]`, `present[]`, `announce[]`, server queue rings) to a **cached** region with explicit writeback after each store and invalidate before each (batched) read. Every such array element has a single writer. The cached region then carries the cached-memory assumptions of Section 1 (no clean writebacks; own line at the host's writeback granularity), and stores to it are weakly ordered (`clflushopt`), so the explicit store-store fences of rule 4 matter. Measured on the uc testbed it is mostly slower than all-uncached: an uncached access waits for an earlier flush, so each cached store costs ~100 ns extra, and only the lock server's poll gains (`docs/backends.md`, "Per-region memory types"). Whether it pays on a CXL device is **Open**.
+
 Rules:
 
 1. **One aligned 8-byte store per message/state update.** Never rely on 64-byte line writes being atomic at the device. Anything a reader must see consistently (e.g. payload + sequence number) fits in one 8-byte word.
