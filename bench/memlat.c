@@ -64,6 +64,19 @@ int main(int argc, char **argv) {
         for (int k=0;k<K;k++) dat[k*64] = (char)it;
         for (int k=0;k<K;k++) _mm_clflushopt(dat + k*64);
         sink += ncl_uc_load(&L[0]); _mm_mfence(); });
+    /* Runs of stores to distinct lines, then one fence (Peterson's flag +
+     * turn, the tournament release clearing one flag per level). Do backend
+     * metadata stores pipeline, or does each wait for the previous one? */
+    TIME("K stores, distinct lines (backend); mfence", {
+        for (int k=0;k<K;k++) ncl_uc_store(&L[2+k*2], it);
+        ncl_fence(); });
+    TIME("K cached stores + clflushopt; mfence", {
+        for (int k=0;k<K;k++) { dat[k*64] = (char)it; _mm_clflushopt(dat + k*64); }
+        _mm_mfence(); });
+    if (has_clwb())
+        TIME("K cached stores + clwb; mfence", {
+            for (int k=0;k<K;k++) { dat[k*64] = (char)it; clwb(dat + k*64); }
+            _mm_mfence(); });
     /* Writeback instruction comparison (--wb): data lines are cached on uc. */
     TIME("K dirty data clflushopt; mfence", {
         for (int k=0;k<K;k++) dat[k*64] = (char)it;

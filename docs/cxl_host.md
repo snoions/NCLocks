@@ -59,7 +59,14 @@ correctness is still checked by `emu`.
    ```
    Every startup line shows `mem_node=`, `uc_pool_node=`, `meta_load=` and `wb=`. CSV rows
    carry `mem_node,uc_pool_node,wb,cpus`.
-6. Experiments (3 reps, report throughput together with fairness):
+6. Experiments: `scripts/cxl_sweep.sh` runs them all under the numactl prefix, writing
+   one CSV per phase to `results/cxl_<date>/`. It refuses to start if the CPUs, the
+   memory node or the uc pool node are wrong, and it aborts on any placement warning.
+   - Phases: `preflight p1 abl 2a 2b base open` (the default, about 75 minutes), plus
+     `dram` after reloading the driver with `nid=0`.
+   - Main configurations: `uc -U split --wb clwb` and `cached-flush --wb clwb`. On this
+     host those were the fastest at N=8 in the first single-run comparison.
+   - It covers (report throughput together with fairness):
    - Phase 1, 2a and 2b, every algorithm, `-b uc --mem-node 2`, N in {4, 8, 16, 32},
      T in {1, 3}.
    - Baselines on the same host:
