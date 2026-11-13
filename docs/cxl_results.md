@@ -247,8 +247,35 @@ less than 0.1% unserved:
   (p50 6.7 / 7.7 vs 7.2 / 9.7).
 - The tournament is the only algorithm unsaturated at 400k.
 
-## Not yet run
+## UC metadata on DRAM (`dram` phase)
 
-`dram`: the same uc configs with the pool on node 0 (`insmod ncl_uc.ko nid=0`, then
-`scripts/cxl_sweep.sh dram`). It separates the CXL share of the costs above from the
-UC share.
+`results/cxl_20261113_2050/dram.csv`: `uc_split_clwb` at 8x1 and 16x1, one lock, with
+the uc pool and the data on node 0 (`ncl_uc.ko nid=0`; every row has `uc_pool_node=0`,
+`mem_node=0`, `UC-`). All 42 runs completed. `errors.log` has one failed preflight
+(`/dev/ncl_uc` permission) from an earlier attempt. Compared with the same config on CXL
+(Phase 1) and with cf on CXL, k/s:
+
+| alg | uc DRAM 8 / 16 | uc CXL 8 / 16 | DRAM / CXL | cf CXL 8 / 16 |
+|---|---|---|---|---|
+| tournament | **1132 / 1141** | 468 / 438 | 2.4-2.6x | 503 / 503 |
+| server | 826 / 794 | 339 / 331 | 2.4x | 326 / 344 |
+| aksrv | 731 / 685 | 290 / 284 | 2.4-2.5x | 290 / 289 |
+| fastsrv | 656 / 606 | 270 / 255 | 2.4x | 277 / 256 |
+| hybrid | 531 / 552 | 213 / 202 | 2.5-2.7x | 254 / 246 |
+| ak | 417 / 340 | 155 / 126 | 2.7x | 190 / 164 |
+| lamport | 172 / 91 | 54 / 27 | 3.2-3.4x | 70 / 38 |
+
+Fairness is unchanged in kind: 1.0 for tournament, server and the server variants; AK
+0.69 / 0.80 and Lamport 0.59 / 0.75, a little *less* fair than on CXL (0.81-0.92).
+p99 drops by the same ~2.5x.
+
+- **CXL costs a uniform ~2.4-2.7x at one lock** (Lamport 3.2-3.4x). The algorithm
+  ranking does not change, so the CXL latency multiplies every algorithm's
+  critical path about equally.
+- **uc on DRAM beats cf on CXL by 2.2-2.4x.** So on this host most of uc's
+  disadvantage against cf comes from UC accesses having to go to CXL: each UC
+  access pays the full CXL round trip, while cf's clwb keeps lines and overlaps
+  writebacks (per-operation table above).
+- This phase is one lock only, so it does not test the uc throughput ceiling seen under
+  "Many locks". That needs the locks phase with the pool on DRAM: with `nid=0` loaded,
+  `MEMNODE=0 CFGS=uc_split_clwb LOCKS="16 256" scripts/cxl_sweep.sh locks`.
