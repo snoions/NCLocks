@@ -225,8 +225,8 @@ runs completed, no errors; spread mostly <5% (max 16%: server uc 32x1 L=64).
 - **The server saturates and turns unfair.** Server throughput is flat from L=64 to
   L=256 (cf 3.1M / 2.5M, uc 2.6M / 2.0M at 16 / 32 nodes) and fairness drops to
   0.78-0.82 (16 nodes) and 0.64-0.66 (32 nodes) at L=256, on both configs. Not yet
-  explained; the per-server load is uniform (home = hash % N), so CPU placement of the
-  32 servers + 32 workers (SMT siblings) is a candidate.
+  explained: the per-server load is uniform (home = hash % N), and at 16 nodes the 16
+  servers + 16 workers have their own cores, so CPU placement alone does not explain it.
 
 ## Open loop (Poisson, N=16, T=1)
 
