@@ -18,7 +18,7 @@
 #
 # env: OUT, BENCH, REPS (3), SECS (3), WARMUP (0.5), CS (200), BACKOFF (16),
 #      MEMNODE (2: CXL), CPUNODE (0: the socket the device hangs off),
-#      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), RUN_TIMEOUT (120 s per run), WB (clwb)
+#      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), OWN_NT ("4x1 8x1 16x1 32x1 16x3"), RUN_TIMEOUT (120 s per run), WB (clwb)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,6 +32,7 @@ BACKOFF=${BACKOFF:-16}
 MEMNODE=${MEMNODE:-2}
 CPUNODE=${CPUNODE:-0}
 NT=${NT:-"4x1 8x1 16x1 32x1 4x3 8x3 16x3"}
+OWN_NT=${OWN_NT:-"4x1 8x1 16x1 32x1 16x3"} # phase own
 RUN_TIMEOUT=${RUN_TIMEOUT:-120}
 WB=${WB:-clwb} # writeback instruction of the main configs (clflushopt for hosts without clwb)
 
@@ -150,7 +151,7 @@ p2b_own() {
   # --wait owner (design §3.3) vs own (grant in the waiter's announce line),
   # interleaved; T=1 makes every handoff cross-node (docs/handoff.md).
   local csv=$OUT/own.csv; header "$csv"
-  for rep in $(seq "$REPS"); do for nt in ${OWN_NT:-"4x1 8x1 16x1 32x1 16x3"}; do nt_split "$nt"
+  for rep in $(seq "$REPS"); do for nt in $OWN_NT; do nt_split "$nt"
     for a in lamport tournament hybrid ak; do for c in $MAIN_CFGS; do for w in owner own; do
       run "$csv" "$rep" "$c" -a "$a" -n "$N" -t "$T" -M handoff --wait "$w" ${CFG[$c]} "${COMMON[@]}"
     done; done; done
