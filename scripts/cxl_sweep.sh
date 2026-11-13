@@ -20,6 +20,7 @@
 # env: OUT, BENCH, REPS (3), SECS (3), WARMUP (0.5), CS (200), BACKOFF (16),
 #      MEMNODE (2: CXL), CPUNODE (0: the socket the device hangs off),
 #      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), OWN_NT ("4x1 8x1 16x1 32x1 16x3"),
+#      CFGS ("cf_clwb"; add uc_split_clwb for uc),
 #      LOCKS ("1 4 16 64 256"), LOCKS_NT ("16x1 32x1"), RUN_TIMEOUT (120 s per run), WB (clwb)
 set -uo pipefail
 
@@ -50,7 +51,11 @@ declare -A CFG=(
   [uc_split_clwb]="-b uc -U split --wb $WB --mem-node $MEMNODE"
   [cf_clwb]="-b cached-flush --wb $WB --mem-node $MEMNODE"
 )
-MAIN_CFGS="uc_split_clwb cf_clwb"
+# Default cf only: uc (really uncached) was slower in every phase of the 2026-11-12/13
+# sweeps and hits an aggregate ceiling at low contention (docs/cxl_results.md, "Many
+# locks"). CFGS="uc_split_clwb cf_clwb" brings uc back; phase dram is uc regardless.
+MAIN_CFGS=${CFGS:-cf_clwb}
+for c in $MAIN_CFGS; do [ -n "${CFG[$c]+x}" ] || { echo "cxl_sweep: unknown config $c" >&2; exit 1; }; done
 
 mkdir -p "$OUT"
 ERR=$OUT/errors.log
