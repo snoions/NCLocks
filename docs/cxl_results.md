@@ -1,0 +1,148 @@
+# Results on the CXL host (sweep of 2026-11-12)
+
+Host: 2 x 60 cores, CXL 2.0 memory expander as NUMA node 2 attached to socket 0
+(`docs/cxl_host.md`). Every run: `numactl --cpunodebind=0 --membind=0`, shared regions
+bound to node 2 (`--mem-node 2`), uc pool from `ncl_uc.ko nid=2` (UC-, checked per page),
+200 ns CS, `-B 16`, 3 s, 3 interleaved reps, medians; servers `-Y next` (own cores).
+Raw CSVs: `results/cxl_20261112_2329/`; tables: `scripts/cxl_summary.py <dir>`. All 1128
+runs completed. The spread across reps is mostly below 5%; the largest is 23% (aksrv 4x1 cf).
+
+Configurations:
+- `uc_split_clwb`: `-b uc -U split --wb clwb`;
+- `cf_clwb`: `-b cached-flush --wb clwb`.
+
+Fairness is per-node min/max completions. All throughputs are k acquisitions/s.
+
+The host is still hardware-coherent. CXL contributes latency and device behaviour, while
+non-coherence is emulated as before (uc = really uncached, cf = cost stand-in).
+
+## Per-operation cost (`ncl_memlat`, uc pool on node 2)
+
+| | ns |
+|---|---|
+| 1 UC load | 474-523 |
+| UC store + mfence | 610-655 |
+| Dekker step (store, fence, load) | ~1000 |
+| 7 UC stores, then mfence | 4513 (each ~645: **UC stores serialize**) |
+| 7 cached stores + clflushopt, mfence | 1454 |
+| 7 cached stores + clwb, mfence | **401** |
+| re-read after clwb / after clflushopt | 333 / 711 |
+| 7-line scan, split batched / UC serial | 559 / 3030 |
+
+On this platform every per-operation cost is about 5x the dev box, and the writeback
+instruction matters: `clwb` keeps the line and its writebacks overlap.
+
+## Phase 1 (closed loop)
+
+Throughput (fairness in parentheses where below 0.99):
+
+| alg | 4x1 cf / uc | 8x1 cf / uc | 16x1 cf / uc | 32x1 cf / uc | 16x3 cf / uc |
+|---|---|---|---|---|---|
+| tournament | **511 / 457** | **503 / 468** | **503 / 438** | **486 / 359** | **473 / 419** |
+| server | 316 / 357 | 326 / 339 | 344 / 331 | 266 / 257 | 309 / 295 |
+| aksrv | 263 / 260 | 290 / 290 | 289 / 284 | 244 / 233 | 260 / 265 |
+| fastsrv | 263 / 264 | 277 / 270 | 256 / 255 | 230 / 216 | 241 / 232 |
+| hybrid | 255 / 217 | 254 / 213 | 246 / 202 | 248 / 189 | 230 / 193 |
+| ak | 204 (0.83) / 161 (0.84) | 190 (0.87) / 155 (0.81) | 164 (0.96) / 126 (0.86) | 155 / 118 (0.97) | 157 (0.92) / 118 (0.88) |
+| lamport | 120 (0.91) / 106 (0.72) | 70 (0.68) / 54 (0.83) | 38 (0.79) / 27 (0.92) | 19 (0.81) / 13 (0.85) | 36 (0.84) / 27 (0.90) |
+
+- **The tournament wins at every N, and is nearly flat in N.** It loses only 5% from 4 to
+  32 nodes on cf, and 21% on uc.
+- **The fast paths do not pay under saturation.** Hybrid, fastsrv and aksrv take the
+  fast path 0% of the time, so they pay the fast-path cost and then the slow path. AK
+  takes it 0-33% of the time and is unfair.
+- **cf beats uc by 10-45%** for all but the servers. This is the cost of each serialized
+  UC access versus a cached access with a `clwb`.
+- **Lamport collapses** as O(N) serialized ~500 ns loads, 13k/s at 32 nodes.
+
+**Ablation** (layout and writeback, 8x1 / 16x1, uc):
+
+| alg | uniform + clflushopt | split + clflushopt | split + clwb |
+|---|---|---|---|
+| server | 206 / 118 | 300 / 279 | **339 / 331** |
+| fastsrv | 186 / 113 | 226 / 208 | 270 / 255 |
+| aksrv | 187 / 113 | 269 / 246 | 290 / 284 |
+| tournament | 431 / 418 | 442 / 408 | 468 / 438 |
+| hybrid | 201 / 192 | 194 / 189 | 213 / 202 |
+| ak / lamport | 155 / 127, 49 / 24 | 155 / 127, 54 / 27 | 155 / 126, 54 / 27 |
+
+**The split layout reverses the dev-box verdict for the servers**, which gain +46% at 8
+nodes and 2.4x at 16 from split alone (batched polls of the queue rings), and 1.65x /
+2.8x with `clwb`. `clwb` adds 6-23% to the other algorithms; AK and Lamport are unchanged.
+
+**Coherent baselines** (`base`, cached memory, real coherence): at T=1, tournament 1.66-1.96 M/s and
+pthread 1.29-1.47 M/s; pthread fairness is 0.82-0.97. Node 2 and node 0 give the same results
+within noise, because the hot lines stay in the caches. So the non-coherent tournament on
+CXL pays 3.4-4.6x versus coherent locking on the same memory.
+
+## Phase 2a (local handoff, `-M local -K 64`, T=3)
+
+Every algorithm reaches 1.2-1.6 M/s, with 98.5% local handoffs, and the tournament is
+again first (1.46-1.58 M). Fairness is 1.0 except for the unfair global algorithms, where
+the local cap turns their unfairness into node starvation: AK 0.5-0.68, Lamport 0.19-0.91.
+
+## Phase 2b (cross-node handoff, `-M handoff`)
+
+With T=3 the results look like 2a (1.1-1.5 M/s, 98.5% local). With T=1 every handoff is
+global:
+
+| alg | 4x1 cf / uc | 8x1 cf / uc | 16x1 cf / uc | 32x1 cf / uc | owner polls/acq at 32 (cf / uc) |
+|---|---|---|---|---|---|
+| server chain | **397 / 373** | **393 / 361** | **386 / 351** | **356 / 320** | 0 (polls own grant slot) |
+| tournament-2b | 325 / 229 | 234 / 145 | 135 / 75 | 67 / 38 | 38 / 64 |
+| hybrid-2b | 227 / 178 | 233 / 193 | 183 / 78 | 92 / 28 | 26 / 89 |
+| ak-2b | 163 / 123 | 163 / 128 | 124 / 75 | 75 / 39 | 33 / 62 |
+| lamport-2b | 200 / 202 | 112 / 108 | 72 / 65 | 39 / 35 | 67 / 70 |
+
+Fairness is 1.0 throughout. Compared with Phase 1 at the same N (tournament uc: 457 /
+468 / 438 / 359), **the gate algorithms lose throughput roughly as 1/N in 2b**, down to
+about 10% of Phase 1 at 32 nodes, while the server chain is flat. On the dev box at N=8,
+tournament-2b reached 55% of Phase 1; here it reaches 31%.
+
+**Hypothesis (to verify): the shared owner field is a hot spot on the device.** The
+`-M handoff` waiters all poll one uncached `owner` word, with backoff capped at `-B 16`
+pauses (`src/lock.c`, the wait loop after `ncl_base_unlock`). Polls per acquisition grow
+as ~2N. At 32 nodes on uc, one handoff takes ~26 us, which means each waiter completes
+only about 2 polls per handoff, or ~13 us per poll against a 500 ns unloaded load. That
+fits same-address accesses being served one at a time (~400 ns each) at the device or
+home agent, with the releaser's handoff store and the new owner's load queued behind the
+other waiters' polls. Phase 1 does not see this, because each tournament node has two
+contenders and they spin on different lines. The server chain does not see it either,
+because every waiter polls its own grant slot (the MCS local-spinning argument, now on a
+memory device).
+
+Cheap checks:
+1. `-M handoff -a tournament -n 16 -B {16,64,256,1024}`. If the owner line is the
+   bottleneck, throughput rises with -B until the poll interval exceeds the handoff time.
+2. Add an `ncl_memlat` row: the latency of a store, then a load to a line that K other
+   threads poll in UC.
+
+Fix candidates, which are design changes (§3.3 says waiters poll `owner` directly):
+- proportional backoff;
+- polling one's own announce line for the handoff, with the owner field kept for the
+  gate path.
+
+## Open loop (Poisson, N=16, T=1)
+
+Sojourn p50 / p99 in us. The capacity column is the highest offered load served with
+less than 0.1% unserved:
+
+| alg | 25k cf / uc | 200k cf / uc | capacity cf / uc |
+|---|---|---|---|
+| server | 6.1 / 6.4, p99 16 / 16 | 5.1 / 5.9, p99 20 / 24 | 300k / 300k (400k: 17-22% unserved) |
+| tournament | 7.2 / 9.7, p99 12 / 16 | 8.7 / 11.8, p99 26 / 39 | **>=400k / >=400k** |
+| hybrid | 6.7 / 7.7 | 37 / 205 | 250k / 200k |
+| fastsrv | 6.9 / 7.9 | 12 / 13 | 250k / 250k |
+| aksrv | 9.7 / 12.3 | 12 / 13 | 250k / 250k |
+| ak | 9.2 / 12.3 | saturated | 150k / 100k |
+
+- **At light load the server has the lowest median, and the tournament has the lowest
+  p99.** Uncontended, the hybrid fast path saves 0.5 us on cf and 2 us on uc
+  (p50 6.7 / 7.7 vs 7.2 / 9.7).
+- The tournament is the only algorithm unsaturated at 400k.
+
+## Not yet run
+
+`dram`: the same uc configs with the pool on node 0 (`insmod ncl_uc.ko nid=0`, then
+`scripts/cxl_sweep.sh dram`). It separates the CXL share of the costs above from the
+UC share.
