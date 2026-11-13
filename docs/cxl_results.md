@@ -132,8 +132,39 @@ That is the classic global-spinning trade-off. Even at its best, tournament-2b s
 
 Fix, implemented as option `--wait own` (`docs/handoff.md`, "Own-line wait"): the
 releaser writes `owner = j`, then a grant word in j's own announce line. Waiters poll
-that line and re-read `owner` only every 16th poll. It is not yet measured on this host:
-`scripts/cxl_sweep.sh own`.
+that line and re-read `owner` only every 16th poll.
+
+**`--wait own` vs `owner`** (`results/cxl_20261113_0334/own.csv`, 3 reps, medians;
+k acq/s, cf / uc split):
+
+| alg | 4x1 | 8x1 | 16x1 | 32x1 | 16x3 |
+|---|---|---|---|---|---|
+| tournament owner | 331 / 227 | 241 / 142 | 137 / 75 | 69 / 39 | 1269 / 1156 |
+| tournament **own** | 314 / 261 | 315 / 250 | **302 / 233** | **246 / 185** | 1411 / 1392 |
+| hybrid owner | 219 / 181 | 221 / 194 | 173 / 80 | 91 / 28 | 1275 / 1163 |
+| hybrid **own** | 223 / 182 | 274 / 209 | 266 / 191 | **243 / 174** | 1424 / 1404 |
+| ak owner | 167 / 128 | 167 / 128 | 123 / 80 | 77 / 40 | 1288 / 1148 |
+| ak **own** | 181 / 125 | 201 / 141 | 196 / 134 | 183 / 127 | 1419 / 1396 |
+| lamport owner | 215 / 209 | 121 / 111 | 71 / 65 | 40 / 37 | 1266 / 1147 |
+| lamport **own** | 322 / 274 | 303 / 242 | 155 / 90 | 44 / 32 | 1423 / 1404 |
+
+Fairness is 1.0 everywhere, there are no missed announces, and the rep spread is mostly
+below 5%. The worst spread is lamport own cf at 16x1, 39%.
+- **The 1/N collapse is gone for tournament, hybrid and AK.** At 32 nodes they run
+  2.4-6x faster than with `owner`, and tournament keeps 78% (cf: 80%) of its 8-node
+  throughput. Owner polls per acquisition fall from ~2N to 3-9, and lock p99 at 32x1
+  drops from 0.6-1.4 ms to 0.15-0.33 ms.
+- **With local handoff (16x3), `own` adds 10-22%.** It reaches 1.39-1.42 M/s, about the
+  same as 2a without cross-node handoff (tournament 1.46 M).
+- **Lamport at 32 nodes does not improve.** Its waits are long (406-523 grant polls per
+  acquisition), so the every-16th-poll rechecks still put 25-32 owner loads on each
+  acquisition, ~13 us of owner-line time per handoff. The fixed recheck interval
+  reintroduces the hot spot whenever waits are long. A recheck interval that grows with
+  the time already waited would bound this.
+- **Still below the alternatives at T=1.** Tournament-2b with `own` (uc 233k / 185k at
+  16 / 32 nodes) stays below both Phase 1 (438k / 359k) and the server chain (351k /
+  320k). The gate, announce and grant cost more than they save when every handoff
+  crosses nodes.
 
 ## Open loop (Poisson, N=16, T=1)
 
