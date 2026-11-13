@@ -11,7 +11,8 @@ Configurations:
 - `uc_split_clwb`: `-b uc -U split --wb clwb`;
 - `cf_clwb`: `-b cached-flush --wb clwb`.
 
-Fairness is per-node min/max completions. All throughputs are k acquisitions/s.
+Fairness is per-node min/max completions. All throughputs are k acquisitions/s. Every
+phase except "Many locks" uses one lock (`-l 1`), i.e. maximum contention.
 
 The host is still hardware-coherent. CXL contributes latency and device behaviour, while
 non-coherence is emulated as before (uc = really uncached, cf = cost stand-in).
@@ -181,6 +182,51 @@ below 5%. The worst spread is lamport own cf at 16x1, 39%.
   16 / 32 nodes, doubling) stays below both Phase 1 (438k / 359k) and the server chain (351k /
   320k). The gate, announce and grant cost more than they save when every handoff
   crosses nodes.
+
+## Many locks (Phase 1, `-l L`, T=1)
+
+`results/cxl_20261113_0923/locks.csv` (`scripts/cxl_sweep.sh locks`): each acquisition
+picks one of L locks uniformly, so contention per lock falls as L grows. Throughput k/s,
+cf / uc:
+
+| alg | 16x1 L=1 | 16x1 L=16 | 16x1 L=256 | 32x1 L=1 | 32x1 L=16 | 32x1 L=256 |
+|---|---|---|---|---|---|---|
+| tournament | 516 / 441 | 1881 / 930 | 2084 / 939 | 505 / 368 | 2782 / 737 | 3364 / 757 |
+| server | 338 / 314 | **2309 / 2103** | 3095 / 2593 | 280 / 252 | **2301 / 1914** | 2453 / 1997 |
+| lamport | 38 / 27 | 750 / 492 | **3890 / 2699** | 19 / 13 | 319 / 216 | **7100 / 2458** |
+| hybrid | 242 / 205 | 1290 / 787 | 2234 / 1008 | 240 / 195 | 1571 / 543 | 3574 / 835 |
+| ak | 166 / 125 | 1179 / 608 | 1653 / 671 | 151 / 119 | 1688 / 483 | 3069 / 636 |
+| fastsrv | 255 / 252 | 1333 / 1032 | 2206 / 1162 | 226 / 215 | 1497 / 974 | 2249 / 884 |
+| aksrv | 287 / 276 | 1309 / 740 | 1649 / 617 | 250 / 236 | 1627 / 728 | 2223 / 544 |
+
+Fast-path fraction (hybrid, ak, fastsrv, aksrv) is 0-6% at L=1, 17-52% at L=16 and
+87-95% at L=256. Lamport's is 73-75% already at L=4 but with starvation-level tails
+(p99 1.4-7.9 ms up to L=16 at 32 nodes; fairness 0.82-0.87 at 32 nodes for L<=64). All
+runs completed, no errors; spread mostly <5% (max 16%: server uc 32x1 L=64).
+
+- **The winner depends on contention.** L=1: tournament (as Phase 1). L=4-64: the server
+  on uc (2.1-2.6M at 16 nodes, ~1.9-2.0M at 32), the tournament or server on cf.
+  L=256 (nearly uncontended): Lamport, whose fast path is the shortest (cf 3.9M / 7.1M;
+  uc 2.7M / 2.5M). Lamport is unusable at L<=16.
+- **uc stops scaling with L or N; cf does not.** At L=256, time per acquisition per
+  thread (N / throughput) on uc roughly doubles from 16 to 32 nodes for every gate
+  algorithm (tournament 17 -> 42 us, hybrid 16 -> 38, ak 24 -> 50, Lamport 6 -> 13),
+  while cf stays nearly flat (tournament 8 -> 10, hybrid 7 -> 9, Lamport 4 -> 4).
+  Uncontended, the tournament at 32 nodes is 5 Peterson levels, ~15 us at the
+  single-thread costs above, so per-access UC latency rises with concurrent UC traffic:
+  there seems to be an aggregate ceiling on UC metadata accesses to the CXL node
+  (tournament uc *falls* from 939k to 757k as N doubles). The `dram` phase would show
+  whether it is UC or CXL. Data handling is the same in both configs and 64 B per lock.
+- **The fast paths pay for their reopen scan on uc.** At L=256 hybrid / ak / fastsrv /
+  aksrv take the fast path ~90-95% of the time, yet on uc reach only 0.5-1.2M, below
+  Lamport (2.5-2.7M) and the server: the strict `present[]` scan before reopening (hybrid,
+  fastsrv) and AK's longer fast path add UC accesses under that ceiling. On cf, hybrid
+  and ak at 32x1 L=256 (3.6M / 3.1M) beat the tournament (3.4M) but not Lamport.
+- **The server saturates and turns unfair.** Server throughput is flat from L=64 to
+  L=256 (cf 3.1M / 2.5M, uc 2.6M / 2.0M at 16 / 32 nodes) and fairness drops to
+  0.78-0.82 (16 nodes) and 0.64-0.66 (32 nodes) at L=256, on both configs. Not yet
+  explained; the per-server load is uniform (home = hash % N), so CPU placement of the
+  32 servers + 32 workers (SMT siblings) is a candidate.
 
 ## Open loop (Poisson, N=16, T=1)
 
