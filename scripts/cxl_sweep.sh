@@ -9,6 +9,7 @@
 #   2b         Phase 2b cross-node handoff (-M handoff, default --wait own), gate algorithms + server chain
 #   base       coherent baselines: tournament and pthread (+ no-submutex) on CXL and DRAM
 #   open       open loop (Poisson) at N=16, T=1, offered load scaled to CXL capacity
+#   locks      Phase 1 with L locks chosen uniformly per acquisition (-l), all algorithms, N=16,32
 #   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms
 #   dram       main uc configs with metadata on DRAM: RELOAD THE DRIVER WITH nid=0 FIRST
 #
@@ -18,7 +19,8 @@
 #
 # env: OUT, BENCH, REPS (3), SECS (3), WARMUP (0.5), CS (200), BACKOFF (16),
 #      MEMNODE (2: CXL), CPUNODE (0: the socket the device hangs off),
-#      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), OWN_NT ("4x1 8x1 16x1 32x1 16x3"), RUN_TIMEOUT (120 s per run), WB (clwb)
+#      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), OWN_NT ("4x1 8x1 16x1 32x1 16x3"),
+#      LOCKS ("1 4 16 64 256"), LOCKS_NT ("16x1 32x1"), RUN_TIMEOUT (120 s per run), WB (clwb)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -33,6 +35,8 @@ MEMNODE=${MEMNODE:-2}
 CPUNODE=${CPUNODE:-0}
 NT=${NT:-"4x1 8x1 16x1 32x1 4x3 8x3 16x3"}
 OWN_NT=${OWN_NT:-"4x1 8x1 16x1 32x1 16x3"} # phase own
+LOCKS=${LOCKS:-"1 4 16 64 256"}             # phase locks
+LOCKS_NT=${LOCKS_NT:-"16x1 32x1"}
 RUN_TIMEOUT=${RUN_TIMEOUT:-120}
 WB=${WB:-clwb} # writeback instruction of the main configs (clflushopt for hosts without clwb)
 
@@ -158,6 +162,18 @@ p2b_own() {
   done; done
 }
 
+many_locks() {
+  # Phase 1 with L independent locks (each its own metadata lines, data block and,
+  # for servers, home = hash % N); contention per lock falls as L grows, so the
+  # uncontended paths (Lamport/hybrid/AK fast path) and per-lock footprint show.
+  local csv=$OUT/locks.csv; header "$csv"
+  for rep in $(seq "$REPS"); do for nt in $LOCKS_NT; do nt_split "$nt"
+    for l in $LOCKS; do for a in $ALL_ALGS; do for c in $MAIN_CFGS; do
+      run "$csv" "$rep" "$c" -a "$a" -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+    done; done; done
+  done; done
+}
+
 open_loop() {
   local csv=$OUT/open.csv; header "$csv"
   local rates=${RATES:-"25k 50k 100k 150k 200k 250k 300k 400k"}
@@ -190,6 +206,7 @@ for ph in $PHASES; do
     2a) p2a ;;
     2b) p2b ;;
     own) p2b_own ;;
+    locks) many_locks ;;
     base) base ;;
     open) open_loop ;;
     dram) dram ;;
