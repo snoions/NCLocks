@@ -9,6 +9,7 @@
 #   2b         Phase 2b cross-node handoff (-M handoff), gate algorithms + server chain
 #   base       coherent baselines: tournament and pthread (+ no-submutex) on CXL and DRAM
 #   open       open loop (Poisson) at N=16, T=1, offered load scaled to CXL capacity
+#   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms
 #   dram       main uc configs with metadata on DRAM: RELOAD THE DRIVER WITH nid=0 FIRST
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
@@ -145,6 +146,17 @@ base() {
   done; done
 }
 
+p2b_own() {
+  # --wait owner (design §3.3) vs own (grant in the waiter's announce line),
+  # interleaved; T=1 makes every handoff cross-node (docs/handoff.md).
+  local csv=$OUT/own.csv; header "$csv"
+  for rep in $(seq "$REPS"); do for nt in ${OWN_NT:-"4x1 8x1 16x1 32x1 16x3"}; do nt_split "$nt"
+    for a in lamport tournament hybrid ak; do for c in $MAIN_CFGS; do for w in owner own; do
+      run "$csv" "$rep" "$c" -a "$a" -n "$N" -t "$T" -M handoff --wait "$w" ${CFG[$c]} "${COMMON[@]}"
+    done; done; done
+  done; done
+}
+
 open_loop() {
   local csv=$OUT/open.csv; header "$csv"
   local rates=${RATES:-"25k 50k 100k 150k 200k 250k 300k 400k"}
@@ -176,6 +188,7 @@ for ph in $PHASES; do
     abl) abl ;;
     2a) p2a ;;
     2b) p2b ;;
+    own) p2b_own ;;
     base) base ;;
     open) open_loop ;;
     dram) dram ;;

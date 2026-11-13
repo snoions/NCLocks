@@ -86,10 +86,16 @@ foreach(alg lamport tournament hybrid ak)
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -G inside -X scan)
     add_test(NAME stress_${alg}_${be}_handoff_probe_cap1
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -X probe -K 1)
+    # Own-line wait (--wait own, docs/handoff.md): grant in the announce line.
+    add_test(NAME stress_${alg}_${be}_handoff_own_cap1
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff --wait own -K 1 --timeout 100)
+    add_test(NAME stress_${alg}_${be}_handoff_own_lazy
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 3 -l 2 -i 10000 -M handoff --wait own -G lazy -H --timeout 100)
     if(be STREQUAL "uc")
       set_tests_properties(stress_${alg}_uc_handoff stress_${alg}_uc_handoff_lazy_cap1
         stress_${alg}_uc_handoff_cap1 stress_${alg}_uc_handoff_inside_scan
-        stress_${alg}_uc_handoff_probe_cap1
+        stress_${alg}_uc_handoff_probe_cap1 stress_${alg}_uc_handoff_own_cap1
+        stress_${alg}_uc_handoff_own_lazy
         PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
     endif()
   endforeach()
@@ -108,6 +114,13 @@ add_test(NAME stress_tournament_cached-flush_probe_handoff_scan
   COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff -X scan -K 1 -Q probe)
 add_test(NAME stress_tournament_cached-flush_batch_handoff_scan
   COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff -X scan -K 1)
+add_test(NAME stress_tournament_cached-flush_handoff_own_n8
+  COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff --wait own -K 1 --timeout 100)
+add_test(NAME wait_own_rejects_server
+  COMMAND ncl_stress -a server -b emu -M handoff --wait own)
+add_test(NAME wait_own_rejects_phase1
+  COMMAND ncl_stress -a tournament -b emu --wait own)
+set_tests_properties(wait_own_rejects_server wait_own_rejects_phase1 PROPERTIES WILL_FAIL TRUE)
 add_test(NAME handoff_rejects_fastsrv
   COMMAND ncl_stress -a fastsrv -b emu -M handoff)
 set_tests_properties(handoff_rejects_fastsrv PROPERTIES WILL_FAIL TRUE)
@@ -161,6 +174,16 @@ foreach(be emu uc)
       COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff -K 1 -X scan --timeout 100)
     list(APPEND split_tests_${be} stress_${alg}_${be}_split_handoff_cap1)
   endforeach()
+  # Own-line wait on the split layout: the grant is a cached store into the
+  # waiter's announce line (two writers, causally ordered).
+  foreach(alg lamport tournament hybrid ak)
+    add_test(NAME stress_${alg}_${be}_split_handoff_own_cap1
+      COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff --wait own -K 1 --timeout 100)
+    list(APPEND split_tests_${be} stress_${alg}_${be}_split_handoff_own_cap1)
+  endforeach()
+  add_test(NAME stress_tournament_${be}_split_handoff_own_n8_probe
+    COMMAND ncl_stress -a tournament -b ${be} -U split -n 8 -t 1 -l 1 -i 20000 -M handoff --wait own -X probe --timeout 100)
+  list(APPEND split_tests_${be} stress_tournament_${be}_split_handoff_own_n8_probe)
   add_test(NAME stress_hybrid_${be}_split_n8_batch
     COMMAND ncl_stress -a hybrid -b ${be} -U split -n 8 -t 2 -l 2 -i 10000 -Q batch --timeout 100)
   add_test(NAME stress_lamport_${be}_split_local

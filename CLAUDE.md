@@ -74,7 +74,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   `-M handoff` is a holder-to-waiter chain instead: the server publishes each request's
   predecessor in a per-lock `succ[]` ring, and the holder passes the lock by writing the
   successor's grant slot (REL to the server only when it finds none; hint bit in the grant,
-  `-X scan` = always read; window `-R`, default 4N). (e) is rejected. Not
+  `-X scan` = always read; window `-R`, default 4N). (e) is rejected. `--wait own`
+  (gate algorithms): waiters poll a grant word in their own announce line instead of the
+  shared `owner` (hot spot on CXL, `docs/cxl_results.md`); default `owner`. Not
   model-checked; notes and
   measurements in `docs/handoff.md`. Includes the no-submutex ablation and full or precise data
   writeback.

@@ -202,6 +202,56 @@ store, a fence, and the clear. It wins at moderate load on both backends, becaus
 announcements halve (600k: 0.08-0.15 vs 0.18-0.26 per acquisition). Most importantly, it
 never falls into gate mode. The lazy measurements above remain valid for uc.
 
+## Own-line wait (`--wait own`)
+
+**Why.** On the CXL host, with T=1, every gate algorithm loses 2b throughput roughly as
+1/N (tournament on uc: 229k at 4 nodes, 38k at 32, against 359k in Phase 1). The handoff
+interval equals owner polls per acquisition × ~420 ns: the device serves the one shared
+`owner` line one access at a time, so the releaser's store and the new owner's load queue
+behind the other waiters' polls. A larger `-B` helps up to a point, then the new owner
+notices late (`docs/cxl_results.md`, "Backoff check"). The server chain does not have
+this problem, because each waiter polls its own grant slot.
+
+**Protocol** (`cfg.handoff_wait = NCL_WAIT_OWN`; default `owner` = design §3.3):
+- **Announce:** the announce word (word 0 of node j's `announce[]` line) holds a fresh
+  per-node sequence number `s` (`ncl_local_lock.ann_seq`, never 0) instead of 1.
+- **Release:** `pick_waiter` also returns the word it read (`ncl_uc_scan_first_v`). After
+  `owner = j`, the releaser fences and stores `s` into word 1 of j's line (the grant).
+  The fence is full when the line is cached (split scan region, cached-flush), because a
+  `clwb`/`clflushopt` writeback is not ordered after an earlier UC store. It is a
+  store-store fence when the line is uncached.
+- **Wait:** poll word 1 of the own line until it equals `s`. Every `NCL_OWNER_RECHECK` (16)
+  polls, also read `owner`: FREE = missed announcement (back through the gate, as before),
+  me = handoff.
+- **Grant before clear:** a waiter that learns of its handoff from `owner` (in the gate or
+  on a recheck) waits for its grant before clearing its announce (`grant_waits`).
+- **Order of writes to the shared line:** the waiter's announce, the releaser's read of
+  it, the releaser's grant, the waiter's read of the grant, the waiter's clear. No two
+  stores to the line overlap, so on the split layout neither node's whole-line writeback
+  can clobber the other word. The releaser's copy is current: it read the line after an
+  invalidate, and the waiter does not write it until it sees the grant.
+- **Stale grants:** a grant from an earlier acquisition holds an older sequence number
+  and is ignored.
+- **Cost:** one more metadata store per cross-node handoff, plus a fence. In exchange, the
+  owner line sees only gate traffic and rechecks.
+
+**Safety** is unchanged: `owner` is written exactly as before, and the grant only lets a
+waiter stop polling earlier than an `owner == me` read would. Liveness: an announce lost
+to a missing writeback or invalidate only causes FREE handoffs (the waiter recovers via
+the recheck), so `--skip-meta-wb`/`--skip-meta-inv` do not make it fail. emu copies words,
+not whole lines, so it cannot show the clobber that grant-before-clear prevents; that part
+rests on the ordering argument above. Not model-checked.
+
+**Dev box** (uc split, T=1, 200 ns CS, `-B 16`, 3 reps; DRAM-backed UC, no hot spot):
+`own` vs `owner`: tournament 922k / 830k (N=4), 841k / 813k (N=8); Lamport 911k / 838k,
+870k / 816k; hybrid 903k / 852k, 859k / 819k. Fairness is 1.0, owner polls per
+acquisition drop from ~2N to under 0.2, and grant polls are ~2N.
+
+**Tests:** `stress_{lamport,tournament,hybrid,ak}_{emu,uc}_handoff_own_{cap1,lazy}`,
+`..._split_handoff_own_cap1`, `stress_tournament_{emu,uc}_split_handoff_own_n8_probe`,
+`stress_tournament_cached-flush_handoff_own_n8`, `wait_own_rejects_{server,phase1}`.
+CSV columns `wait`, `grant_polls_per_acq`.
+
 ## (c) lock server: holder-to-waiter chain (`-a server -M handoff`)
 
 In Phase 1, a contended (c) handoff is two hops through the server: the holder sends REL,

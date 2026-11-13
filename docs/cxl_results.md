@@ -111,16 +111,29 @@ contenders and they spin on different lines. The server chain does not see it ei
 because every waiter polls its own grant slot (the MCS local-spinning argument, now on a
 memory device).
 
-Cheap checks:
-1. `-M handoff -a tournament -n 16 -B {16,64,256,1024}`. If the owner line is the
-   bottleneck, throughput rises with -B until the poll interval exceeds the handoff time.
-2. Add an `ncl_memlat` row: the latency of a store, then a load to a line that K other
-   threads poll in UC.
+**Backoff check** (tournament, uc split clwb, T=1, 3 reps, spread below 2%):
 
-Fix candidates, which are design changes (§3.3 says waiters poll `owner` directly):
-- proportional backoff;
-- polling one's own announce line for the handoff, with the owner field kept for the
-  gate path.
+| -B | 2b 16x1 k/s (owner polls/acq) | 2b 32x1 | Phase 1 16x1 / 32x1 |
+|---|---|---|---|
+| 16 | 74.8 (31.0) | 38.2 (64.0) | 443 / 362 |
+| 64 | 78.1 (29.5) | 40.1 (60.8) | 443 / 369 |
+| 256 | 89.6 (25.4) | 44.8 (54.0) | 444 / 377 |
+| 1024 | **103.5** (21.0) | **61.5** (38.4) | 442 / 380 |
+| 4096 | 57.8 (18.8) | 56.8 (25.5) | 439 / 383 |
+
+The check supports the hypothesis. Up to `-B 1024`, the handoff interval (1/throughput)
+equals owner polls per acquisition × 420-460 ns at both N. The owner line serves one
+access at a time, and every handoff waits behind all queued polls. Slower polling helps,
+by +38% at 16 nodes and +61% at 32. At 4096 pauses the polls no longer saturate the line
+(~900 ns per poll), but the new owner notices its handoff late, so throughput drops again.
+That is the classic global-spinning trade-off. Even at its best, tournament-2b stays at
+23% of Phase 1 at 16 nodes and 16% at 32, and far below the server chain (351k / 320k).
+**Backoff tuning cannot fix this. The waiters must stop sharing a polled line.**
+
+Fix, implemented as option `--wait own` (`docs/handoff.md`, "Own-line wait"): the
+releaser writes `owner = j`, then a grant word in j's own announce line. Waiters poll
+that line and re-read `owner` only every 16th poll. It is not yet measured on this host:
+`scripts/cxl_sweep.sh own`.
 
 ## Open loop (Poisson, N=16, T=1)
 

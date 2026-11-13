@@ -234,24 +234,41 @@ static inline int ncl_meta_cached(const ncl_line_t *l)
            (uintptr_t)l - ncl_mem.cm_lo < ncl_mem.cm_len;
 }
 
-/* EMU split: the device copy of a scan-region line's word. */
-static inline _Atomic uint64_t *ncl__emu_dev(const ncl_line_t *l)
+/* Word k of a metadata line. Word 0 is the line's variable (ncl_line_t.v).
+ * Only the 2b own-line wait (`--wait own`, docs/handoff.md) uses word 1: it
+ * puts a node's grant next to its announce word, a line with two writers whose
+ * stores are causally ordered (never concurrent), so a whole-line writeback
+ * cannot clobber the other word. */
+#define NCL_LINE_WORDS 2 /* words in use per line (EMU copies these on invalidate) */
+static inline _Atomic uint64_t *ncl__word(const ncl_line_t *l, int k)
 {
-    return (_Atomic uint64_t *)((uintptr_t)&l->v - (uintptr_t)ncl_mem.scan + (uintptr_t)ncl_mem.scan_dev);
+    return (_Atomic uint64_t *)((uintptr_t)&l->v + (uintptr_t)k * sizeof(uint64_t));
 }
 
+/* EMU split: the device copy of word k of a scan-region line. */
+static inline _Atomic uint64_t *ncl__emu_dev_w(const ncl_line_t *l, int k)
+{
+    return (_Atomic uint64_t *)((uintptr_t)ncl__word(l, k) - (uintptr_t)ncl_mem.scan +
+                                (uintptr_t)ncl_mem.scan_dev);
+}
+static inline _Atomic uint64_t *ncl__emu_dev(const ncl_line_t *l) { return ncl__emu_dev_w(l, 0); }
+
 /* Issue an invalidate of a cached metadata line (no fence). EMU refreshes the
- * private copy from the device. Each line holds one word (ncl_line_t); the
- * pad is never written, so copying the word is copying the line. */
+ * private copy from the device. Lines hold one word (ncl_line_t), two for the
+ * own-line wait; the rest of the pad is never written, so copying the words in
+ * use is copying the line. */
 static inline void ncl__meta_inv(ncl_line_t *l)
 {
     if (NCL_UNLIKELY(ncl_mem.debug_skip_meta_inv) && ncl_mem.split)
         return;
-    if (ncl_mem.backend == NCL_BACKEND_EMU)
-        atomic_store_explicit(&l->v, atomic_load_explicit(ncl__emu_dev(l), memory_order_relaxed),
-                              memory_order_relaxed);
-    else
+    if (ncl_mem.backend == NCL_BACKEND_EMU) {
+        for (int k = 0; k < NCL_LINE_WORDS; k++)
+            atomic_store_explicit(ncl__word(l, k),
+                                  atomic_load_explicit(ncl__emu_dev_w(l, k), memory_order_relaxed),
+                                  memory_order_relaxed);
+    } else {
         ncl__flushopt(l);
+    }
 }
 
 /* Fence after invalidates, before the loads (EMU copies synchronously). */
@@ -263,7 +280,8 @@ static inline void ncl__meta_inv_fence(void)
 #endif
 }
 
-static inline uint64_t ncl_uc_load(ncl_line_t *l)
+/* Word k of line l (k < NCL_LINE_WORDS); ncl_uc_load/store use word 0. */
+static inline uint64_t ncl_uc_load_w(ncl_line_t *l, int k)
 {
     ncl_dev_delay();
     if (ncl_meta_cached(l)) {
@@ -271,13 +289,14 @@ static inline uint64_t ncl_uc_load(ncl_line_t *l)
         ncl__meta_inv(l);
         ncl__meta_inv_fence();
     }
-    return atomic_load_explicit(&l->v, memory_order_relaxed);
+    return atomic_load_explicit(ncl__word(l, k), memory_order_relaxed);
 }
+static inline uint64_t ncl_uc_load(ncl_line_t *l) { return ncl_uc_load_w(l, 0); }
 
-static inline void ncl_uc_store(ncl_line_t *l, uint64_t v)
+static inline void ncl_uc_store_w(ncl_line_t *l, int k, uint64_t v)
 {
     ncl_dev_delay();
-    atomic_store_explicit(&l->v, v, memory_order_relaxed);
+    atomic_store_explicit(ncl__word(l, k), v, memory_order_relaxed);
     if (ncl_meta_cached(l)) {
         /* Write back so other nodes can see it. EMU stores the VALUE to the
          * device (not a re-read of the private copy): a same-node thread's
@@ -287,11 +306,12 @@ static inline void ncl_uc_store(ncl_line_t *l, uint64_t v)
         if (NCL_UNLIKELY(ncl_mem.debug_skip_meta_wb) && ncl_mem.split)
             return;
         if (ncl_mem.backend == NCL_BACKEND_EMU)
-            atomic_store_explicit(ncl__emu_dev(l), v, memory_order_relaxed);
+            atomic_store_explicit(ncl__emu_dev_w(l, k), v, memory_order_relaxed);
         else
             ncl__wb(l);
     }
 }
+static inline void ncl_uc_store(ncl_line_t *l, uint64_t v) { ncl_uc_store_w(l, 0, v); }
 
 /* ---- batched metadata reads -------------------------------------------- */
 
@@ -342,12 +362,13 @@ static inline void ncl_uc_load_many(ncl_line_t *const *ls, int n, uint64_t *out)
     }
 }
 
-/* First j = (start + k) % n, k < count, j != skip, with arr[j] != 0; -1 if none.
+/* First j = (start + k) % n, k < count, j != skip, with arr[j] != 0 (*val = arr[j]); -1 if none.
  * Serial backends stop at the first hit; batched reads all candidates.
  * *nloads += metadata loads issued. */
-static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count, int skip,
-                                    uint64_t *nloads)
+static inline int ncl_uc_scan_first_v(ncl_line_t *arr, int n, int start, int count, int skip,
+                                      uint64_t *nloads, uint64_t *val)
 {
+    uint64_t x;
     if (ncl_meta_batching_for(arr)) {
         ncl_line_t *ls[NCL_MAX_PARTICIPANTS];
         int idx[NCL_MAX_PARTICIPANTS];
@@ -359,8 +380,10 @@ static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count
                 if (j == skip)
                     continue;
                 ++*nloads;
-                if (ncl_uc_load(&arr[j]))
+                if ((x = ncl_uc_load(&arr[j]))) {
+                    *val = x;
                     return j;
+                }
                 k0++;
                 break;
             }
@@ -377,8 +400,10 @@ static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count
         ncl_uc_load_many(ls, m, v);
         *nloads += (uint64_t)m;
         for (int k = 0; k < m; k++)
-            if (v[k])
+            if (v[k]) {
+                *val = v[k];
                 return idx[k];
+            }
         return -1;
     }
     for (int k = 0; k < count; k++) {
@@ -386,10 +411,20 @@ static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count
         if (j == skip)
             continue;
         ++*nloads;
-        if (ncl_uc_load(&arr[j]))
+        if ((x = ncl_uc_load(&arr[j]))) {
+            *val = x;
             return j;
+        }
     }
     return -1;
+}
+
+/* Same, without the value. */
+static inline int ncl_uc_scan_first(ncl_line_t *arr, int n, int start, int count, int skip,
+                                    uint64_t *nloads)
+{
+    uint64_t v;
+    return ncl_uc_scan_first_v(arr, n, start, count, skip, nloads, &v);
 }
 
 /* ---- protected data (cached) ------------------------------------------- */

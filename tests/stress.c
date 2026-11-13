@@ -226,6 +226,7 @@ static void usage(const char *argv0)
             "  -G PLACE      handoff: announce before (default) | inside | lazy\n"
             "  -X PICK       handoff: pick_waiter adaptive (default) | scan | probe\n"
             "                (server: adaptive = follow the grant's hint bit, scan = always read succ[])\n"
+            "  --wait W      handoff, gate algorithms: poll owner (default) | own (own line)\n"
             "  -R LINES      server handoff: chain window, power of two (default 4N rounded up)\n"
             "  -O on|off     handoff: overlap release data writeback with its loads (default on)\n"
             "  -U LAYOUT     metadata layout: uniform (default) | split (scanned arrays in a\n"
@@ -262,6 +263,7 @@ int main(int argc, char **argv)
         {"mem-node", required_argument, 0, 1001},
         {"cpus", required_argument, 0, 1002},
         {"wb", required_argument, 0, 1003},
+        {"wait", required_argument, 0, 1004},
         {"skip-wb", no_argument, 0, 1},
         {"skip-inv", no_argument, 0, 2},
         {"skip-meta-wb", no_argument, 0, 3},
@@ -353,6 +355,11 @@ int main(int argc, char **argv)
         case 1003:
             if (!strcmp(optarg, "clwb")) { if (ncl_wb_mode_set(NCL_WB_CLWB) < 0) return 2; }
             else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
+            break;
+        case 1004:
+            if (!strcmp(optarg, "own")) cfg.handoff_wait = NCL_WAIT_OWN;
+            else if (!strcmp(optarg, "owner")) cfg.handoff_wait = NCL_WAIT_OWNER;
+            else { fprintf(stderr, "--wait: owner|own\n"); return 2; }
             break;
         case 1: cfg.debug_skip_data_wb = 1; break;
         case 2: cfg.debug_skip_data_inv = 1; break;
