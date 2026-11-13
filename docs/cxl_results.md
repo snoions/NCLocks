@@ -161,9 +161,24 @@ below 5%. The worst spread is lamport own cf at 16x1, 39%.
   acquisition), so the every-16th-poll rechecks still put 25-32 owner loads on each
   acquisition, ~13 us of owner-line time per handoff. The fixed recheck interval
   reintroduces the hot spot whenever waits are long. The doubling interval (now the
-  default) bounds this to O(log wait). It still needs to be measured.
-- **Still below the alternatives at T=1.** Tournament-2b with `own` (uc 233k / 185k at
-  16 / 32 nodes) stays below both Phase 1 (438k / 359k) and the server chain (351k /
+  default) bounds this to O(log wait); see below.
+- **Doubling re-read** (`results/cxl_20261113_0423/own.csv`, same sweep; `owner` mode as
+  the control matches the run above within ±6.5%, mean −0.2%). Owner polls per
+  acquisition with `own` fall to 2-4.6 at 32 nodes, from 3.6-32 with the fixed interval:
+
+  | `own`, cf / uc | fixed every 16th | doubling |
+  |---|---|---|
+  | lamport 16x1 | 155 / 90 | **210 / 124** (+36-38%) |
+  | lamport 32x1 | 44 / 32 | **65 / 46** (+42-47%) |
+  | tournament 32x1 | 246 / 185 | **290 / 222** (+18-20%; lock p99 147 → 115-147 us) |
+  | hybrid / ak 32x1 | 243 / 174, 183 / 127 | 254 / 180, 188 / 131 (+3-4%) |
+
+  Everything else is unchanged within noise (±5%), fairness is 1.0, and there are no
+  missed announces. Lamport at 32 nodes is still slow (45-65k). Its owner traffic is now
+  small (4.6 loads per acquisition), so the remaining cost is its gate and ~420 grant
+  polls per wait, not the owner line.
+- **Still below the alternatives at T=1.** Tournament-2b with `own` (uc 240k / 222k at
+  16 / 32 nodes, doubling) stays below both Phase 1 (438k / 359k) and the server chain (351k /
   320k). The gate, announce and grant cost more than they save when every handoff
   crosses nodes.
 

@@ -254,8 +254,9 @@ acquisition drop from ~2N to under 0.2, and grant polls are ~2N.
 
 **CXL host** (fixed every-16th recheck, `docs/cxl_results.md`): with T=1, `own` removes the
 1/N collapse for tournament, hybrid and AK, at 2.4-6x `owner`'s throughput at 32 nodes,
-fairness 1.0. With local handoff (16x3) it adds 10-22%. The doubling recheck targets the
-Lamport case and is not yet measured there.
+fairness 1.0. With local handoff (16x3) it adds 10-22%. The doubling recheck adds +36-47% for Lamport
+at 16-32 nodes and +18-20% for the tournament at 32, and leaves the rest unchanged
+(`results/cxl_20261113_0423/`).
 
 **Tests:** all `-M handoff` gate tests run `own` (the default), including the split
 layout (`..._split_handoff_own_cap1`, `stress_tournament_{emu,uc}_split_handoff_own_n8_probe`,
