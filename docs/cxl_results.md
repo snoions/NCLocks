@@ -130,9 +130,10 @@ That is the classic global-spinning trade-off. Even at its best, tournament-2b s
 23% of Phase 1 at 16 nodes and 16% at 32, and far below the server chain (351k / 320k).
 **Backoff tuning cannot fix this. The waiters must stop sharing a polled line.**
 
-Fix, implemented as option `--wait own` (`docs/handoff.md`, "Own-line wait"): the
-releaser writes `owner = j`, then a grant word in j's own announce line. Waiters poll
-that line and re-read `owner` only every 16th poll.
+Fix, `--wait own` (`docs/handoff.md`, "Own-line wait"; now the default): the releaser
+writes `owner = j`, then a grant word in j's own announce line. Waiters poll that line.
+In the version measured below they re-read `owner` every 16th poll. The interval now
+doubles after each re-read (16, 32, 64, ...) because of the Lamport result below.
 
 **`--wait own` vs `owner`** (`results/cxl_20261113_0334/own.csv`, 3 reps, medians;
 k acq/s, cf / uc split):
@@ -159,8 +160,8 @@ below 5%. The worst spread is lamport own cf at 16x1, 39%.
 - **Lamport at 32 nodes does not improve.** Its waits are long (406-523 grant polls per
   acquisition), so the every-16th-poll rechecks still put 25-32 owner loads on each
   acquisition, ~13 us of owner-line time per handoff. The fixed recheck interval
-  reintroduces the hot spot whenever waits are long. A recheck interval that grows with
-  the time already waited would bound this.
+  reintroduces the hot spot whenever waits are long. The doubling interval (now the
+  default) bounds this to O(log wait). It still needs to be measured.
 - **Still below the alternatives at T=1.** Tournament-2b with `own` (uc 233k / 185k at
   16 / 32 nodes) stays below both Phase 1 (438k / 359k) and the server chain (351k /
   320k). The gate, announce and grant cost more than they save when every handoff

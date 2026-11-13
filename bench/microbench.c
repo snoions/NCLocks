@@ -357,8 +357,8 @@ static void usage(const char *argv0)
             "              was uncontended, else scan; default) | scan (spec) | probe.\n"
             "              server: adaptive = read succ[] only if the grant's hint bit is set;\n"
             "              scan = always read\n"
-            "  --wait W    handoff, gate algorithms: waiters poll the shared owner word (owner,\n"
-            "              default) or their own announce line, granted by the releaser (own)\n"
+            "  --wait W    handoff, gate algorithms: waiters poll their own announce line, granted\n"
+            "              by the releaser (own, default) or the shared owner word (owner)\n"
             "  -R LINES    server handoff: chain window = succ[] lines per lock (power of two;\n"
             "              default 4N rounded up)\n"
             "  -O on|off   handoff: overlap the release's data writeback with its loads (on)\n"
@@ -404,6 +404,7 @@ int main(int argc, char **argv)
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
+    int wait_set = 0;
     while ((c = getopt_long(argc, argv, "n:t:l:a:b:L:s:W:c:T:f:r:A:S:M:K:B:Y:F:G:X:R:Q:O:U:mCHPh", lopts,
                             NULL)) != -1) {
         switch (c) {
@@ -496,6 +497,7 @@ int main(int argc, char **argv)
             if (!strcmp(optarg, "own")) cfg.handoff_wait = NCL_WAIT_OWN;
             else if (!strcmp(optarg, "owner")) cfg.handoff_wait = NCL_WAIT_OWNER;
             else { fprintf(stderr, "--wait: owner|own\n"); return 2; }
+            wait_set = 1;
             break;
         case 'S': cfg.server_backoff_cap = (unsigned)atoi(optarg); break;
         case 'Y':
@@ -510,6 +512,11 @@ int main(int argc, char **argv)
             break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;
         }
+    }
+    if (wait_set && (cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER)) {
+        fprintf(stderr, "--wait applies to -M handoff with a gate algorithm (lamport, tournament, "
+                        "hybrid, ak); the server chain already waits on its own slot\n");
+        return 2;
     }
     if (rate > 0 && !arrival_given)
         arrival = ARR_POISSON;

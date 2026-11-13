@@ -6,7 +6,7 @@
 #   p1         Phase 1, closed loop, every algorithm, main configs, all (N,T)
 #   abl        Phase 1 ablation: uc uniform + clflushopt (the dev-box default), N=8,16
 #   2a         Phase 2a local handoff (-M local), T=3
-#   2b         Phase 2b cross-node handoff (-M handoff), gate algorithms + server chain
+#   2b         Phase 2b cross-node handoff (-M handoff, default --wait own), gate algorithms + server chain
 #   base       coherent baselines: tournament and pthread (+ no-submutex) on CXL and DRAM
 #   open       open loop (Poisson) at N=16, T=1, offered load scaled to CXL capacity
 #   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms

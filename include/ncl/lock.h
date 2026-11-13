@@ -41,8 +41,9 @@
  *                     this node's own acquisition was uncontended, else scans
  *                     (ADAPTIVE, default); always scans (SCAN, spec); always
  *                     probes (PROBE; collapses at moderate load).
- *                     cfg.handoff_wait (NCL_WAIT_*): waiters poll owner
- *                     (OWNER, default) or their own announce line (OWN).
+ *                     cfg.handoff_wait (NCL_WAIT_*): waiters poll their own
+ *                     announce line, granted by the releaser (OWN, default),
+ *                     or the owner word (OWNER).
  *                     SERVER ("chain", design §4c variant, see docs/handoff.md):
  *                     the home server assigns each REQ a grant number and
  *                     publishes the successor of number n-1 in an uncached
@@ -97,18 +98,20 @@ enum { NCL_ANNOUNCE_BEFORE = 0, NCL_ANNOUNCE_INSIDE = 1, NCL_ANNOUNCE_LAZY = 2 }
 enum { NCL_PICK_ADAPTIVE = 0, NCL_PICK_SCAN = 1, NCL_PICK_PROBE = 2 }; /* 0 = default */
 
 /* How MODE_HANDOFF waiters learn of a handoff (gate algorithms; docs/handoff.md).
- * OWNER (default, design §3.3): poll the shared owner word. All N-1 waiters
- * poll one line, and on the CXL host every handoff queues behind their polls
- * (docs/cxl_results.md). OWN: the announce word carries a per-node sequence
- * number; the releaser stores owner = j, fences, then copies j's sequence into
- * word 1 of j's announce line (the grant). Waiters poll their own line and
- * re-read owner only every NCL_OWNER_RECHECK polls (a missed announce leaves
- * owner FREE). A waiter that learns of its handoff from owner instead waits for
- * the grant before clearing its announce, so stores to the shared line never
- * overlap. */
-enum { NCL_WAIT_OWNER = 0, NCL_WAIT_OWN = 1 }; /* 0 = default */
+ * OWN (default): the announce word carries a per-node sequence number; the
+ * releaser stores owner = j, fences, then copies j's sequence into word 1 of
+ * j's announce line (the grant). Waiters poll their own line and re-read owner
+ * (a missed announce leaves it FREE) after NCL_OWNER_RECHECK polls, then after
+ * twice as many each time, so owner loads per wait grow as log(wait). A waiter
+ * that learns of its handoff from owner instead waits for the grant before
+ * clearing its announce, so stores to the shared line never overlap.
+ * OWNER (design §3.3 as first specified): poll the shared owner word. All N-1
+ * waiters poll one line, and on the CXL host every handoff queues behind their
+ * polls, so throughput falls as 1/N (docs/cxl_results.md). Ignored outside
+ * MODE_HANDOFF and by the server chain. */
+enum { NCL_WAIT_OWN = 0, NCL_WAIT_OWNER = 1 }; /* 0 = default */
 #ifndef NCL_OWNER_RECHECK
-#define NCL_OWNER_RECHECK 16
+#define NCL_OWNER_RECHECK 16 /* polls before the first owner re-read */
 #endif
 
 #define NCL_SRV_CHAIN_MAX 128 /* max chain window (succ[] lines per lock) */
@@ -126,7 +129,7 @@ struct ncl_sys_cfg {
     int local_cap;          /* LOCAL/HANDOFF: max consecutive local handoffs (0 = 64) */
     int announce_place;     /* HANDOFF: announce placement (§3.5), NCL_ANNOUNCE_*; 0 = before */
     int pick_policy;        /* HANDOFF: pick_waiter policy, NCL_PICK_*; 0 = adaptive */
-    int handoff_wait;       /* HANDOFF, gate algorithms: NCL_WAIT_*; 0 = poll owner */
+    int handoff_wait;       /* HANDOFF, gate algorithms: NCL_WAIT_*; 0 = own line */
     int chain_lines;        /* SERVER HANDOFF: succ[] ring = assignment window, power of
                                two in [2, NCL_SRV_CHAIN_MAX]; 0 = 4N rounded up */
     int meta_split;         /* 1: scanned arrays (b[], present[], announce[], server

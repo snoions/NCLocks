@@ -117,10 +117,8 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
                         "owner) and server (holder-to-waiter chain); not fastsrv (use -M local)\n");
         return -1;
     }
-    if (c->handoff_wait == NCL_WAIT_OWN &&
-        (c->mode != NCL_MODE_HANDOFF || c->alg == NCL_ALG_SERVER)) {
-        fprintf(stderr, "ncl: --wait own applies to -M handoff with a gate algorithm (lamport, "
-                        "tournament, hybrid, ak); the server chain already waits on its own slot\n");
+    if (c->handoff_wait != NCL_WAIT_OWN && c->handoff_wait != NCL_WAIT_OWNER) {
+        fprintf(stderr, "ncl: bad handoff_wait %d\n", c->handoff_wait);
         return -1;
     }
     if (c->chain_lines && (c->chain_lines < 2 || c->chain_lines > NCL_SRV_CHAIN_MAX ||
@@ -403,10 +401,15 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
          * 48 threads on 20 CPUs, 14 s without the yield vs 0.14 s Phase 1). */
         struct ncl_backoff bo;
         ncl_backoff_init(&bo);
-        unsigned spun = 0, polls = 0;
+        unsigned spun = 0;
+        uint64_t polls = 0, recheck = NCL_OWNER_RECHECK;
         for (;;) {
-            /* WAIT_OWN: poll our own line; the shared owner word only every
-             * NCL_OWNER_RECHECK polls, to notice FREE after a missed announce. */
+            /* WAIT_OWN: poll our own line. Re-read the shared owner word (to
+             * notice FREE after a missed announce) at poll NCL_OWNER_RECHECK,
+             * then at twice as many each time: O(log wait) owner loads per
+             * wait, and a miss is noticed within twice the time already
+             * waited. A fixed interval rebuilt the hot spot whenever waits
+             * were long (Lamport at 32 nodes, docs/cxl_results.md). */
             if (own) {
                 h->grant_polls++;
                 if (ncl_uc_load_w(ann, 1) == aval) {
@@ -416,7 +419,8 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
                     goto acquired;
                 }
             }
-            if (!own || ++polls % NCL_OWNER_RECHECK == 0) {
+            if (!own || ++polls == recheck) {
+                recheck *= 2;
                 o = ncl_uc_load(L->owner);
                 h->owner_polls++;
                 check_owner(o);

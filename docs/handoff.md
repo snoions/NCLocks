@@ -202,7 +202,7 @@ store, a fence, and the clear. It wins at moderate load on both backends, becaus
 announcements halve (600k: 0.08-0.15 vs 0.18-0.26 per acquisition). Most importantly, it
 never falls into gate mode. The lazy measurements above remain valid for uc.
 
-## Own-line wait (`--wait own`)
+## Own-line wait (`--wait own`, default)
 
 **Why.** On the CXL host, with T=1, every gate algorithm loses 2b throughput roughly as
 1/N (tournament on uc: 229k at 4 nodes, 38k at 32, against 359k in Phase 1). The handoff
@@ -212,7 +212,8 @@ behind the other waiters' polls. A larger `-B` helps up to a point, then the new
 notices late (`docs/cxl_results.md`, "Backoff check"). The server chain does not have
 this problem, because each waiter polls its own grant slot.
 
-**Protocol** (`cfg.handoff_wait = NCL_WAIT_OWN`; default `owner` = design §3.3):
+**Protocol** (`cfg.handoff_wait = NCL_WAIT_OWN`, the default since the CXL measurements
+below; `--wait owner` = design §3.3 as first specified):
 - **Announce:** the announce word (word 0 of node j's `announce[]` line) holds a fresh
   per-node sequence number `s` (`ncl_local_lock.ann_seq`, never 0) instead of 1.
 - **Release:** `pick_waiter` also returns the word it read (`ncl_uc_scan_first_v`). After
@@ -220,9 +221,13 @@ this problem, because each waiter polls its own grant slot.
   The fence is full when the line is cached (split scan region, cached-flush), because a
   `clwb`/`clflushopt` writeback is not ordered after an earlier UC store. It is a
   store-store fence when the line is uncached.
-- **Wait:** poll word 1 of the own line until it equals `s`. Every `NCL_OWNER_RECHECK` (16)
-  polls, also read `owner`: FREE = missed announcement (back through the gate, as before),
-  me = handoff.
+- **Wait:** poll word 1 of the own line until it equals `s`. After `NCL_OWNER_RECHECK`
+  (16) polls, and then after twice as many each time (16, 32, 64, ...), also read
+  `owner`: FREE = missed announcement (back through the gate, as before), me = handoff.
+  So a wait costs O(log wait) owner loads, and a miss is noticed within twice the time
+  already waited. The first version re-read every 16th poll. On the CXL host that rebuilt
+  the hot spot whenever waits were long: Lamport at 32 nodes made 25-32 owner loads per
+  acquisition and gained nothing.
 - **Grant before clear:** a waiter that learns of its handoff from `owner` (in the gate or
   on a recheck) waits for its grant before clearing its announce (`grant_waits`).
 - **Order of writes to the shared line:** the waiter's announce, the releaser's read of
@@ -247,9 +252,16 @@ rests on the ordering argument above. Not model-checked.
 870k / 816k; hybrid 903k / 852k, 859k / 819k. Fairness is 1.0, owner polls per
 acquisition drop from ~2N to under 0.2, and grant polls are ~2N.
 
-**Tests:** `stress_{lamport,tournament,hybrid,ak}_{emu,uc}_handoff_own_{cap1,lazy}`,
-`..._split_handoff_own_cap1`, `stress_tournament_{emu,uc}_split_handoff_own_n8_probe`,
-`stress_tournament_cached-flush_handoff_own_n8`, `wait_own_rejects_{server,phase1}`.
+**CXL host** (fixed every-16th recheck, `docs/cxl_results.md`): with T=1, `own` removes the
+1/N collapse for tournament, hybrid and AK, at 2.4-6x `owner`'s throughput at 32 nodes,
+fairness 1.0. With local handoff (16x3) it adds 10-22%. The doubling recheck targets the
+Lamport case and is not yet measured there.
+
+**Tests:** all `-M handoff` gate tests run `own` (the default), including the split
+layout (`..._split_handoff_own_cap1`, `stress_tournament_{emu,uc}_split_handoff_own_n8_probe`,
+`stress_tournament_cached-flush_handoff_own_n8`). `owner` is covered by
+`stress_{lamport,tournament,hybrid,ak}_{emu,uc}_handoff_owner_{cap1,lazy}` and
+`stress_hybrid_{emu,uc}_split_handoff_owner_cap1`. Also `wait_rejects_{server,phase1}`.
 CSV columns `wait`, `grant_polls_per_acq`.
 
 ## (c) lock server: holder-to-waiter chain (`-a server -M handoff`)

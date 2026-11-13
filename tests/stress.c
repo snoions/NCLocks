@@ -226,7 +226,7 @@ static void usage(const char *argv0)
             "  -G PLACE      handoff: announce before (default) | inside | lazy\n"
             "  -X PICK       handoff: pick_waiter adaptive (default) | scan | probe\n"
             "                (server: adaptive = follow the grant's hint bit, scan = always read succ[])\n"
-            "  --wait W      handoff, gate algorithms: poll owner (default) | own (own line)\n"
+            "  --wait W      handoff, gate algorithms: own (own line, default) | owner (poll owner)\n"
             "  -R LINES      server handoff: chain window, power of two (default 4N rounded up)\n"
             "  -O on|off     handoff: overlap release data writeback with its loads (default on)\n"
             "  -U LAYOUT     metadata layout: uniform (default) | split (scanned arrays in a\n"
@@ -275,6 +275,7 @@ int main(int argc, char **argv)
         {0, 0, 0, 0},
     };
     int c;
+    int wait_set = 0;
     while ((c = getopt_long(argc, argv, "n:t:l:i:w:d:a:b:L:M:K:F:G:X:R:Q:O:U:mHph", lopts, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
@@ -360,11 +361,17 @@ int main(int argc, char **argv)
             if (!strcmp(optarg, "own")) cfg.handoff_wait = NCL_WAIT_OWN;
             else if (!strcmp(optarg, "owner")) cfg.handoff_wait = NCL_WAIT_OWNER;
             else { fprintf(stderr, "--wait: owner|own\n"); return 2; }
+            wait_set = 1;
             break;
         case 1: cfg.debug_skip_data_wb = 1; break;
         case 2: cfg.debug_skip_data_inv = 1; break;
         default: usage(argv[0]); return c == 'h' ? 0 : 2;
         }
+    }
+    if (wait_set && (cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER)) {
+        fprintf(stderr, "--wait applies to -M handoff with a gate algorithm (lamport, tournament, "
+                        "hybrid, ak); the server chain already waits on its own slot\n");
+        return 2;
     }
     if (nwords < 1 || nlocks < 1 || nthreads < 1) {
         usage(argv[0]);
