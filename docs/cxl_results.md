@@ -276,6 +276,35 @@ p99 drops by the same ~2.5x.
   disadvantage against cf comes from UC accesses having to go to CXL: each UC
   access pays the full CXL round trip, while cf's clwb keeps lines and overlaps
   writebacks (per-operation table above).
-- This phase is one lock only, so it does not test the uc throughput ceiling seen under
-  "Many locks". That needs the locks phase with the pool on DRAM: with `nid=0` loaded,
-  `MEMNODE=0 CFGS=uc_split_clwb LOCKS="16 256" scripts/cxl_sweep.sh locks`.
+
+### Many locks with UC metadata on DRAM
+
+`results/cxl_20261113_2101/locks.csv`: the locks phase with `MEMNODE=0
+CFGS=uc_split_clwb LOCKS="16 256"` (pool on node 0, checked per row), 84 runs, no errors,
+spread <=3%. k/s, then time per acquisition per thread (N / throughput) in us:
+
+| alg | DRAM uc 16x1 L=256 | DRAM uc 32x1 L=256 | CXL uc 16 / 32 | CXL cf 16 / 32 |
+|---|---|---|---|---|
+| tournament | 4355, 3.7 us | 7084, 4.5 us | 939 / 757 (17 / 42 us) | 2084 / 3364 (8 / 10 us) |
+| lamport | 8585, 1.9 | **15946, 2.0** | 2699 / 2458 (6 / 13) | 3890 / 7100 (4 / 4) |
+| hybrid | 4798, 3.3 | 8252, 3.9 | 1008 / 835 (16 / 38) | 2234 / 3574 (7 / 9) |
+| ak | 3465, 4.6 | 6543, 4.9 | 671 / 636 (24 / 50) | 1653 / 3069 (10 / 10) |
+| fastsrv | 4649, 3.4 | 7777, 4.1 | 1162 / 884 (14 / 36) | 2206 / 2249 (7 / 14) |
+| aksrv | 3440, 4.7 | 6329, 5.1 | 617 / 544 (26 / 59) | 1649 / 2223 (10 / 14) |
+| server | 8099, 2.0 | 12842, 2.5 | 2593 / 1997 (6 / 16) | 3095 / 2453 (5 / 13) |
+
+- **The uc ceiling is CXL-specific.** On DRAM, uc throughput nearly doubles from 16 to 32
+  nodes and the per-thread time stays flat (tournament 3.7 -> 4.5 us, Lamport 1.9 -> 2.0).
+  On CXL it doubles or triples instead. Since cf on CXL scales too, the limit is not
+  CXL bandwidth in general but **uncached accesses to the CXL device under concurrency**:
+  at 32 nodes, L=256, DRAM is 6-12x faster for uc versus 2.4-2.7x at one lock. A
+  candidate is that 8-byte UC stores reach the device as partial writes (`MemWrPtl`) that
+  it serves slowly or serially; untested (it would need device-side counters or a
+  memlat run with concurrent UC streams).
+- **With the ceiling gone, uc beats cf on CXL everywhere** (tournament 7.1M vs 3.4M,
+  Lamport 15.9M vs 7.1M at 32x1 L=256), and the many-locks ranking is the same as on CXL
+  cf: Lamport, then the server, at L=256; the server at L=16 (5.8M / 6.5M).
+- At L=16 Lamport is still the worst at 32 nodes (827k, p99 tails), as on CXL.
+- **Server unfairness persists but is smaller:** 0.94 at 16x1 and 0.80 at 32x1, L=256
+  (CXL 0.78 / 0.64). It grows with load on the servers, so it is a server-side effect, not
+  a CXL one.
