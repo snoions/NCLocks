@@ -129,6 +129,10 @@ enum { NCL_WAIT_OWN = 0, NCL_WAIT_OWNER = 1 }; /* 0 = default */
  *           Adaptive: only when this node's last global acquisition of the
  *           lock waited (as -X adaptive); otherwise straight to the gate. */
 enum { NCL_HO_GRANT = 1, NCL_HO_CLEAR = 2, NCL_HO_SKIP = 4, NCL_HO_ALL = 7 };
+/* cfg.handoff_opts = NCL_HO_DEFAULT: resolved by ncl_sys_create to all options
+ * that apply (-M handoff, gate algorithm): grant needs --wait own, skip needs
+ * -G before; elsewhere none. 0 = none (also for zero-initialized configs). */
+#define NCL_HO_DEFAULT (-1)
 /* "none", "all" or a comma list of grant,clear,skip. 0 ok, -1 bad. */
 int ncl_ho_opts_parse(const char *s, int *out);
 /* "none" or the comma list; buf of at least 24 bytes. */
@@ -154,7 +158,7 @@ struct ncl_sys_cfg {
     int announce_place;     /* HANDOFF: announce placement (§3.5), NCL_ANNOUNCE_*; 0 = before */
     int pick_policy;        /* HANDOFF: pick_waiter policy, NCL_PICK_*; 0 = adaptive */
     int handoff_wait;       /* HANDOFF, gate algorithms: NCL_WAIT_*; 0 = own line */
-    int handoff_opts;       /* HANDOFF, gate algorithms: NCL_HO_* bits; 0 = none */
+    int handoff_opts;       /* HANDOFF, gate algorithms: NCL_HO_* bits; 0 = none; NCL_HO_DEFAULT */
     int chain_lines;        /* SERVER HANDOFF: succ[] ring = assignment window, power of
                                two in [2, NCL_SRV_CHAIN_MAX]; 0 = 4N rounded up */
     int meta_split;         /* 1: scanned arrays (b[], present[], announce[], server

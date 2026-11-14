@@ -359,7 +359,8 @@ static void usage(const char *argv0)
             "              scan = always read\n"
             "  --wait W    handoff, gate algorithms: waiters poll their own announce line, granted\n"
             "              by the releaser (own, default) or the shared owner word (owner)\n"
-            "  --ho LIST   handoff, gate algorithms: shorter handoff path, none (default) | all |\n"
+            "  --ho LIST   handoff, gate algorithms: shorter handoff path, all (default: the options\n"
+            "              that apply; grant needs --wait own, skip -G before) | none |\n"
             "              comma list of grant (owner FREE/HELD, the grant alone hands off; needs\n"
             "              --wait own), clear (announce cleared at release), skip (read owner\n"
             "              before the gate, enter it only if FREE; -G before); docs/handoff.md\n"
@@ -398,6 +399,7 @@ int main(int argc, char **argv)
         .backend = NCL_BACKEND_CACHED_FLUSH,
         .alg = NCL_ALG_LAMPORT,
         .mode = NCL_MODE_PHASE1,
+        .handoff_opts = NCL_HO_DEFAULT,
     };
     int c, arrival_given = 0;
     static struct option lopts[] = {
@@ -662,7 +664,7 @@ int main(int argc, char **argv)
 
     char ho_buf[32];
     const char *ho_desc = cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER
-                              ? "-" : ncl_ho_opts_name(cfg.handoff_opts, ho_buf);
+                              ? "-" : ncl_ho_opts_name(ncl_sys_cfg()->handoff_opts, ho_buf);
     char cpus_csv[512]; /* the CPU list with ';' for ',' (CSV-safe) */
     snprintf(cpus_csv, sizeof cpus_csv, "%s", ncl_cpus_describe());
     for (char *q = cpus_csv; *q; q++)

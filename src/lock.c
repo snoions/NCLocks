@@ -150,6 +150,20 @@ int ncl_mode_parse(const char *s, ncl_mode_t *out)
 
 int ncl_sys_create(const struct ncl_sys_cfg *c)
 {
+    struct ncl_sys_cfg resolved = *c;
+    if (resolved.handoff_opts == NCL_HO_DEFAULT) {
+        /* Default: every --ho option that applies (docs/handoff.md). */
+        int o = 0;
+        if (c->mode == NCL_MODE_HANDOFF && c->alg != NCL_ALG_SERVER) {
+            o = NCL_HO_CLEAR;
+            if (c->handoff_wait == NCL_WAIT_OWN)
+                o |= NCL_HO_GRANT;
+            if (c->announce_place == NCL_ANNOUNCE_BEFORE)
+                o |= NCL_HO_SKIP;
+        }
+        resolved.handoff_opts = o;
+    }
+    c = &resolved;
     if ((c->mode == NCL_MODE_LOCAL || c->mode == NCL_MODE_HANDOFF) && c->no_submutex) {
         fprintf(stderr, "ncl: mode %s needs the submutex (no ablation)\n", ncl_mode_name(c->mode));
         return -1;

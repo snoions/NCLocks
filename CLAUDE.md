@@ -77,7 +77,7 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   `-X scan` = always read; window `-R`, default 4N). (e) is rejected. Gate waiters
   poll a grant word in their own announce line (`--wait own`, default) instead of the shared
   `owner` (`--wait owner`; a hot spot on CXL, `docs/cxl_results.md`), re-reading `owner`
-  after 16, 32, 64, ... polls. `--ho grant,clear,skip|all` (off by default) shortens the
+  after 16, 32, 64, ... polls. `--ho grant,clear,skip|all|none` (default all that apply) shortens the
   handoff path: grant-only handoff with `owner` FREE/HELD, announce cleared at release,
   owner read before the gate (the gate is entered only to take a FREE lock). Not
   model-checked; notes and

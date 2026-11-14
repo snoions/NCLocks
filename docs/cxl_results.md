@@ -204,11 +204,8 @@ below). k/s:
   above the server chain). Hybrid and AK do not move, and **Lamport gets 1.6-2.8x
   slower**, with its gate retrying 5.8-9.3 times per acquisition.
 - **The gate is the bottleneck.** At saturation every acquisition still passes the gate
-  once (`gate_entries_per_acq` = 1.0) to read "held". A shorter handoff brings these gate
-  passes closer together, so they overlap and contend, and on CXL a contended Lamport
-  gate spins on `x`/`y`/`b[]`. The tournament's gate degrades gracefully; Lamport's
-  collapses. The dev box shows the same effect on a smaller scale (Lamport retries
-  0 -> 0.6 with `grant,clear`).
+  once (`gate_entries_per_acq` = 1.0) to read "held". Explained, with the `skip` run,
+  in the next subsection.
   This led to `--ho skip` (read `owner` before the gate, adaptively; docs/handoff.md),
   which takes the gate off every acquisition at saturation; measured below.
 - **`prepick` did nothing on CXL either:** it found the next waiter in its snapshot on
@@ -245,6 +242,23 @@ errors. k/s, T=1, L=1 (`none` / `grant,clear` / **`grant,clear,skip`**):
 - **2b at T=1 now matches Phase 1** (at 16-32 nodes within 6%, at 4 nodes 0.87-0.99x),
   and the gate algorithm no longer matters at saturation. It still does not beat it:
   the handoff floor (one store seen by one waiter) is the same.
+- **Where the gain came from: the gate was a second mutex in series.** Without `skip`,
+  every acquisition passes the gate once, and the gate is itself a mutual-exclusion
+  lock, so 2b throughput can be no higher than the gate's own contended throughput.
+  It isn't on the handoff path (the node in the gate is not the next to be granted),
+  but it caps the rate. The numbers match: 2b `grant,clear` runs at about the
+  algorithm's own Phase 1 throughput (16x1 / 32x1: hybrid 269 / 256 vs Phase 1 242 /
+  240, AK 193 / 175 vs 166 / 151, Lamport 67 / 39 vs 38 / 19, tournament 460 / 465 vs
+  516 / 505). It is flat in N, as a single serial resource would be. 2b is slightly above
+  Phase 1 because the gate's critical section is one owner load instead of the
+  workload's CS and data writeback. `grant` made handoffs faster, so gate arrivals
+  came denser. That hurts only Lamport, whose throughput collapses with contention
+  (Phase 1: 120k at 4 nodes, 19k at 32); with the slower `none` handoff its gate saw
+  less contention (211k at 16 nodes). With `skip`, the only serial resource left is
+  the grant chain, whose rate is set by the handoff (~2 us on CXL) and not by the
+  gate, so all four reach the same ~470-505k. The tournament gains least, because
+  its gate already ran at ~500k. On the dev box (uc split) the gate's ~1.7M exceeded
+  the ~1.05M handoff rate, so `skip` changed nothing there.
 - **L=256 and T=3 are unchanged** (adaptive: the early read never fires at L=256):
   e.g. 16x1 L=256 Lamport-2b 2578, tournament-2b 1593, server chain 3055, Phase 1
   tournament 2067 (Phase 1 Lamport 3890 in the locks phase); T=3 L=1 all 1.44-1.45M.

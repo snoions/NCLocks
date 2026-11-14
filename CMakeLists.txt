@@ -126,6 +126,19 @@ foreach(alg lamport hybrid)
   endforeach()
   set_tests_properties(stress_${alg}_uc_handoff_hoall_cap1 PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
 endforeach()
+# --ho all is the 2b default: keep the original handoff path (--ho none) covered.
+foreach(alg lamport tournament hybrid ak)
+  foreach(be emu uc)
+    add_test(NAME stress_${alg}_${be}_handoff_honone_cap1
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff --ho none -K 1 --timeout 100)
+    add_test(NAME stress_${alg}_${be}_split_handoff_honone_scan
+      COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 3 -l 2 -i 10000 -M handoff --ho none -X scan -H --timeout 100)
+  endforeach()
+  set_tests_properties(stress_${alg}_uc_handoff_honone_cap1 stress_${alg}_uc_split_handoff_honone_scan
+    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+endforeach()
+add_test(NAME stress_tournament_cached-flush_handoff_honone_n8
+  COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff --ho none -K 1 --timeout 100)
 add_test(NAME ho_rejects_grant_owner_wait
   COMMAND ncl_stress -a tournament -b emu -M handoff --wait owner --ho grant)
 add_test(NAME ho_rejects_phase1

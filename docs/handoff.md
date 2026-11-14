@@ -272,7 +272,10 @@ at 16 nodes): between one critical section and the next, 2b adds a pick load, an
 `owner` store plus fence, and the waiter's announce clear, ~3 serialized CXL round trips
 (`docs/cxl_results.md`). `--ho LIST` (`cfg.handoff_opts`, `NCL_HO_*`: `grant`, `clear`,
 `skip`; `all` = the three) takes these, and the gate pass itself, off the critical path;
-default `none` until measured on CXL. Gate algorithms only.
+default `all` since the CXL measurements (`docs/cxl_results.md`): it never lost to
+`none` in 112 configurations. As a default it drops the options a config cannot use
+(`grant` with `--wait owner`, `skip` with `-G inside|lazy`); an explicit `--ho` is
+checked strictly. `--ho none` restores the original §3.3 path. Gate algorithms only.
 
 - **`grant`**: `owner` holds only FREE or HELD (`OWNER_HELD`, never a node), and a handoff
   is the grant store into the waiter's announce line alone. The gate takes only a FREE

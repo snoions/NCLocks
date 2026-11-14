@@ -227,7 +227,7 @@ static void usage(const char *argv0)
             "  -X PICK       handoff: pick_waiter adaptive (default) | scan | probe\n"
             "                (server: adaptive = follow the grant's hint bit, scan = always read succ[])\n"
             "  --wait W      handoff, gate algorithms: own (own line, default) | owner (poll owner)\n"
-            "  --ho LIST     handoff, gate algorithms: none (default) | all | grant,clear,skip\n"
+            "  --ho LIST     handoff, gate algorithms: all (default; drops grant with --wait owner, skip with -G inside|lazy) | none | grant,clear,skip\n"
             "  -R LINES      server handoff: chain window, power of two (default 4N rounded up)\n"
             "  -O on|off     handoff: overlap release data writeback with its loads (default on)\n"
             "  -U LAYOUT     metadata layout: uniform (default) | split (scanned arrays in a\n"
@@ -259,6 +259,7 @@ int main(int argc, char **argv)
         .backend = NCL_BACKEND_EMU,
         .alg = NCL_ALG_LAMPORT,
         .mode = NCL_MODE_PHASE1,
+        .handoff_opts = NCL_HO_DEFAULT,
     };
     static struct option lopts[] = {
         {"mem-node", required_argument, 0, 1001},
