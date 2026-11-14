@@ -210,7 +210,7 @@ below). k/s:
   collapses. The dev box shows the same effect on a smaller scale (Lamport retries
   0 -> 0.6 with `grant,clear`).
   This led to `--ho skip` (read `owner` before the gate, adaptively; docs/handoff.md),
-  which takes the gate off every acquisition at saturation; not yet measured on CXL.
+  which takes the gate off every acquisition at saturation; measured below.
 - **`prepick` did nothing on CXL either:** it found the next waiter in its snapshot on
   every handoff at L=1, but `all` was 0.96-1.0x of `grant,clear`. It was removed.
 - **T=3 (98.5% local handoffs), L=1:** every 2b variant reaches 1.43-1.47M, whatever
@@ -222,6 +222,32 @@ below). k/s:
 - **Fairness:** 1.0 at L=1 for every option; 0.93-0.99 at L=256 (server chain 0.80 at
   32x1). p99 at L=1: 2b tournament 10-74 us with `grant,clear` vs 11-115 us with `none`;
   Lamport `grant,clear` 0.4-1.5 ms.
+
+#### With `skip` (`results/cxl_20261114_0836/ho.csv`)
+
+Same phase after `4134c29`, `all` = `grant,clear,skip`; cf, 3 reps, 336 runs, no
+errors. k/s, T=1, L=1 (`none` / `grant,clear` / **`grant,clear,skip`**):
+
+| | 4x1 | 16x1 | 32x1 |
+|---|---|---|---|
+| Phase 1 tournament | 509 | 503 | 506 |
+| server chain | 394 | 382 | 367 |
+| tournament-2b | 326 / 421 / **444** | 301 / 460 / **473** | 298 / 465 / **503** |
+| hybrid-2b | 229 / 240 / **483** | 262 / 269 / **475** | 257 / 256 / **505** |
+| ak-2b | 182 / 179 / **466** | 201 / 193 / **471** | 186 / 175 / **480** |
+| lamport-2b | 330 / 184 / **505** | 211 / 67 / **471** | 69 / 39 / **486** |
+
+- **`skip` fixes the gate collapse.** Gate entries per acquisition go from 1.0 to 0 at
+  saturation, and all four gate algorithms land at 444-505k: 0.87-1.0x Phase 1
+  tournament, 1.2-1.4x the server chain. Lamport goes from 39k to 486k at 32 nodes.
+  p50 at 32 nodes is 62-65 us for every gate, against 61 us for Phase 1. Fairness
+  1.0; no missed announces.
+- **2b at T=1 now matches Phase 1** (at 16-32 nodes within 6%, at 4 nodes 0.87-0.99x),
+  and the gate algorithm no longer matters at saturation. It still does not beat it:
+  the handoff floor (one store seen by one waiter) is the same.
+- **L=256 and T=3 are unchanged** (adaptive: the early read never fires at L=256):
+  e.g. 16x1 L=256 Lamport-2b 2578, tournament-2b 1593, server chain 3055, Phase 1
+  tournament 2067 (Phase 1 Lamport 3890 in the locks phase); T=3 L=1 all 1.44-1.45M.
 
 ## Many locks (Phase 1, `-l L`, T=1)
 
