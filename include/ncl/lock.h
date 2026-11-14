@@ -119,17 +119,17 @@ enum { NCL_WAIT_OWN = 0, NCL_WAIT_OWNER = 1 }; /* 0 = default */
  *  CLEAR:   a node clears its announce at its global release (before the
  *           handoff fence) instead of before the critical section. While it
  *           holds the lock only it scans, and it skips its own slot.
- *  PREPICK: right after the lock arrives, invalidate the announce lines the
- *           release would read first and prefetch them; the release reads
- *           those cached copies without another round trip and hands off to
- *           the first announced one. Valid because a node announced after we
- *           took the lock keeps waiting until we pass it on; a snapshot that
- *           shows no waiter falls back to the normal pick. Only cached
- *           announce lines (split layout, cached-flush, emu split) can be
- *           prefetched; elsewhere it is a no-op. */
-enum { NCL_HO_GRANT = 1, NCL_HO_CLEAR = 2, NCL_HO_PREPICK = 4, NCL_HO_ALL = 7 };
-#define NCL_PREPICK_MAX 4 /* announce lines prefetched for a scanning release */
-/* "none", "all" or a comma list of grant,clear,prepick. 0 ok, -1 bad. */
+ *  SKIP:    a waiter reads `owner` right after its announce (-G before only) and
+ *           enters the gate only if it is FREE. Valid because the gate guards
+ *           only FREE -> taken: releasers never take it, so a "held" read
+ *           outside the gate tells as much as one inside, and a releaser that
+ *           misses the announce stores FREE after that read (seen by the
+ *           waiter's owner re-reads, which then retry through the gate).
+ *           At saturation the gate is then entered only to take a FREE lock.
+ *           Adaptive: only when this node's last global acquisition of the
+ *           lock waited (as -X adaptive); otherwise straight to the gate. */
+enum { NCL_HO_GRANT = 1, NCL_HO_CLEAR = 2, NCL_HO_SKIP = 4, NCL_HO_ALL = 7 };
+/* "none", "all" or a comma list of grant,clear,skip. 0 ok, -1 bad. */
 int ncl_ho_opts_parse(const char *s, int *out);
 /* "none" or the comma list; buf of at least 24 bytes. */
 const char *ncl_ho_opts_name(int opts, char *buf);
@@ -219,8 +219,7 @@ struct ncl_handoff_stats {
     uint64_t announce_loads;  /* announce[] loads in pick_waiter */
     uint64_t grant_polls;     /* WAIT_OWN: polls of the own grant word */
     uint64_t grant_waits;     /* WAIT_OWN: handoff seen via owner, then waited for the grant */
-    uint64_t prepick_lines;   /* PREPICK: announce lines prefetched at acquire */
-    uint64_t prepick_hits;    /* PREPICK: handoffs named from the prefetched copies */
+    uint64_t gate_skips;      /* SKIP: owner read held before the gate, gate not entered */
 };
 #define NCL_HANDOFF_STATS_N (sizeof(struct ncl_handoff_stats) / sizeof(uint64_t))
 

@@ -183,6 +183,46 @@ below 5%. The worst spread is lamport own cf at 16x1, 39%.
   320k). The gate, announce and grant cost more than they save when every handoff
   crosses nodes.
 
+### Shorter handoff path (`ho` phase, `--ho`)
+
+`results/cxl_20261114_0711/ho.csv`: cf (`cf_clwb`) only, 3 reps, 336 runs, spread
+<=10% except Lamport at L=1 (up to 28%). `errors.log` holds only the uc preflight's
+`/dev/ncl_uc` "Permission denied"; no run failed. Options: `none`, `grant,clear`, and
+`all`, which in this run was `grant,clear,prepick` (`prepick` has since been removed; see
+below). k/s:
+
+| T=1, L=1 | 4x1 | 16x1 | 32x1 | Lamport gate retries/acq at 16 / 32 |
+|---|---|---|---|---|
+| Phase 1 tournament | 510 | 504 | 499 | |
+| server chain | 403 | 388 | 365 | |
+| tournament-2b none -> grant,clear | 314 -> **429** | 304 -> **455** | 292 -> **462** | |
+| hybrid-2b | 223 -> 238 | 273 -> 265 | 259 -> 258 | |
+| ak-2b | 183 -> 185 | 202 -> 188 | 191 -> 183 | |
+| lamport-2b | 333 -> 204 | 185 -> **65** | 71 -> **38** | 1.0 -> 5.8 / 4.3 -> 9.3 |
+
+- **`grant,clear` helps only the tournament** (1.37-1.58x, now 85-93% of Phase 1 and
+  above the server chain). Hybrid and AK do not move, and **Lamport gets 1.6-2.8x
+  slower**, with its gate retrying 5.8-9.3 times per acquisition.
+- **The gate is the bottleneck.** At saturation every acquisition still passes the gate
+  once (`gate_entries_per_acq` = 1.0) to read "held". A shorter handoff brings these gate
+  passes closer together, so they overlap and contend, and on CXL a contended Lamport
+  gate spins on `x`/`y`/`b[]`. The tournament's gate degrades gracefully; Lamport's
+  collapses. The dev box shows the same effect on a smaller scale (Lamport retries
+  0 -> 0.6 with `grant,clear`).
+  This led to `--ho skip` (read `owner` before the gate, adaptively; docs/handoff.md),
+  which takes the gate off every acquisition at saturation; not yet measured on CXL.
+- **`prepick` did nothing on CXL either:** it found the next waiter in its snapshot on
+  every handoff at L=1, but `all` was 0.96-1.0x of `grant,clear`. It was removed.
+- **T=3 (98.5% local handoffs), L=1:** every 2b variant reaches 1.43-1.47M, whatever
+  the options; the server chain gets 1.40M and Phase 1 tournament 480k.
+- **L=256:** `grant,clear` gives 1.02-1.07x for all four gate algorithms (16x1:
+  tournament 1548 -> 1600, Lamport 2443 -> 2592; 32x1: Lamport 4485 -> 4804). Lamport-2b
+  beats Phase 1 tournament (2076 / 3351) but not the server chain (3031 / 3352 at 16x1 /
+  32x1). At 16x3: Lamport-2b 6494, server chain 6882, Phase 1 tournament 5722.
+- **Fairness:** 1.0 at L=1 for every option; 0.93-0.99 at L=256 (server chain 0.80 at
+  32x1). p99 at L=1: 2b tournament 10-74 us with `grant,clear` vs 11-115 us with `none`;
+  Lamport `grant,clear` 0.4-1.5 ms.
+
 ## Many locks (Phase 1, `-l L`, T=1)
 
 `results/cxl_20261113_0923/locks.csv` (`scripts/cxl_sweep.sh locks`): each acquisition

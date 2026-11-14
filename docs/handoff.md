@@ -270,8 +270,9 @@ CSV columns `wait`, `grant_polls_per_acq`.
 At T=1 on the CXL host, tournament-2b runs at ~0.6x Phase 1 (4.2 vs 2.3 us per handoff
 at 16 nodes): between one critical section and the next, 2b adds a pick load, an
 `owner` store plus fence, and the waiter's announce clear, ~3 serialized CXL round trips
-(`docs/cxl_results.md`). `--ho LIST` (`cfg.handoff_opts`, `NCL_HO_*`) takes these off
-the critical path; default `none` until measured on CXL. Gate algorithms only.
+(`docs/cxl_results.md`). `--ho LIST` (`cfg.handoff_opts`, `NCL_HO_*`: `grant`, `clear`,
+`skip`; `all` = the three) takes these, and the gate pass itself, off the critical path;
+default `none` until measured on CXL. Gate algorithms only.
 
 - **`grant`**: `owner` holds only FREE or HELD (`OWNER_HELD`, never a node), and a handoff
   is the grant store into the waiter's announce line alone. The gate takes only a FREE
@@ -286,23 +287,28 @@ the critical path; default `none` until measured on CXL. Gate algorithms only.
   the holder scans, and it skips its own slot, so the pick rule "announced => waiting"
   still holds for every slot it reads. A grant still on its way (`--wait own`, handoff
   learned from `owner`) is awaited at the release instead.
-- **`prepick`**: right after the lock arrives (after the acquire fence), the holder
-  invalidates the announce lines its release will read first (the probe slot, or the
-  first `NCL_PREPICK_MAX` = 4 slots after itself), fences and prefetches them
-  (`ncl_meta_snapshot`); the release reads those copies without a round trip
-  (`ncl_meta_peek_w`) and falls back to the normal pick if none is announced. Valid
-  because every copy postdates our ownership, and a node announced after we took the
-  lock keeps waiting until we pass it on. Only cached announce lines can be prefetched
-  (split layout, cached-flush, emu split); on UC lines it is a no-op.
+- **`skip`**: with announce-before (`-G before`, the default), a waiter reads `owner`
+  right after its announce fence and enters the gate only if it is FREE; "held" sends it
+  straight to its wait (and, without `grant`, `owner == me` is a handoff, as in the
+  gate). Valid because the gate serializes only FREE -> taken: releasers never take it,
+  so a "held" read outside the gate tells as much as one inside. A releaser that misses
+  the announce stores FREE after that read, the waiter's owner re-reads see it, and the
+  waiter retries through the gate. At saturation the gate is then entered only to take
+  a FREE lock (`gate_entries_per_acq` ~0, `gate_skips_per_acq` ~1), so the gate algorithm
+  matters only when the lock goes idle. Adaptive: the early read is done only if this
+  node's last global acquisition of the lock waited (like `-X adaptive`), so an
+  uncontended acquisition goes straight to the gate. Rejected with `-G inside|lazy`.
 
 Not model-checked. Stress: `stress_{lamport,tournament,hybrid,ak}_{emu,uc}_split_handoff_hoall_{cap1,scan}`,
-`stress_tournament_{emu,uc}_split_handoff_ho{grant,clear,prepick}_n8`,
-`stress_hybrid_{emu,uc}_split_handoff_owner_hoclearprepick`,
+`stress_tournament_{emu,uc}_split_handoff_ho{grant,clear,skip}_n8`,
+`stress_hybrid_{emu,uc}_split_handoff_owner_hoclearskip`,
 `stress_{lamport,hybrid}_{emu,uc}_handoff_hoall_cap1` (uniform),
-`stress_tournament_cached-flush_handoff_hoall_n8`, and `ho_rejects_*`. Under
+`stress_tournament_cached-flush_handoff_hoall_n8`, and `ho_rejects_*`; plus 160 hand-run
+combinations of `skip` (4 gate algorithms x emu, emu split, uc, uc split, cf x skip,
+grant+skip, grant+clear+skip, all x adaptive/scan pick), all passing. Under
 `--skip-meta-inv`, hybrid-2b hangs intermittently with and without `--ho` (the emulator
 catching the missing invalidate in the gate), so it is no test of the options. CSV
-columns `ho_opts`, `prepick_hits_per_acq`.
+columns `ho_opts`, `gate_skips_per_acq`.
 
 **Dev box** (8 nodes, T=1, 200 ns CS, `-B 16`, 1 s, 3 reps, k/s; fairness 1.0 at L=1,
 0.96-0.98 at L=256 for every option):
@@ -314,13 +320,31 @@ columns `ho_opts`, `prepick_hits_per_acq`.
 | lamport uc split | 853 | 970 (1.14x) | **1086 (1.27x)** | 4374 | 4564 (1.04x) |
 | hybrid uc split | 853 | 981 (1.15x) | **1085 (1.27x)** | 3605 | 3733 (1.04x) |
 
-`prepick` hits on every handoff at L=1 (`prepick_hits_per_acq` = 1.0) but costs more than
-it saves here: 0.88-0.96x alone, and `all` is below `grant,clear` (0.92-1.18x of
-`none`). Its invalidate + fence lands on the acquire path, while the pick load it removes
-was already overlapped with the data writeback (`-O on`); with many locks it is wasted
-on uncontended acquisitions. Whether CXL's longer load latency changes that is for
-`scripts/cxl_sweep.sh ho`. Even `grant,clear` stays below Phase 1 at L=1 on the dev box
-(tournament uc split 1.09M vs 1.70M).
+**`skip`** (dev box, 8 nodes, T=1, 2 s, 2 reps, k/s; `gc` = `grant,clear`, `gcs` =
+`grant,clear,skip`):
+
+| | cf L=1 none / gc / **gcs** | uc split L=1 none / gc / **gcs** | cf L=256 gc / gcs | uc split L=256 gc / gcs |
+|---|---|---|---|---|
+| tournament | 924 / 1328 / **1358** | 836 / 1045 / **1045** | 4063 / 4055 | 4328 / 4310 |
+| lamport | 940 / 1153 / **1366** | 851 / 1046 / **1055** | 4804 / 4813 | 4537 / 4572 |
+| hybrid | 919 / 1127 / **1363** | 858 / 1065 / **1036** | 3586 / 3584 | 3749 / 3744 |
+| ak | 916 / 930 / **1365** | 851 / 1069 / **1037** | 3007 / 3007 | 3382 / 3372 |
+| Phase 1 tournament | 1642 | 1678 | 6079 | 7677 |
+
+At L=1 `skip` takes the gate off every acquisition (`gate_entries_per_acq` 1.0 -> 0),
+and all four gate algorithms run alike (cf 1.36M): the gate no longer matters at
+saturation. With `grant,clear` alone, the shorter handoff makes gate passes overlap; on
+cf Lamport's gate then retries (0.6/acq) and AK gains nothing. On CXL this was much
+worse (Lamport 2.8x slower, `docs/cxl_results.md`). On uc split, `skip` is +-3%: there the
+gate was not the limit. A first version that always read `owner` early cost 5-14% at
+L=256 (cf p99 2-4 -> 10 us): most acquisitions find FREE, so the read was one more
+round trip before the gate. The adaptive rule (early read only if this node's last
+acquisition of the lock waited) removes that: L=256 equals `grant,clear`. Fairness
+1.0 at L=1, 0.95-0.98 at L=256. Still below Phase 1 at L=1 on the dev box.
+
+`prepick` (removed): snapshotting the announce lines at acquire found the next waiter on
+every handoff at L=1, but its invalidate + fence on the acquire path cost more than the
+pick load it saved (dev box 0.88-0.96x; CXL `all` 0.96-1.0x of `grant,clear`).
 
 ## (c) lock server: holder-to-waiter chain (`-a server -M handoff`)
 

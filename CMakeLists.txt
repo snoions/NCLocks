@@ -119,8 +119,7 @@ add_test(NAME stress_tournament_cached-flush_handoff_own_n8
 add_test(NAME stress_tournament_cached-flush_handoff_hoall_n8
   COMMAND ncl_stress -a tournament -b cached-flush -n 8 -t 2 -l 2 -i 10000 -M handoff --ho all -K 1 --timeout 100)
 foreach(alg lamport hybrid)
-  # Uniform layout: announce lines are UC (uc) or emulated-uncached (emu), so
-  # prepick is a no-op; grant and clear still apply.
+  # Uniform layout: announce lines are UC (uc) or emulated-uncached (emu).
   foreach(be emu uc)
     add_test(NAME stress_${alg}_${be}_handoff_hoall_cap1
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff --ho all -K 1 --timeout 100)
@@ -133,7 +132,10 @@ add_test(NAME ho_rejects_phase1
   COMMAND ncl_stress -a tournament -b emu --ho all)
 add_test(NAME ho_rejects_server
   COMMAND ncl_stress -a server -b emu -M handoff --ho clear)
-set_tests_properties(ho_rejects_grant_owner_wait ho_rejects_phase1 ho_rejects_server PROPERTIES WILL_FAIL TRUE)
+add_test(NAME ho_rejects_skip_lazy
+  COMMAND ncl_stress -a tournament -b emu -M handoff -G lazy --ho skip)
+set_tests_properties(ho_rejects_grant_owner_wait ho_rejects_phase1 ho_rejects_server ho_rejects_skip_lazy
+  PROPERTIES WILL_FAIL TRUE)
 add_test(NAME wait_rejects_server
   COMMAND ncl_stress -a server -b emu -M handoff --wait own)
 add_test(NAME wait_rejects_phase1
@@ -203,8 +205,7 @@ foreach(be emu uc)
     COMMAND ncl_stress -a tournament -b ${be} -U split -n 8 -t 1 -l 1 -i 20000 -M handoff --wait own -X probe --timeout 100)
   list(APPEND split_tests_${be} stress_tournament_${be}_split_handoff_own_n8_probe)
   # Shorter handoff path (--ho, docs/handoff.md): all three options and each
-  # alone, with prefetchable (split) announce lines; clear+prepick with the
-  # shared-owner wait (grant needs --wait own).
+  # alone; clear+skip with the shared-owner wait (grant needs --wait own).
   foreach(alg lamport tournament hybrid ak)
     add_test(NAME stress_${alg}_${be}_split_handoff_hoall_cap1
       COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff --ho all -K 1 --timeout 100)
@@ -212,14 +213,14 @@ foreach(be emu uc)
       COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 3 -l 2 -i 10000 -M handoff --ho all -X scan -H --timeout 100)
     list(APPEND split_tests_${be} stress_${alg}_${be}_split_handoff_hoall_cap1 stress_${alg}_${be}_split_handoff_hoall_scan)
   endforeach()
-  foreach(ho grant clear prepick)
+  foreach(ho grant clear skip)
     add_test(NAME stress_tournament_${be}_split_handoff_ho${ho}_n8
       COMMAND ncl_stress -a tournament -b ${be} -U split -n 8 -t 1 -l 1 -i 20000 -M handoff --ho ${ho} --timeout 100)
     list(APPEND split_tests_${be} stress_tournament_${be}_split_handoff_ho${ho}_n8)
   endforeach()
-  add_test(NAME stress_hybrid_${be}_split_handoff_owner_hoclearprepick
-    COMMAND ncl_stress -a hybrid -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff --wait owner --ho clear,prepick -K 1 --timeout 100)
-  list(APPEND split_tests_${be} stress_hybrid_${be}_split_handoff_owner_hoclearprepick)
+  add_test(NAME stress_hybrid_${be}_split_handoff_owner_hoclearskip
+    COMMAND ncl_stress -a hybrid -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff --wait owner --ho clear,skip -K 1 --timeout 100)
+  list(APPEND split_tests_${be} stress_hybrid_${be}_split_handoff_owner_hoclearskip)
   add_test(NAME stress_hybrid_${be}_split_handoff_owner_cap1
     COMMAND ncl_stress -a hybrid -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff --wait owner -K 1 --timeout 100)
   list(APPEND split_tests_${be} stress_hybrid_${be}_split_handoff_owner_cap1)

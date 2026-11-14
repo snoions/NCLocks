@@ -361,8 +361,8 @@ static void usage(const char *argv0)
             "              by the releaser (own, default) or the shared owner word (owner)\n"
             "  --ho LIST   handoff, gate algorithms: shorter handoff path, none (default) | all |\n"
             "              comma list of grant (owner FREE/HELD, the grant alone hands off; needs\n"
-            "              --wait own), clear (announce cleared at release), prepick (snapshot the\n"
-            "              announce lines at acquire, read them at release); docs/handoff.md\n"
+            "              --wait own), clear (announce cleared at release), skip (read owner\n"
+            "              before the gate, enter it only if FREE; -G before); docs/handoff.md\n"
             "  -R LINES    server handoff: chain window = succ[] lines per lock (power of two;\n"
             "              default 4N rounded up)\n"
             "  -O on|off   handoff: overlap the release's data writeback with its loads (on)\n"
@@ -390,7 +390,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,prepick_hits_per_acq"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq"
 
 int main(int argc, char **argv)
 {
@@ -506,7 +506,7 @@ int main(int argc, char **argv)
             break;
         case 1005:
             if (ncl_ho_opts_parse(optarg, &cfg.handoff_opts) < 0) {
-                fprintf(stderr, "--ho: none|all|grant,clear,prepick\n");
+                fprintf(stderr, "--ho: none|all|grant,clear,skip\n");
                 return 2;
             }
             break;
@@ -698,7 +698,7 @@ int main(int argc, char **argv)
                cfg.backend == NCL_BACKEND_UC ? ncl_mem.uc_pool_node : -1, ncl_wb_mode_name(),
                pin ? cpus_csv : "none",
                cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER ? "-" : WAIT_NAME(cfg.handoff_wait),
-               PER(tot->ho.grant_polls), ho_desc, PER(tot->ho.prepick_hits));
+               PER(tot->ho.grant_polls), ho_desc, PER(tot->ho.gate_skips));
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -785,9 +785,9 @@ int main(int argc, char **argv)
         } else if (cfg.mode == NCL_MODE_HANDOFF) {
             const struct ncl_handoff_stats *o = &tot->ho;
             printf("handoff wait=%s opts=%s: grant_polls/acq=%.2f grant_waits=%lu "
-                   "prepick_lines/acq=%.2f prepick_hits/acq=%.3f\n", WAIT_NAME(cfg.handoff_wait),
-                   ho_desc, PER(o->grant_polls), (unsigned long)o->grant_waits,
-                   PER(o->prepick_lines), PER(o->prepick_hits));
+                   "gate_skips/acq=%.3f\n",
+                   WAIT_NAME(cfg.handoff_wait), ho_desc, PER(o->grant_polls),
+                   (unsigned long)o->grant_waits, PER(o->gate_skips));
             printf("handoff (announce %s, pick %s): gate_entries=%lu takes=%lu gate_handoffs=%lu "
                    "wait_handoffs=%lu missed_announce=%lu owner_polls/acq=%.2f sent=%lu frees=%lu "
                    "announce_loads/release=%.2f\n",

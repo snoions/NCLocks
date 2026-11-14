@@ -47,7 +47,7 @@ EXTRA = {
     "2b": ["global_handoff_frac", "owner_polls_per_acq", "lock_p99"],
     "own": ["owner_polls_per_acq", "grant_polls_per_acq"],
     "locks": ["fast_frac", "lock_p99"],
-    "ho": ["lock_p99", "missed_announce_per_acq", "prepick_hits_per_acq"],
+    "ho": ["lock_p99", "missed_announce_per_acq", "gate_entries_per_acq"],
 }
 
 

@@ -10,7 +10,7 @@
 #   base       coherent baselines: tournament and pthread (+ no-submutex) on CXL and DRAM
 #   open       open loop (Poisson) at N=16, T=1, offered load scaled to CXL capacity
 #   locks      Phase 1 with L locks chosen uniformly per acquisition (-l), all algorithms, N=16,32
-#   ho         2b shorter handoff path (--ho none | grant,clear | all), gate algorithms,
+#   ho         2b shorter handoff path (--ho none | grant,clear | all = grant,clear,skip), gate algorithms,
 #              with Phase 1 tournament and the server chain as references, L=1 and 256
 #   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms
 #   dram       main uc configs with metadata on DRAM: RELOAD THE DRIVER WITH nid=0 FIRST
