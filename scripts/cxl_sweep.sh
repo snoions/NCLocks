@@ -10,6 +10,8 @@
 #   base       coherent baselines: tournament and pthread (+ no-submutex) on CXL and DRAM
 #   open       open loop (Poisson) at N=16, T=1, offered load scaled to CXL capacity
 #   locks      Phase 1 with L locks chosen uniformly per acquisition (-l), all algorithms, N=16,32
+#   ho         2b shorter handoff path (--ho none | grant,clear | all), gate algorithms,
+#              with Phase 1 tournament and the server chain as references, L=1 and 256
 #   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms
 #   dram       main uc configs with metadata on DRAM: RELOAD THE DRIVER WITH nid=0 FIRST
 #
@@ -21,7 +23,8 @@
 #      MEMNODE (2: CXL), CPUNODE (0: the socket the device hangs off),
 #      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), OWN_NT ("4x1 8x1 16x1 32x1 16x3"),
 #      CFGS ("cf_clwb"; add uc_split_clwb for uc),
-#      LOCKS ("1 4 16 64 256"), LOCKS_NT ("16x1 32x1"), RUN_TIMEOUT (120 s per run), WB (clwb)
+#      LOCKS ("1 4 16 64 256"), LOCKS_NT ("16x1 32x1"),
+#      HO_NT ("4x1 16x1 32x1 16x3"), HO_LOCKS ("1 256"), HO_OPTS ("none grant,clear all"), RUN_TIMEOUT (120 s per run), WB (clwb)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -38,6 +41,9 @@ NT=${NT:-"4x1 8x1 16x1 32x1 4x3 8x3 16x3"}
 OWN_NT=${OWN_NT:-"4x1 8x1 16x1 32x1 16x3"} # phase own
 LOCKS=${LOCKS:-"1 4 16 64 256"}             # phase locks
 LOCKS_NT=${LOCKS_NT:-"16x1 32x1"}
+HO_NT=${HO_NT:-"4x1 16x1 32x1 16x3"}         # phase ho
+HO_LOCKS=${HO_LOCKS:-"1 256"}
+HO_OPTS=${HO_OPTS:-"none grant,clear all"}
 RUN_TIMEOUT=${RUN_TIMEOUT:-120}
 WB=${WB:-clwb} # writeback instruction of the main configs (clflushopt for hosts without clwb)
 
@@ -179,6 +185,21 @@ many_locks() {
   done; done
 }
 
+p2b_ho() {
+  # --ho options (docs/handoff.md "Shorter handoff path"), interleaved, plus the
+  # references they are measured against: Phase 1 tournament and the server chain.
+  local csv=$OUT/ho.csv; header "$csv"
+  for rep in $(seq "$REPS"); do for nt in $HO_NT; do nt_split "$nt"; for l in $HO_LOCKS; do
+    for c in $MAIN_CFGS; do
+      run "$csv" "$rep" "$c" -a tournament -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+      run "$csv" "$rep" "$c" -a server -n "$N" -t "$T" -l "$l" -M handoff ${CFG[$c]} "${COMMON[@]}"
+      for a in lamport tournament hybrid ak; do for h in $HO_OPTS; do
+        run "$csv" "$rep" "$c" -a "$a" -n "$N" -t "$T" -l "$l" -M handoff --ho "$h" ${CFG[$c]} "${COMMON[@]}"
+      done; done
+    done
+  done; done; done
+}
+
 open_loop() {
   local csv=$OUT/open.csv; header "$csv"
   local rates=${RATES:-"25k 50k 100k 150k 200k 250k 300k 400k"}
@@ -211,6 +232,7 @@ for ph in $PHASES; do
     2a) p2a ;;
     2b) p2b ;;
     own) p2b_own ;;
+    ho) p2b_ho ;;
     locks) many_locks ;;
     base) base ;;
     open) open_loop ;;

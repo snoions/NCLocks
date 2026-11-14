@@ -359,6 +359,10 @@ static void usage(const char *argv0)
             "              scan = always read\n"
             "  --wait W    handoff, gate algorithms: waiters poll their own announce line, granted\n"
             "              by the releaser (own, default) or the shared owner word (owner)\n"
+            "  --ho LIST   handoff, gate algorithms: shorter handoff path, none (default) | all |\n"
+            "              comma list of grant (owner FREE/HELD, the grant alone hands off; needs\n"
+            "              --wait own), clear (announce cleared at release), prepick (snapshot the\n"
+            "              announce lines at acquire, read them at release); docs/handoff.md\n"
             "  -R LINES    server handoff: chain window = succ[] lines per lock (power of two;\n"
             "              default 4N rounded up)\n"
             "  -O on|off   handoff: overlap the release's data writeback with its loads (on)\n"
@@ -386,7 +390,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,prepick_hits_per_acq"
 
 int main(int argc, char **argv)
 {
@@ -401,6 +405,7 @@ int main(int argc, char **argv)
         {"cpus", required_argument, 0, 1002},
         {"wb", required_argument, 0, 1003},
         {"wait", required_argument, 0, 1004},
+        {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -498,6 +503,12 @@ int main(int argc, char **argv)
             else if (!strcmp(optarg, "owner")) cfg.handoff_wait = NCL_WAIT_OWNER;
             else { fprintf(stderr, "--wait: owner|own\n"); return 2; }
             wait_set = 1;
+            break;
+        case 1005:
+            if (ncl_ho_opts_parse(optarg, &cfg.handoff_opts) < 0) {
+                fprintf(stderr, "--ho: none|all|grant,clear,prepick\n");
+                return 2;
+            }
             break;
         case 'S': cfg.server_backoff_cap = (unsigned)atoi(optarg); break;
         case 'Y':
@@ -649,6 +660,9 @@ int main(int argc, char **argv)
     else
         snprintf(arrdesc, sizeof arrdesc, "%s", arr_names[arrival]);
 
+    char ho_buf[32];
+    const char *ho_desc = cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER
+                              ? "-" : ncl_ho_opts_name(cfg.handoff_opts, ho_buf);
     char cpus_csv[512]; /* the CPU list with ';' for ',' (CSV-safe) */
     snprintf(cpus_csv, sizeof cpus_csv, "%s", ncl_cpus_describe());
     for (char *q = cpus_csv; *q; q++)
@@ -656,7 +670,7 @@ int main(int argc, char **argv)
             *q = ';';
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -684,7 +698,7 @@ int main(int argc, char **argv)
                cfg.backend == NCL_BACKEND_UC ? ncl_mem.uc_pool_node : -1, ncl_wb_mode_name(),
                pin ? cpus_csv : "none",
                cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER ? "-" : WAIT_NAME(cfg.handoff_wait),
-               PER(tot->ho.grant_polls));
+               PER(tot->ho.grant_polls), ho_desc, PER(tot->ho.prepick_hits));
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -770,8 +784,10 @@ int main(int argc, char **argv)
                    (unsigned long)o->wait_handoffs);
         } else if (cfg.mode == NCL_MODE_HANDOFF) {
             const struct ncl_handoff_stats *o = &tot->ho;
-            printf("handoff wait=%s: grant_polls/acq=%.2f grant_waits=%lu\n", WAIT_NAME(cfg.handoff_wait),
-                   PER(o->grant_polls), (unsigned long)o->grant_waits);
+            printf("handoff wait=%s opts=%s: grant_polls/acq=%.2f grant_waits=%lu "
+                   "prepick_lines/acq=%.2f prepick_hits/acq=%.3f\n", WAIT_NAME(cfg.handoff_wait),
+                   ho_desc, PER(o->grant_polls), (unsigned long)o->grant_waits,
+                   PER(o->prepick_lines), PER(o->prepick_hits));
             printf("handoff (announce %s, pick %s): gate_entries=%lu takes=%lu gate_handoffs=%lu "
                    "wait_handoffs=%lu missed_announce=%lu owner_polls/acq=%.2f sent=%lu frees=%lu "
                    "announce_loads/release=%.2f\n",

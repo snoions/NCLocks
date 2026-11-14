@@ -313,6 +313,40 @@ static inline void ncl_uc_store_w(ncl_line_t *l, int k, uint64_t v)
 }
 static inline void ncl_uc_store(ncl_line_t *l, uint64_t v) { ncl_uc_store_w(l, 0, v); }
 
+/* ---- snapshot reads (2b PREPICK) ----------------------------------------- */
+
+/* Start a snapshot of cached metadata lines: invalidate each, one fence, then
+ * prefetch (non-blocking), so a later ncl_meta_peek_w returns a value read
+ * after this call began, without a round trip on the reader's path. EMU split
+ * copies the device words into the private view here (the view is the
+ * snapshot). Returns 0 and does nothing if the lines are not cached (UC: a
+ * load would block, so there is nothing to overlap). The caller must order
+ * this after the event the snapshot must postdate (ncl_fence). All lines in
+ * the same region. */
+static inline int ncl_meta_snapshot(ncl_line_t *const *ls, int n)
+{
+    if (n <= 0 || !ncl_meta_cached(ls[0]))
+        return 0;
+    ncl_dev_delay();
+    for (int k = 0; k < n; k++)
+        ncl__meta_inv(ls[k]);
+    ncl__meta_inv_fence();
+#if defined(__x86_64__)
+    if (ncl_mem.backend != NCL_BACKEND_EMU)
+        for (int k = 0; k < n; k++)
+            _mm_prefetch((const char *)ls[k], _MM_HINT_T0);
+#endif
+    return 1;
+}
+
+/* Word k of a line snapshotted by ncl_meta_snapshot, without invalidating.
+ * The value is at least as new as the snapshot (a hardware prefetch or a miss
+ * may refetch a newer one), never older. */
+static inline uint64_t ncl_meta_peek_w(ncl_line_t *l, int k)
+{
+    return atomic_load_explicit(ncl__word(l, k), memory_order_relaxed);
+}
+
 /* ---- batched metadata reads -------------------------------------------- */
 
 /* Batch invalidates for multi-line reads of CACHED lines (cached-flush, or the

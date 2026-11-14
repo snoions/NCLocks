@@ -110,6 +110,30 @@ enum { NCL_PICK_ADAPTIVE = 0, NCL_PICK_SCAN = 1, NCL_PICK_PROBE = 2 }; /* 0 = de
  * polls, so throughput falls as 1/N (docs/cxl_results.md). Ignored outside
  * MODE_HANDOFF and by the server chain. */
 enum { NCL_WAIT_OWN = 0, NCL_WAIT_OWNER = 1 }; /* 0 = default */
+/* MODE_HANDOFF critical-path options (gate algorithms; cfg.handoff_opts bits,
+ * docs/handoff.md "Shorter handoff path"). Not model-checked.
+ *  GRANT:   the handoff is the grant store alone. `owner` is FREE or HELD
+ *           (never a node), so the releaser stores nothing else and needs no
+ *           owner-before-grant fence; only a release that finds no waiter
+ *           stores FREE. Needs --wait own.
+ *  CLEAR:   a node clears its announce at its global release (before the
+ *           handoff fence) instead of before the critical section. While it
+ *           holds the lock only it scans, and it skips its own slot.
+ *  PREPICK: right after the lock arrives, invalidate the announce lines the
+ *           release would read first and prefetch them; the release reads
+ *           those cached copies without another round trip and hands off to
+ *           the first announced one. Valid because a node announced after we
+ *           took the lock keeps waiting until we pass it on; a snapshot that
+ *           shows no waiter falls back to the normal pick. Only cached
+ *           announce lines (split layout, cached-flush, emu split) can be
+ *           prefetched; elsewhere it is a no-op. */
+enum { NCL_HO_GRANT = 1, NCL_HO_CLEAR = 2, NCL_HO_PREPICK = 4, NCL_HO_ALL = 7 };
+#define NCL_PREPICK_MAX 4 /* announce lines prefetched for a scanning release */
+/* "none", "all" or a comma list of grant,clear,prepick. 0 ok, -1 bad. */
+int ncl_ho_opts_parse(const char *s, int *out);
+/* "none" or the comma list; buf of at least 24 bytes. */
+const char *ncl_ho_opts_name(int opts, char *buf);
+
 #ifndef NCL_OWNER_RECHECK
 #define NCL_OWNER_RECHECK 16 /* polls before the first owner re-read */
 #endif
@@ -130,6 +154,7 @@ struct ncl_sys_cfg {
     int announce_place;     /* HANDOFF: announce placement (§3.5), NCL_ANNOUNCE_*; 0 = before */
     int pick_policy;        /* HANDOFF: pick_waiter policy, NCL_PICK_*; 0 = adaptive */
     int handoff_wait;       /* HANDOFF, gate algorithms: NCL_WAIT_*; 0 = own line */
+    int handoff_opts;       /* HANDOFF, gate algorithms: NCL_HO_* bits; 0 = none */
     int chain_lines;        /* SERVER HANDOFF: succ[] ring = assignment window, power of
                                two in [2, NCL_SRV_CHAIN_MAX]; 0 = 4N rounded up */
     int meta_split;         /* 1: scanned arrays (b[], present[], announce[], server
@@ -194,6 +219,8 @@ struct ncl_handoff_stats {
     uint64_t announce_loads;  /* announce[] loads in pick_waiter */
     uint64_t grant_polls;     /* WAIT_OWN: polls of the own grant word */
     uint64_t grant_waits;     /* WAIT_OWN: handoff seen via owner, then waited for the grant */
+    uint64_t prepick_lines;   /* PREPICK: announce lines prefetched at acquire */
+    uint64_t prepick_hits;    /* PREPICK: handoffs named from the prefetched copies */
 };
 #define NCL_HANDOFF_STATS_N (sizeof(struct ncl_handoff_stats) / sizeof(uint64_t))
 

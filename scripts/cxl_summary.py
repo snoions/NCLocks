@@ -2,7 +2,7 @@
 """Median tables for a scripts/cxl_sweep.sh result directory (needs pandas).
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
-Phases: p1 abl 2a 2b own locks base open dram (default: those whose CSV exists).
+Phases: p1 abl 2a 2b own ho locks base open dram (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -47,6 +47,7 @@ EXTRA = {
     "2b": ["global_handoff_frac", "owner_polls_per_acq", "lock_p99"],
     "own": ["owner_polls_per_acq", "grant_polls_per_acq"],
     "locks": ["fast_frac", "lock_p99"],
+    "ho": ["lock_p99", "missed_announce_per_acq", "prepick_hits_per_acq"],
 }
 
 
@@ -54,7 +55,7 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     root = sys.argv[1]
-    phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "locks", "base", "open", "dram"]
+    phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -63,6 +64,8 @@ def main():
         print(f"=== {ph} ({len(d)} rows)")
         if ph == "own":
             d["config"] = d.config + "/" + d["wait"]
+        if ph == "ho":
+            d["config"] = d["mode"] + "/" + d["ho_opts"]
         if ph == "open":
             print(open_loop(d).to_string())
         else:

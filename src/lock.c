@@ -49,6 +49,11 @@ struct ncl_local_lock {
     int pw_next;          /* HANDOFF, pick_policy: next announce[] slot to probe */
     int acq_contended;    /* HANDOFF: this global acquisition waited or got a handoff */
     uint64_t ann_seq;     /* HANDOFF, WAIT_OWN: last announce sequence number (word 0) */
+    uint64_t ann_val;     /* HANDOFF_OPTS CLEAR: our announce value, still set while held */
+    int ann_set;          /* HANDOFF_OPTS CLEAR: announce to clear at the global release */
+    int need_grant;       /* HANDOFF_OPTS CLEAR: handoff seen via owner, grant not yet seen */
+    int npre;             /* HANDOFF_OPTS PREPICK: announce slots snapshotted at acquire */
+    int pre[NCL_PREPICK_MAX];
     uint64_t srv_grant;   /* SERVER in HANDOFF: grant word (seq + hint) for the release */
     /* LOCAL/HANDOFF precise hints accumulated over a local run */
     int ndirty, dirty_full;
@@ -84,6 +89,8 @@ static size_t handoff_scan_lines(const struct ncl_sys_cfg *c, int P)
     return (size_t)P; /* announce[] */
 }
 #define OWNER_FREE 0ull
+/* HANDOFF_OPTS GRANT: owner value while held (never equal to a node + 1). */
+#define OWNER_HELD ((uint64_t)NCL_MAX_PARTICIPANTS + 1)
 
 static size_t round_line(size_t n) { return (n + NCL_CACHELINE - 1) & ~(size_t)(NCL_CACHELINE - 1); }
 
@@ -95,6 +102,43 @@ const char *ncl_mode_name(ncl_mode_t m)
     case NCL_MODE_HANDOFF: return "handoff";
     }
     return "?";
+}
+
+static const struct { int bit; const char *name; } ho_names[] = {
+    {NCL_HO_GRANT, "grant"}, {NCL_HO_CLEAR, "clear"}, {NCL_HO_PREPICK, "prepick"}};
+
+int ncl_ho_opts_parse(const char *s, int *out)
+{
+    if (!strcmp(s, "none")) { *out = 0; return 0; }
+    if (!strcmp(s, "all")) { *out = NCL_HO_ALL; return 0; }
+    int v = 0;
+    while (*s) {
+        size_t n = strcspn(s, ",+");
+        int k = 0, nk = (int)(sizeof ho_names / sizeof ho_names[0]);
+        for (; k < nk; k++)
+            if (strlen(ho_names[k].name) == n && !strncmp(s, ho_names[k].name, n))
+                break;
+        if (k == nk)
+            return -1;
+        v |= ho_names[k].bit;
+        s += n;
+        if (*s == ',' || *s == '+')
+            s++;
+    }
+    *out = v;
+    return v ? 0 : -1;
+}
+
+const char *ncl_ho_opts_name(int opts, char *buf)
+{
+    buf[0] = 0;
+    for (size_t k = 0; k < sizeof ho_names / sizeof ho_names[0]; k++)
+        if (opts & ho_names[k].bit) {
+            if (buf[0])
+                strcat(buf, "+");
+            strcat(buf, ho_names[k].name);
+        }
+    return buf[0] ? buf : "none";
 }
 
 int ncl_mode_parse(const char *s, ncl_mode_t *out)
@@ -119,6 +163,19 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     }
     if (c->handoff_wait != NCL_WAIT_OWN && c->handoff_wait != NCL_WAIT_OWNER) {
         fprintf(stderr, "ncl: bad handoff_wait %d\n", c->handoff_wait);
+        return -1;
+    }
+    if (c->handoff_opts & ~NCL_HO_ALL) {
+        fprintf(stderr, "ncl: bad handoff_opts %#x\n", c->handoff_opts);
+        return -1;
+    }
+    if (c->handoff_opts && (c->mode != NCL_MODE_HANDOFF || c->alg == NCL_ALG_SERVER)) {
+        fprintf(stderr, "ncl: handoff options (grant, clear, prepick) apply to -M handoff with "
+                        "a gate algorithm\n");
+        return -1;
+    }
+    if ((c->handoff_opts & NCL_HO_GRANT) && c->handoff_wait != NCL_WAIT_OWN) {
+        fprintf(stderr, "ncl: handoff option grant needs --wait own (the grant is the handoff)\n");
         return -1;
     }
     if (c->chain_lines && (c->chain_lines < 2 || c->chain_lines > NCL_SRV_CHAIN_MAX ||
@@ -320,9 +377,40 @@ void ncl_thread_init(struct ncl_thread *t, int local_idx)
 
 static void check_owner(uint64_t o)
 {
-    if (o > (uint64_t)hdr->participants) {
+    if (o > (uint64_t)hdr->participants && o != OWNER_HELD) {
         fprintf(stderr, "ncl: corrupt owner word %#llx\n", (unsigned long long)o);
         abort();
+    }
+}
+
+/* PREPICK: snapshot the announce slots the release will read first (see
+ * NCL_HO_PREPICK). Called with the lock just taken and after the fence that
+ * orders that, so every copy postdates our ownership: a slot announced in it
+ * belongs to a node that keeps waiting until we pass the lock on. */
+static void prepick(struct ncl_local_lock *L, int me)
+{
+    const int P = hdr->participants;
+    ncl_line_t *ls[NCL_PREPICK_MAX];
+    int n = 0;
+    L->npre = 0;
+    if (P < 2)
+        return;
+    int probe = cfg.pick_policy == NCL_PICK_PROBE ||
+                (cfg.pick_policy == NCL_PICK_ADAPTIVE && !L->acq_contended);
+    if (probe) {
+        L->pre[n] = L->pw_next;
+        ls[n] = &L->announce[L->pre[n]];
+        n++;
+    } else {
+        for (int k = 1; k < P && n < NCL_PREPICK_MAX; k++) {
+            L->pre[n] = (me + k) % P;
+            ls[n] = &L->announce[L->pre[n]];
+            n++;
+        }
+    }
+    if (ncl_meta_snapshot(ls, n)) {
+        L->npre = n;
+        L->st.ho.prepick_lines += (uint64_t)n;
     }
 }
 
@@ -340,6 +428,10 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
     const int own = cfg.handoff_wait == NCL_WAIT_OWN;
     const uint64_t aval = own ? ++L->ann_seq : 1;
     int need_grant = 0; /* handoff seen via owner: grant store may still be coming */
+    /* GRANT: owner is only FREE/HELD; a handoff is our grant word alone, so
+     * "owner == me" never means a handoff (and never occurs). */
+    const int grant = cfg.handoff_opts & NCL_HO_GRANT;
+    const uint64_t taken = grant ? OWNER_HELD : mine;
 
     const int place = cfg.announce_place;
     int announced = 0, waited = 0;
@@ -361,10 +453,10 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
         ncl_fence();
         uint64_t o = ncl_uc_load(L->owner);
         check_owner(o);
-        if (o == OWNER_FREE || o == mine) {
+        if (o == OWNER_FREE || (!grant && o == mine)) {
             /* Only gate users write a FREE owner, one at a time; a handoff
              * to us is already ours. Single 8-byte store either way. */
-            ncl_uc_store(L->owner, mine);
+            ncl_uc_store(L->owner, taken);
             ncl_fence(); /* owner store before the gate-exit stores */
             ncl_base_unlock(&L->base, me, gpath, bst);
             if (o == mine) {
@@ -424,7 +516,7 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
                 o = ncl_uc_load(L->owner);
                 h->owner_polls++;
                 check_owner(o);
-                if (o == mine) {
+                if (!grant && o == mine) {
                     h->wait_handoffs++;
                     L->acq_contended = 1;
                     path = NCL_PATH_GLOBAL_HANDOFF;
@@ -432,7 +524,10 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
                     goto acquired;
                 }
                 if (o == OWNER_FREE) {
-                    h->missed_announce++; /* releaser missed us: retry the gate */
+                    /* Releaser missed us: retry the gate. GRANT: a releaser
+                     * either grants us or stores FREE, never both, so no
+                     * grant can be on its way. */
+                    h->missed_announce++;
                     break;
                 }
             }
@@ -444,49 +539,101 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
         }
     }
 acquired:
-    if (need_grant) {
-        /* The releaser that set owner = us stores our grant next (owner,
-         * fence, grant). Wait for it before clearing the announce: the two
-         * share a line, and on a cached scan region a whole-line writeback of
-         * its grant must not land after our clear (it would resurrect the
-         * announce). Short: the grant store follows the owner store. */
-        unsigned n = 0;
-        h->grant_waits++;
-        while (ncl_uc_load_w(ann, 1) != aval)
-            ncl_spin_wait(&n);
+    if (cfg.handoff_opts & NCL_HO_CLEAR) {
+        /* Keep the announce (and any wait for a grant still on its way) until
+         * the global release: only the holder scans, and it skips itself. */
+        L->ann_set = announced;
+        L->ann_val = aval;
+        L->need_grant = need_grant;
+        ncl_fence(); /* ownership observed before the CS */
+    } else {
+        if (need_grant) {
+            /* The releaser that set owner = us stores our grant next (owner,
+             * fence, grant). Wait for it before clearing the announce: the two
+             * share a line, and on a cached scan region a whole-line writeback
+             * of its grant must not land after our clear (it would resurrect
+             * the announce). Short: the grant store follows the owner store. */
+            unsigned n = 0;
+            h->grant_waits++;
+            while (ncl_uc_load_w(ann, 1) != aval)
+                ncl_spin_wait(&n);
+        }
+        ncl_fence(); /* ownership observed before the CS and the clear below */
+        if (announced)
+            ncl_uc_store(ann, 0);
     }
-    ncl_fence(); /* ownership observed before the CS and the clear below */
-    if (announced)
-        ncl_uc_store(ann, 0);
+    if (cfg.handoff_opts & NCL_HO_PREPICK)
+        prepick(L, me);
     return path;
 }
 
-/* Design §3.3 release: never enters the gate. Data is already written back. */
 static void handoff_release(struct ncl_local_lock *L, int me)
 {
     struct ncl_handoff_stats *h = &L->st.ho;
     const int P = hdr->participants;
+    const int grant = cfg.handoff_opts & NCL_HO_GRANT;
     int w = -1;
     uint64_t seq = 0; /* the picked waiter's announce word (WAIT_OWN: its sequence) */
+
+    if (L->ann_set) {
+        /* CLEAR: our announce stayed set while we held the lock. Clear it
+         * now; the fence before the handoff store makes it visible before
+         * anyone else can hold the lock and scan. */
+        ncl_line_t *ann = &L->announce[me];
+        if (L->need_grant) {
+            /* See handoff_acquire: a grant still on its way must land before
+             * our clear. Long since done by now, in practice. */
+            unsigned n = 0;
+            h->grant_waits++;
+            while (ncl_uc_load_w(ann, 1) != L->ann_val)
+                ncl_spin_wait(&n);
+            L->need_grant = 0;
+        }
+        ncl_uc_store(ann, 0);
+        L->ann_set = 0;
+    }
+
     int probe = cfg.pick_policy == NCL_PICK_PROBE ||
                 (cfg.pick_policy == NCL_PICK_ADAPTIVE && !L->acq_contended);
+    /* PREPICK: the first announced slot in the snapshot, in the order the
+     * normal pick would read them. */
+    for (int k = 0; k < L->npre; k++) {
+        uint64_t v = ncl_meta_peek_w(&L->announce[L->pre[k]], 0);
+        if (v) {
+            w = L->pre[k];
+            seq = v;
+            h->prepick_hits++;
+            break;
+        }
+    }
+    L->npre = 0;
     if (probe && P > 1) {
         /* One probe at this node's round-robin pointer. Hit: hand off and
          * continue after that node next time. Miss: FREE (a waiter we did
          * not probe recovers through the gate) and advance by one. Under
          * saturation every slot is set, so the pointers sweep the ring. */
         int j = L->pw_next;
-        h->announce_loads++;
-        if ((seq = ncl_uc_load(&L->announce[j])))
-            w = j;
+        if (w < 0) {
+            h->announce_loads++;
+            if ((seq = ncl_uc_load(&L->announce[j])))
+                w = j;
+        }
         int nx = (j + 1) % P;
         if (nx == me)
             nx = (nx + 1) % P;
         L->pw_next = nx;
-    } else
-    w = ncl_uc_scan_first_v(L->announce, P, me + 1, P - 1, me, &h->announce_loads, &seq); /* round-robin after me */
-    ncl_fence(); /* CS effects, data writeback and the scan before the owner store */
-    if (w >= 0) {
+    } else if (w < 0) {
+        w = ncl_uc_scan_first_v(L->announce, P, me + 1, P - 1, me, &h->announce_loads, &seq); /* round-robin after me */
+    }
+    ncl_fence(); /* CS effects, data writeback, our clear and the scan before the handoff */
+    if (w >= 0 && grant) {
+        /* GRANT: owner stays HELD; the grant store alone passes the lock (and,
+         * through the fence above, the data). Our copy of w's line is
+         * current: we read it after an invalidate (or in the snapshot), and
+         * w writes it only after seeing this grant. */
+        ncl_uc_store_w(&L->announce[w], 1, seq);
+        h->handoffs_sent++;
+    } else if (w >= 0) {
         ncl_uc_store(L->owner, (uint64_t)w + 1); /* handoff = one 8-byte store */
         h->handoffs_sent++;
         if (cfg.handoff_wait == NCL_WAIT_OWN) {
@@ -507,7 +654,7 @@ static void handoff_release(struct ncl_local_lock *L, int me)
         ncl_uc_store(L->owner, OWNER_FREE);
         h->frees++;
     }
-    ncl_fence_ss(); /* owner store before the submutex unlock */
+    ncl_fence_ss(); /* handoff store before the submutex unlock */
 }
 
 void ncl_acquire(struct ncl_thread *t, int lock)
