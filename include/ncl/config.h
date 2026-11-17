@@ -19,6 +19,16 @@
 #define NCL_MAX_PARTICIPANTS 256
 #endif
 
+/* Diagnostic counters (path mix, polls, retries, ...). -DNCL_STATS=OFF compiles
+ * them out to check that they do not skew measurements; the counters then
+ * read 0. Throughput, latency and fairness are counted by the bench itself,
+ * and the stress test's acquire/release balance check is always kept. */
+#ifndef NCL_NO_STATS
+#define NCL_STAT(e) ((void)(e))
+#else
+#define NCL_STAT(e) ((void)0)
+#endif
+
 #define NCL_ALIGNED(n) __attribute__((aligned(n)))
 #define NCL_LIKELY(x) __builtin_expect(!!(x), 1)
 #define NCL_UNLIKELY(x) __builtin_expect(!!(x), 0)

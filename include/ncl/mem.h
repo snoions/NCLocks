@@ -379,7 +379,7 @@ static inline int ncl_uc_scan_first_v(ncl_line_t *arr, int n, int start, int cou
                 int j = (start + k0) % n;
                 if (j == skip)
                     continue;
-                ++*nloads;
+                NCL_STAT(++*nloads);
                 if ((x = ncl_uc_load(&arr[j]))) {
                     *val = x;
                     return j;
@@ -398,7 +398,7 @@ static inline int ncl_uc_scan_first_v(ncl_line_t *arr, int n, int start, int cou
         if (m == 0)
             return -1;
         ncl_uc_load_many(ls, m, v);
-        *nloads += (uint64_t)m;
+        NCL_STAT(*nloads += (uint64_t)m);
         for (int k = 0; k < m; k++)
             if (v[k]) {
                 *val = v[k];
@@ -410,7 +410,7 @@ static inline int ncl_uc_scan_first_v(ncl_line_t *arr, int n, int start, int cou
         int j = (start + k) % n;
         if (j == skip)
             continue;
-        ++*nloads;
+        NCL_STAT(++*nloads);
         if ((x = ncl_uc_load(&arr[j]))) {
             *val = x;
             return j;

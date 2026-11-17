@@ -301,3 +301,28 @@ Fairness matches the uc column except Lamport (0.92 uc, 0.82 split).
   balance at larger N and on real hardware is open. A store path that does not wait (a
   cached store whose flush is not followed by an uncached access before the next fence)
   would need protocol changes, not a layout change.
+
+## Measurement overhead of the diagnostic counters
+
+The lock paths count events for diagnosis (path mix, gate entries, polls, retries,
+scan loads, server rounds): plain increments of node-local memory, plus branches on the
+run's `cfg` options. `cmake -DNCL_STATS=OFF` compiles the counters out (`NCL_STAT()` in
+`include/ncl/config.h`); throughput, latency and fairness are counted by `ncl_bench`
+itself, and the stress test's acquire/release balance stays. Dev box, 8x1, 200 ns CS,
+`-B 16`, 2 s, 3 reps interleaved, ratio stats-off / stats-on:
+
+| | coherent L=1 | coherent L=256 | cached-flush L=1 | cached-flush L=256 |
+|---|---|---|---|---|
+| tournament Phase 1 | 1.002 | 1.006 | 0.974 | 1.002 |
+| lamport Phase 1 | 1.024 | 1.015 | 1.010 | 1.008 |
+| tournament 2b (`--ho all`) | 1.020 | 1.018 | 1.020 | 1.008 |
+| tournament 2b `--ho none` | 0.997 | 1.017 | 0.977 | 1.002 |
+| lamport 2b (`--ho all`) | 1.011 | 1.019 | 0.999 | 1.007 |
+| server chain | 1.020 | 1.013 | 1.006 | 1.013 |
+
+The counters cost 0-2%, in the same proportion for every variant. That is within the
+run-to-run noise at L=1 (sd 1-3%) and measurable only at L=256 on coherent memory, the
+fastest case (sd <0.1%). Fairness is unchanged. On CXL, where a metadata round trip
+takes several times longer than with cached-flush on the dev box, the share is smaller
+still. Rankings and the `--ho` comparisons are unaffected. Option branches are in both
+builds; they read the constant `cfg` and are always predicted the same way.

@@ -208,7 +208,7 @@ static void grant_next(struct srv_lock *sl)
     sl->grants_this_hold++;
     ncl_fence(); /* the message(s) / top-lock reads that allow this grant come first */
     ncl_uc_store(grant_slot(wt.node, wt.gslot), reply_encode(sl->lock, REPLY_GRANT, wt.reqid));
-    S.st.grants++;
+    NCL_STAT(S.st.grants++);
 }
 
 /* Drive one lock's state machine as far as it can go without waiting.
@@ -224,7 +224,7 @@ static void advance(struct srv_lock *sl)
             sl->slow = SLOW_TRYING;
         }
         if (sl->slow == SLOW_TRYING) {
-            S.st.top_wait_polls++;
+            NCL_STAT(S.st.top_wait_polls++);
             if (!ncl_top_may_enter(&sl->b, NCL_SIDE_SLOW)) {
                 if (!sl->in_trying) { /* poll again in later rounds */
                     sl->in_trying = 1;
@@ -234,7 +234,7 @@ static void advance(struct srv_lock *sl)
             }
             sl->slow = SLOW_HOLDING;
             sl->grants_this_hold = 0;
-            S.st.top_acquires++;
+            NCL_STAT(S.st.top_acquires++);
         }
         /* Starvation fix: yield to a waiting fast winner between grants, but
          * only after granting at least once in this hold (else a stream of
@@ -243,7 +243,7 @@ static void advance(struct srv_lock *sl)
             ncl_top_other_flag(&sl->b, NCL_SIDE_SLOW)) {
             ncl_fence();
             ncl_top_unlock(&sl->b, NCL_SIDE_SLOW);
-            S.st.top_yields++;
+            NCL_STAT(S.st.top_yields++);
             ncl_top_announce(&sl->b, NCL_SIDE_SLOW); /* turn = SLOW: fast goes first */
             sl->slow = SLOW_TRYING;
             if (!sl->in_trying) {
@@ -293,7 +293,7 @@ static void chain_grant(struct srv_lock *sl)
     int hint = sl->next - sl->cur > 1; /* succ[cur] already published */
     ncl_fence(); /* REL / succ publication before the grant */
     ncl_uc_store(grant_slot(wt.node, wt.gslot), chain_reply(sl->lock, wt.reqid, sl->cur, hint, 0));
-    S.st.grants++;
+    NCL_STAT(S.st.grants++);
 }
 
 static void chain_advance(struct srv_lock *sl, int grant)
@@ -312,14 +312,14 @@ static void chain_advance(struct srv_lock *sl, int grant)
         if (n != sl->cur) {
             ncl_fence();
             ncl_uc_store(succ_line(sl, n - 1), succ_encode(n - 1, wt.node, wt.gslot, wt.reqid));
-            S.st.published++;
+            NCL_STAT(S.st.published++);
         } else if (!sl->held) {
             sl->held = 1;
             grant = 1;
         }
     }
     if (sl->qn)
-        S.st.window_full++;
+        NCL_STAT(S.st.window_full++);
     if (grant)
         chain_grant(sl);
 }
@@ -335,7 +335,7 @@ static void chain_process(int src, unsigned type, struct srv_lock *sl, uint32_t 
             (struct waiter){(uint8_t)src, (uint16_t)gslot, (uint16_t)reqid};
         sl->qn++;
         if (sl->held)
-            S.st.queued++;
+            NCL_STAT(S.st.queued++);
         chain_advance(sl, 0);
     } else if (type == MSG_REL) {
         /* REL(k): k in [cur, next) and assigned to src. */
@@ -348,7 +348,7 @@ static void chain_process(int src, unsigned type, struct srv_lock *sl, uint32_t 
         sl->cur = k + 1;
         int grant = sl->cur != sl->next; /* k+1 assigned but not passed to */
         if (grant)
-            S.st.rel_grants++;
+            NCL_STAT(S.st.rel_grants++);
         else
             sl->held = 0;
         chain_advance(sl, grant);
@@ -363,7 +363,7 @@ static void process(int src, uint64_t w)
     uint32_t lock = (uint32_t)(w >> M_LOCK_SHIFT) & MASK(NCL_SRV_LOCK_BITS);
     uint32_t gslot = (uint32_t)(w >> M_GSLOT_SHIFT) & MASK(NCL_SRV_GSLOT_BITS);
     uint32_t reqid = (uint32_t)w & MASK(NCL_SRV_REQID_BITS);
-    S.st.msgs++;
+    NCL_STAT(S.st.msgs++);
 
     /* Bounds-check everything before acting on the message's behalf. */
     if (lock >= (uint32_t)S.cfg.nlocks || S.local_idx[lock] < 0 || gslot >= S.L.grants_per_node) {
@@ -384,7 +384,7 @@ static void process(int src, uint64_t w)
             (struct waiter){(uint8_t)src, (uint16_t)gslot, (uint16_t)reqid};
         sl->qn++;
         if (sl->held)
-            S.st.queued++;
+            NCL_STAT(S.st.queued++);
     } else if (type == MSG_REL) {
         if (!sl->held || sl->holder != src) {
             S.st.errors++;
@@ -433,7 +433,7 @@ static void *server_main(void *arg)
     ncl_backoff_init(&bo);
     while (!atomic_load_explicit(&S.stop, memory_order_relaxed)) {
         int got = 0;
-        S.st.rounds++;
+        NCL_STAT(S.st.rounds++);
         /* At most one message per source per round: round-robin fairness. */
         /* One poll round over the expected slot of every source queue.
          * Batched (cached queue lines: cached-flush, or the split layout's
@@ -465,7 +465,7 @@ static void *server_main(void *arg)
         if (got) {
             ncl_backoff_init(&bo);
         } else {
-            S.st.idle_rounds++;
+            NCL_STAT(S.st.idle_rounds++);
             ncl_backoff_capped(&bo, S.backoff_cap); /* adaptive: back off while idle */
             if (bo.cur >= S.backoff_cap)
                 sched_yield(); /* fully backed off: don't hog an oversubscribed CPU */
@@ -567,7 +567,7 @@ int ncl_srv_chain_release(int lock, uint64_t grant, int always_read, struct ncl_
     if (always_read || (grant & R_HINT)) {
         ncl_line_t *succ = S.blocks + (size_t)lock * S.lines_per_lock;
         uint64_t s = ncl_uc_load(succ + (seq & (S.R - 1)));
-        h->announce_loads++;
+        NCL_STAT(h->announce_loads++);
         if ((s & S_VALID) && ((uint32_t)(s >> S_SEQ_SHIFT) & SEQ_MASK) == seq) {
             unsigned node = (unsigned)(s >> S_NODE_SHIFT) & 63;
             uint32_t gslot = (uint32_t)(s >> M_GSLOT_SHIFT) & MASK(NCL_SRV_GSLOT_BITS);
@@ -579,12 +579,12 @@ int ncl_srv_chain_release(int lock, uint64_t grant, int always_read, struct ncl_
             ncl_fence(); /* data writeback before the grant */
             ncl_uc_store(grant_slot((int)node, gslot),
                          chain_reply((uint32_t)lock, reqid, seq + 1, 1, 1));
-            h->handoffs_sent++;
+            NCL_STAT(h->handoffs_sent++);
             return 1;
         }
-        h->missed_announce++; /* read, but no successor for us */
+        NCL_STAT(h->missed_announce++); /* read, but no successor for us */
     }
-    h->frees++;
+    NCL_STAT(h->frees++);
     send(ncl_srv_home(lock, S.N), MSG_REL, (uint32_t)lock, 0, seq);
     return 0;
 }

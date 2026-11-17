@@ -9,6 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(NCL_SANITIZE "Build with -fsanitize=address,undefined" OFF)
+option(NCL_STATS "Diagnostic counters in the lock paths (OFF: compiled out)" ON)
 set(NCL_MAX_NODES 64 CACHE STRING "Max nodes")
 set(NCL_MAX_PARTICIPANTS 256 CACHE STRING "Max global-algorithm participants")
 
@@ -28,6 +29,9 @@ target_include_directories(ncl PUBLIC include)
 target_compile_definitions(ncl PUBLIC
   NCL_MAX_NODES=${NCL_MAX_NODES} NCL_MAX_PARTICIPANTS=${NCL_MAX_PARTICIPANTS})
 target_link_libraries(ncl PUBLIC Threads::Threads)
+if(NOT NCL_STATS)
+  target_compile_definitions(ncl PUBLIC NCL_NO_STATS)
+endif()
 
 add_executable(ncl_stress tests/stress.c)
 target_link_libraries(ncl_stress ncl)

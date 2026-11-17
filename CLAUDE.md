@@ -104,7 +104,7 @@ Emulated nodes are forked processes sharing a memfd mapped at a fixed VA
 ## Build & test
 
 ```
-cmake -S . -B build && cmake --build build -j
+cmake -S . -B build && cmake --build build -j   # -DNCL_STATS=OFF: counters compiled out (docs/backends.md)
 cd build && ctest -j4                              # stress matrix + emu negative tests; uc skipped w/o driver
 ./ncl_stress -a hybrid -b emu -n 8 -t 2 -i 200000  # single stress run
 ./ncl_bench -a lamport -b uc -n 8 -s 2 -c 200          # closed loop

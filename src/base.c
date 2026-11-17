@@ -155,7 +155,7 @@ start:
     if (ncl_uc_load(LAM_Y(b)) != 0) {
         ncl_uc_store(LAM_B(b, i), 0);
         await_eq(LAM_Y(b), 0);
-        st->lamport_retries++;
+        NCL_STAT(st->lamport_retries++);
         goto start;
     }
     ncl_uc_store(LAM_Y(b), me);
@@ -171,7 +171,7 @@ start:
             await_eq(LAM_B(b, j), 0);
         if (ncl_uc_load(LAM_Y(b)) != me) {
             await_eq(LAM_Y(b), 0);
-            st->lamport_retries++;
+            NCL_STAT(st->lamport_retries++);
             goto start;
         }
     }
@@ -265,13 +265,13 @@ int ncl_splitter_enter(struct ncl_base *b, int i, struct ncl_base_stats *st)
     ncl_uc_store(SP_RACE(b), me);
     ncl_fence(); /* (1) */
     if (ncl_uc_load(SP_DOOR(b)) == DOOR_CLOSED) {
-        st->split_fail_closed++; /* "right" */
+        NCL_STAT(st->split_fail_closed++); /* "right" */
         return 0;
     }
     ncl_uc_store(SP_DOOR(b), DOOR_CLOSED);
     ncl_fence(); /* (2) */
     if (ncl_uc_load(SP_RACE(b)) != me) {
-        st->split_fail_lost++; /* "down" */
+        NCL_STAT(st->split_fail_lost++); /* "down" */
         return 0;
     }
     return 1; /* "stop" */
@@ -286,7 +286,7 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
     int start = b->reset_hint >= 0 && b->reset_hint != i ? b->reset_hint : (i + 1) % np;
     if (ncl_fast_release == NCL_FASTREL_ALWAYS) {
         ncl_splitter_open(b);
-        st->split_resets++;
+        NCL_STAT(st->split_resets++);
         return;
     }
     if (ncl_fast_release == NCL_FASTREL_HINT) {
@@ -294,9 +294,9 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
          * node is present. UNSAFE: that node may be a slow releaser in the
          * middle of its reset check (see base.h). Measurement only. */
         if (start != i) {
-            st->split_scan_loads++;
+            NCL_STAT(st->split_scan_loads++);
             if (ncl_uc_load(SP_PRESENT(b, start))) {
-                st->split_fast_keep_closed++;
+                NCL_STAT(st->split_fast_keep_closed++);
                 return;
             }
         }
@@ -307,7 +307,7 @@ void ncl_splitter_open_unless_others(struct ncl_base *b, int i, struct ncl_base_
     int j = ncl_uc_scan_first(SP_PRESENT(b, 0), np, start, np, i, &st->split_scan_loads);
     if (j >= 0) {
         b->reset_hint = j;
-        st->split_fast_keep_closed++;
+        NCL_STAT(st->split_fast_keep_closed++);
         return; /* leave CLOSED: someone is on the slow path */
     }
     ncl_fence(); /* scan before the store (load->store order, explicit) */
@@ -338,8 +338,8 @@ void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_s
     if (hint < 0 || hint == skip)
         hint = skip >= 0 ? (skip + 1) % np : 0;
     if (hint != skip && ncl_uc_load(SP_PRESENT(b, hint))) {
-        st->split_precheck_skips++;
-        st->split_reset_skips++;
+        NCL_STAT(st->split_precheck_skips++);
+        NCL_STAT(st->split_reset_skips++);
         return;
     }
 
@@ -356,14 +356,14 @@ void ncl_splitter_reset_if_quiet(struct ncl_base *b, int skip, struct ncl_base_s
     int j = ncl_uc_scan_first(SP_PRESENT(b, 0), np, start, np, skip, &st->split_scan_loads);
     if (j >= 0) {
         b->reset_hint = j;
-        st->split_reset_skips++;
+        NCL_STAT(st->split_reset_skips++);
         return;
     }
     if (NCL_UNLIKELY(ncl_debug_reset_delay))
         ncl_lat_spin_cycles(ncl_debug_reset_delay);
     ncl_fence();
     ncl_uc_store(SP_DOOR(b), DOOR_OPEN);
-    st->split_resets++;
+    NCL_STAT(st->split_resets++);
 }
 
 void ncl_top_announce(struct ncl_base *b, int side)
@@ -465,7 +465,7 @@ static int ak_try_fast(struct ncl_base *b, int i, struct ncl_base_stats *st, int
     uint64_t y = ncl_uc_load(AK_Y(b));             /* 2: y := Y */
     ak_check(b, y);
     if (!AK_FREE(y)) {
-        st->split_fail_closed++;
+        NCL_STAT(st->split_fail_closed++);
         *slow2 = 0;                                /* SLOW 1 */
         return 0;
     }
@@ -476,7 +476,7 @@ static int ak_try_fast(struct ncl_base *b, int i, struct ncl_base_stats *st, int
     *slow2 = 1;
     if (ncl_uc_load(AK_X(b)) != me ||              /* 5: X != p */
         ncl_uc_load(AK_INFAST(b))) {               /* 6: Infast */
-        st->split_fail_lost++;
+        NCL_STAT(st->split_fail_lost++);
         return 0;
     }
     *k = AK_INDX(y);
@@ -484,7 +484,7 @@ static int ak_try_fast(struct ncl_base *b, int i, struct ncl_base_stats *st, int
     ncl_fence();
     if (ncl_uc_load(AK_RESET(b)) != y) {           /* 8: Reset != y */
         ncl_uc_store(AK_NT(b, *k), 0);             /* 9 */
-        st->split_fail_lost++;
+        NCL_STAT(st->split_fail_lost++);
         return 0;
     }
     ncl_uc_store(AK_INFAST(b), 1);                 /* 10: Infast := true */
@@ -523,16 +523,16 @@ static void ak_reopen_if_clear(struct ncl_base *b, int k, int check_nt, struct n
             nt = ncl_uc_load(AK_NT(b, k));
         ob = nt ? 0 : ncl_uc_load(AK_OBS(b, k));
     }
-    st->split_scan_loads += (uint64_t)(check_nt + 1);
+    NCL_STAT(st->split_scan_loads += (uint64_t)(check_nt + 1));
     if (nt || ob) {
-        st->split_reset_skips++;
+        NCL_STAT(st->split_reset_skips++);
         return;
     }
     uint64_t w = ak_word(1, (uint64_t)((k + 1) % b->P));
     ncl_uc_store(AK_RESET(b), w);                  /* 16/36 */
     ncl_fence_ss();
     ncl_uc_store(AK_Y(b), w);                      /* 17/37: fast path open */
-    st->split_resets++;
+    NCL_STAT(st->split_resets++);
 }
 
 /* Statements 13-20 (fast-path release), caller has fenced. */
@@ -545,7 +545,7 @@ static void ak_fast_exit(struct ncl_base *b, int i, int k, struct ncl_base_stats
         /* Fairness variant: a slow-path process (or, for AKSRV, the server
          * with queued requests) waits at the top lock; leave the fast path
          * closed (always safe). The slow side's reset reopens it. */
-        st->split_fast_keep_closed++;
+        NCL_STAT(st->split_fast_keep_closed++);
     } else {
         ak_reopen_if_clear(b, k, 0, st);           /* 15-17: if !Obstacle[y.indx] */
     }

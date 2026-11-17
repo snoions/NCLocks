@@ -404,6 +404,7 @@ static void check_owner(uint64_t o)
 static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_stats *bst)
 {
     struct ncl_handoff_stats *h = &L->st.ho;
+    (void)h; /* only NCL_STAT uses it */
     const uint64_t mine = (uint64_t)me + 1;
     ncl_line_t *ann = &L->announce[me];
     int path;
@@ -437,7 +438,7 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
             o = ncl_uc_load(L->owner);
             check_owner(o);
             if (!grant && o == mine) {
-                h->wait_handoffs++;
+                NCL_STAT(h->wait_handoffs++);
                 need_grant = own;
                 L->acq_contended = 1;
                 path = NCL_PATH_GLOBAL_HANDOFF;
@@ -449,10 +450,10 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
     for (;;) {
         if (skip) {
             skip = 0;
-            h->gate_skips++;
+            NCL_STAT(h->gate_skips++);
         } else {
             int gpath = ncl_base_lock(&L->base, me, bst);
-            h->gate_entries++;
+            NCL_STAT(h->gate_entries++);
             if (place == NCL_ANNOUNCE_INSIDE && !announced) {
                 ncl_uc_store(ann, aval);
                 announced = 1;
@@ -470,12 +471,12 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
                 ncl_fence(); /* owner store before the gate-exit stores */
                 ncl_base_unlock(&L->base, me, gpath, bst);
                 if (o == mine) {
-                    h->gate_handoffs++;
+                    NCL_STAT(h->gate_handoffs++);
                     need_grant = own;
                     L->acq_contended = 1;
                     path = NCL_PATH_GLOBAL_HANDOFF;
                 } else {
-                    h->gate_takes++;
+                    NCL_STAT(h->gate_takes++);
                     L->acq_contended = waited;
                     path = gpath;
                 }
@@ -514,9 +515,9 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
              * waited. A fixed interval rebuilt the hot spot whenever waits
              * were long (Lamport at 32 nodes, docs/cxl_results.md). */
             if (own) {
-                h->grant_polls++;
+                NCL_STAT(h->grant_polls++);
                 if (ncl_uc_load_w(ann, 1) == aval) {
-                    h->wait_handoffs++;
+                    NCL_STAT(h->wait_handoffs++);
                     L->acq_contended = 1;
                     path = NCL_PATH_GLOBAL_HANDOFF;
                     goto acquired;
@@ -525,10 +526,10 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
             if (!own || ++polls == recheck) {
                 recheck *= 2;
                 o = ncl_uc_load(L->owner);
-                h->owner_polls++;
+                NCL_STAT(h->owner_polls++);
                 check_owner(o);
                 if (!grant && o == mine) {
-                    h->wait_handoffs++;
+                    NCL_STAT(h->wait_handoffs++);
                     L->acq_contended = 1;
                     path = NCL_PATH_GLOBAL_HANDOFF;
                     need_grant = own;
@@ -538,7 +539,7 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
                     /* Releaser missed us: retry the gate. GRANT: a releaser
                      * either grants us or stores FREE, never both, so no
                      * grant can be on its way. */
-                    h->missed_announce++;
+                    NCL_STAT(h->missed_announce++);
                     break;
                 }
             }
@@ -565,7 +566,7 @@ acquired:
              * of its grant must not land after our clear (it would resurrect
              * the announce). Short: the grant store follows the owner store. */
             unsigned n = 0;
-            h->grant_waits++;
+            NCL_STAT(h->grant_waits++);
             while (ncl_uc_load_w(ann, 1) != aval)
                 ncl_spin_wait(&n);
         }
@@ -593,7 +594,7 @@ static void handoff_release(struct ncl_local_lock *L, int me)
             /* See handoff_acquire: a grant still on its way must land before
              * our clear. Long since done by now, in practice. */
             unsigned n = 0;
-            h->grant_waits++;
+            NCL_STAT(h->grant_waits++);
             while (ncl_uc_load_w(ann, 1) != L->ann_val)
                 ncl_spin_wait(&n);
             L->need_grant = 0;
@@ -611,7 +612,7 @@ static void handoff_release(struct ncl_local_lock *L, int me)
          * saturation every slot is set, so the pointers sweep the ring. */
         int j = L->pw_next;
         if (w < 0) {
-            h->announce_loads++;
+            NCL_STAT(h->announce_loads++);
             if ((seq = ncl_uc_load(&L->announce[j])))
                 w = j;
         }
@@ -629,10 +630,10 @@ static void handoff_release(struct ncl_local_lock *L, int me)
          * current: we read it after an invalidate (or in the snapshot), and
          * w writes it only after seeing this grant. */
         ncl_uc_store_w(&L->announce[w], 1, seq);
-        h->handoffs_sent++;
+        NCL_STAT(h->handoffs_sent++);
     } else if (w >= 0) {
         ncl_uc_store(L->owner, (uint64_t)w + 1); /* handoff = one 8-byte store */
-        h->handoffs_sent++;
+        NCL_STAT(h->handoffs_sent++);
         if (cfg.handoff_wait == NCL_WAIT_OWN) {
             /* Grant after owner: w may run and release (storing owner) as soon
              * as it sees the grant, so our owner store must be visible first.
@@ -649,7 +650,7 @@ static void handoff_release(struct ncl_local_lock *L, int me)
         }
     } else {
         ncl_uc_store(L->owner, OWNER_FREE);
-        h->frees++;
+        NCL_STAT(h->frees++);
     }
     ncl_fence_ss(); /* handoff store before the submutex unlock */
 }
@@ -673,7 +674,7 @@ void ncl_acquire(struct ncl_thread *t, int lock)
          * within the node, so no invalidate. */
         ncl_fence();
         L->st.acquires++;
-        L->st.path[NCL_PATH_LOCAL_HANDOFF]++;
+        NCL_STAT(L->st.path[NCL_PATH_LOCAL_HANDOFF]++);
         return;
     }
 
@@ -686,7 +687,7 @@ void ncl_acquire(struct ncl_thread *t, int lock)
             L->srv_grant = g;
             if (ncl_srv_grant_passed(g)) {
                 path = NCL_PATH_GLOBAL_HANDOFF;
-                L->st.ho.wait_handoffs++;
+                NCL_STAT(L->st.ho.wait_handoffs++);
             }
         }
     } else if (ncl_alg_fastsrv_like(cfg.alg)) {
@@ -706,8 +707,8 @@ void ncl_acquire(struct ncl_thread *t, int lock)
     L->ndirty = 0;
     L->dirty_full = 0;
     L->st.acquires++;
-    L->st.path[path]++;
-    ncl_base_stats_add(&L->st.base, &tmp);
+    NCL_STAT(L->st.path[path]++);
+    NCL_STAT(ncl_base_stats_add(&L->st.base, &tmp));
 
     /* Global lock arrived at this node: drop stale cached data. */
     if (L->data_len && !cfg.debug_skip_data_inv)
@@ -755,7 +756,7 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
                 ncl_sub_unlock(&L->sub);
                 return;
             }
-            L->st.cap_releases++;
+            NCL_STAT(L->st.cap_releases++);
         }
     }
 
