@@ -2,7 +2,8 @@
 """Median tables for a scripts/cxl_sweep.sh result directory (needs pandas).
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
-Phases: p1 abl 2a 2b own ho locks base open dram (default: those whose CSV exists).
+Phases: p1 abl 2a 2b own ho locks base open dram conc open2b (default: those whose CSV
+exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -41,6 +42,34 @@ def open_loop(d):
     return r.unstack("config")
 
 
+def conc(d):
+    """ncl_memconc: aggregate Mops/s (median) and ns per op per thread, by op and T."""
+    r = d.groupby(["op", "threads", "config"]).agg(
+        mops=("mops", "median"), ns=("ns_per_op_per_thread", "median"))
+    return r.round(1).unstack("config")
+
+
+def open2b(d):
+    """Open-loop rows by variant and offered load; closed-loop rows separately."""
+    d = d.copy()
+    d["variant"] = (d.alg + "/" + d["mode"] + "/" + d.ho_opts.astype(str) + "/"
+                    + d.pick.astype(str)).str.replace("/-/-", "", regex=False)
+    o = d[d.arrival != "closed"]
+    r = o.groupby(["locks", "target_rps", "variant"]).agg(
+        ach=("achieved_rps", "median"), unserved=("unserved_frac", "median"),
+        p50=("lock_p50", "median"), p99=("lock_p99", "median"),
+        missed=("missed_announce_per_acq", "median"))
+    r["ach"] = (r.ach / 1e3).round(0)
+    r["p50"] = (r.p50 / 1e3).round(2)
+    r["p99"] = (r.p99 / 1e3).round(1)
+    out = r.to_string()
+    c = d[d.arrival == "closed"]
+    if len(c):
+        c = c.assign(config=c.config + "/" + c.pick.astype(str))
+        out += "\n\nclosed loop, L=256:\n" + closed(c, ["lock_p99", "missed_announce_per_acq"]).to_string()
+    return out
+
+
 EXTRA = {
     "p1": ["fast_frac", "lock_p99"],
     "2a": ["local_handoff_frac"],
@@ -55,7 +84,8 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     root = sys.argv[1]
-    phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram"]
+    phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
+                              "conc", "open2b"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -68,6 +98,10 @@ def main():
             d["config"] = d["mode"] + "/" + d["ho_opts"]
         if ph == "open":
             print(open_loop(d).to_string())
+        elif ph == "conc":
+            print(conc(d).to_string())
+        elif ph == "open2b":
+            print(open2b(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()

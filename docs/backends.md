@@ -326,3 +326,32 @@ fastest case (sd <0.1%). Fairness is unchanged. On CXL, where a metadata round t
 takes several times longer than with cached-flush on the dev box, the share is smaller
 still. Rankings and the `--ho` comparisons are unaffected. Option branches are in both
 builds; they read the constant `cfg` and are always predicted the same way.
+
+## Device concurrency (`ncl_memconc`)
+
+`ncl_memconc -b uc|cached-flush|coherent -T 1,2,4,... -o ops [--mem-node N] [--wb clwb]
+[-C]`: T pinned threads (process CPUs in order; more threads than CPUs is refused) issue
+one access pattern on their own lines (2-line stride for metadata, 4 for data) for `-s`
+seconds; one row per (op, T) with aggregate Mops/s, ns per op per thread and the
+per-thread min/max. It asks whether the device serves concurrent accesses in parallel,
+and separates the uncached memory type from partial writes. Ops:
+
+- `load`, `store` (8 bytes, no fence), `storef` (store + mfence), `dekker` (store own
+  line, mfence, load the next thread's line): metadata through the backend (UC on uc,
+  flush around the access on cached-flush).
+- `shload`: all threads load the same metadata line (a polled hot spot).
+- `wb64`: write the own cached data line, writeback (clflushopt or `--wb clwb`), sfence: a
+  full-line write.
+- `nt8` / `nt64`: one 8-byte movnti / eight filling the line, sfence: a partial vs a full
+  line write from write-back memory, with no UC mapping involved.
+
+If uc `store`/`storef` flatten with T on the device while `nt64` and `wb64` scale, and `nt8`
+flattens too, the limit is partial writes; if `nt8` scales, it is the UC path. Sweep phase
+`conc` (`scripts/cxl_sweep.sh conc`) runs uc (pool on MEMNODE), cf on MEMNODE and cf on
+the CPU node's DRAM, at T = 1-60.
+
+Dev box (uc pool and cf on node 0 DRAM, T = 1 / 8, Mops/s): uc `load` 11.5 / 142, `store`
+32 / 246, `storef` 22 / 170, `dekker` 8 / 76; `nt8` 22 / 211, `nt64` 21 / 199, `wb64` 7.6 /
+62. Everything scales with T except `shload`, which stops at ~21M/s from T=4 on every
+backend: same-line loads are served one at a time (the reason waiters poll their own
+line, `--wait own`).

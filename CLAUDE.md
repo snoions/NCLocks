@@ -95,6 +95,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   server placement (sibling = SMT sibling of the node's worker; use it when servers must share
   cores, e.g. N=8 on this 10-core host). Always report fairness with
   throughput: Lamport's throughput at the default backoff comes with severe starvation.
+- `bench/memconc.c` (`ncl_memconc`): aggregate throughput of T threads issuing one access
+  pattern (uc/cf load, store, Dekker step, same-line load, full-line writeback, 8- vs
+  64-byte movnti), to locate the uc ceiling on CXL; `docs/backends.md`, sweep phase `conc`.
 - Not yet implemented: home migration/NACK (2c), partial-write
   stress test (§5), skewed/phased access, LiTL interposition, KV store.
 

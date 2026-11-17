@@ -40,6 +40,8 @@ add_executable(ncl_bench bench/microbench.c)
 target_link_libraries(ncl_bench ncl m)
 add_executable(ncl_memlat bench/memlat.c)
 target_link_libraries(ncl_memlat ncl)
+add_executable(ncl_memconc bench/memconc.c)
+target_link_libraries(ncl_memconc ncl)
 
 enable_testing()
 foreach(alg lamport tournament hybrid server fastsrv ak)

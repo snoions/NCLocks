@@ -14,6 +14,12 @@
 #              with Phase 1 tournament and the server chain as references, L=1 and 256
 #   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms
 #   dram       main uc configs with metadata on DRAM: RELOAD THE DRIVER WITH nid=0 FIRST
+#   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
+#              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
+#              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
+#   open2b     open loop at N=16, T=1: 2b (--ho all and none, -X adaptive vs scan) vs
+#              Phase 1 and the server chain, L=1 and 256; plus closed-loop L=256 rows
+#              for the cost of -X scan when uncontended
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
 # rep and config name; failures and warnings go to $OUT/errors.log. Runs are
@@ -24,7 +30,9 @@
 #      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), OWN_NT ("4x1 8x1 16x1 32x1 16x3"),
 #      CFGS ("cf_clwb"; add uc_split_clwb for uc),
 #      LOCKS ("1 4 16 64 256"), LOCKS_NT ("16x1 32x1"),
-#      HO_NT ("4x1 16x1 32x1 16x3"), HO_LOCKS ("1 256"), HO_OPTS ("none grant,clear all"), RUN_TIMEOUT (120 s per run), WB (clwb)
+#      HO_NT ("4x1 16x1 32x1 16x3"), HO_LOCKS ("1 256"), HO_OPTS ("none grant,clear all"), RUN_TIMEOUT (120 s per run), WB (clwb),
+#      CONC_T ("1 2 4 8 16 24 32 48 60"), CONC_SECS (1), MEMCONC (build/ncl_memconc),
+#      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -45,6 +53,12 @@ HO_NT=${HO_NT:-"4x1 16x1 32x1 16x3"}         # phase ho
 HO_LOCKS=${HO_LOCKS:-"1 256"}
 HO_OPTS=${HO_OPTS:-"none grant,clear all"}
 RUN_TIMEOUT=${RUN_TIMEOUT:-120}
+CONC_T=${CONC_T:-"1 2 4 8 16 24 32 48 60"} # phase conc
+CONC_SECS=${CONC_SECS:-1}
+MEMCONC=${MEMCONC:-$ROOT/build/ncl_memconc}
+RATES1=${RATES1:-"25k 50k 100k 200k 300k 400k 450k"}             # phase open2b, L=1
+RATES256=${RATES256:-"250k 500k 1000k 1500k 2000k 2500k 3000k"} # phase open2b, L=256
+OPEN2B_N=${OPEN2B_N:-16}
 WB=${WB:-clwb} # writeback instruction of the main configs (clflushopt for hosts without clwb)
 
 NUMA=(numactl --cpunodebind="$CPUNODE" --membind="$CPUNODE")
@@ -222,6 +236,53 @@ dram() {
   done; done
 }
 
+conc() {
+  # Device concurrency: does the aggregate of uncached 8-byte accesses flatten
+  # with T while full-line writes scale (partial-write hypothesis)?
+  [ -x "$MEMCONC" ] || die "$MEMCONC not built"
+  local csv=$OUT/conc.csv
+  [ -s "$csv" ] || echo "rep,config,$("$MEMCONC" -H)" >"$csv"
+  local ts; ts=$(echo $CONC_T | tr ' ' ',')
+  local -A CC=(
+    [uc]="-b uc --wb $WB"
+    [cf_cxl]="-b cached-flush --wb $WB --mem-node $MEMNODE"
+    [cf_dram]="-b cached-flush --wb $WB --mem-node $CPUNODE"
+  )
+  for rep in $(seq "$REPS"); do for c in uc cf_cxl cf_dram; do
+    local o e rc; e=$(mktemp)
+    o=$(timeout 1800 "${NUMA[@]}" "$MEMCONC" ${CC[$c]} -T "$ts" -s "$CONC_SECS" -W 0.2 -C 2>"$e"); rc=$?
+    if [ $rc -ne 0 ] || [ -s "$e" ]; then
+      { echo "conc $c rep $rep rc=$rc:"; cat "$e"; } >>"$ERR"
+    fi
+    rm -f "$e"
+    [ -n "$o" ] && echo "$o" | sed "s/^/$rep,$c,/" >>"$csv"
+  done; done
+}
+
+open2b() {
+  local csv=$OUT/open2b.csv; header "$csv"
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for l in 1 256; do
+      local rates=$RATES1; [ "$l" = 256 ] && rates=$RATES256
+      for r in $rates; do
+        for v in "-a tournament" "-a lamport" "-a server -M handoff" \
+                 "-a tournament -M handoff" "-a tournament -M handoff -X scan" \
+                 "-a tournament -M handoff --ho none" \
+                 "-a lamport -M handoff" "-a lamport -M handoff -X scan" \
+                 "-a hybrid -M handoff -X scan"; do
+          run "$csv" "$rep" "$c" $v -n "$OPEN2B_N" -t 1 -l "$l" -r "$r" -A poisson ${CFG[$c]} "${COMMON[@]}"
+        done
+      done
+    done
+    # Closed loop, L=256 (mostly uncontended): what -X scan costs vs the probe.
+    for nt in ${OPEN2B_CLOSED_NT:-16x1 32x1}; do nt_split "$nt"
+      for a in tournament lamport; do for x in adaptive scan; do
+        run "$csv" "$rep" "$c" -a "$a" -M handoff -X "$x" -n "$N" -t "$T" -l 256 ${CFG[$c]} "${COMMON[@]}"
+      done; done
+    done
+  done; done
+}
+
 PHASES=${*:-"preflight p1 abl 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
@@ -237,6 +298,8 @@ for ph in $PHASES; do
     base) base ;;
     open) open_loop ;;
     dram) dram ;;
+    conc) conc ;;
+    open2b) open2b ;;
     *) die "unknown phase $ph" ;;
   esac
 done
