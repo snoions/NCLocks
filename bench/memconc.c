@@ -5,6 +5,9 @@
  * concurrently, or does the aggregate flatten? And is it the uncached memory
  * type or the partial (8-byte) write that limits it?
  *
+ * line GB/s = Mops * 64 B: the bandwidth if every op moved one full line (an
+ * upper bound for the 8-byte uc ops, exact for the line ops).
+ *
  * Usage: ncl_memconc -b uc|cached-flush|coherent [-T 1,2,4,...] [-o op,op,...]
  *                    [-s SECS] [-W WARMUP] [--mem-node N] [--wb clwb] [-C] [-H]
  * One row per (op, T). Threads are pinned to the process's CPUs in order
@@ -24,7 +27,14 @@
  *            partial write from write-back memory, no UC involved
  *   nt64     cached data: 8 movnti filling the own line, sfence: a full line
  *            through write combining
- * nt8 vs nt64 vs store separates "partial write" from "uncached".
+ *   rdbatch  cached data, 64 own lines per op batch: clflushopt all, mfence, load
+ *            all (64 misses in flight): the device's read line rate. Counted
+ *            per line, so Mops * 64 B = read bandwidth.
+ *   wbbatch  cached data: write 64 own lines, writeback each (clflushopt or
+ *            --wb clwb), sfence: the device's full-line write rate, per line.
+ * nt8 vs nt64 vs store separates "partial write" from "uncached"; rdbatch and
+ * wbbatch give the bandwidth the device sustains with many lines in flight,
+ * to compare with the bytes the uc ops reach (one line per UC access).
  */
 #define _GNU_SOURCE
 #include <getopt.h>
@@ -39,18 +49,22 @@
 #include "ncl/cpus.h"
 #include "ncl/mem.h"
 
-enum { OP_LOAD, OP_STORE, OP_STOREF, OP_DEKKER, OP_SHLOAD, OP_WB64, OP_NT8, OP_NT64, OP_N };
-static const char *op_names[OP_N] = {"load", "store", "storef", "dekker",
-                                     "shload", "wb64", "nt8", "nt64"};
+enum { OP_LOAD, OP_STORE, OP_STOREF, OP_DEKKER, OP_SHLOAD, OP_WB64, OP_NT8, OP_NT64,
+       OP_RDBATCH, OP_WBBATCH, OP_N };
+static const char *op_names[OP_N] = {"load", "store", "storef", "dekker", "shload",
+                                     "wb64", "nt8", "nt64", "rdbatch", "wbbatch"};
+#define BATCH 64 /* lines per rdbatch/wbbatch op */
 
 #define MAXT 256
 #define META_STRIDE 2 /* lines between threads' metadata lines (no adjacent-line pairs) */
-#define DATA_STRIDE 4 /* lines between threads' data lines */
+#define DATA_STRIDE 4 /* lines between threads' data lines (single-line ops) */
+#define BATCH_SPAN (2 * BATCH) /* lines between threads' batches */
 
 static int op, nthreads;
 static ncl_line_t *mlines; /* thread t: mlines[t * META_STRIDE] */
 static ncl_line_t *shared_line;
 static char *dlines;       /* thread t: dlines + t * DATA_STRIDE * 64 */
+static char *blines;       /* thread t: blines + t * BATCH_SPAN * 64, BATCH lines */
 static _Atomic int phase;  /* 0 warmup, 1 measuring, 2 stop */
 static pthread_barrier_t bar;
 static uint64_t counted[MAXT];
@@ -63,8 +77,37 @@ static void *worker(void *arg)
     ncl_line_t *my = &mlines[t * META_STRIDE];
     ncl_line_t *peer = &mlines[((t + 1) % (nthreads > 1 ? nthreads : 2)) * META_STRIDE];
     char *d = dlines + (size_t)t * DATA_STRIDE * 64;
+    char *bl = blines + (size_t)t * BATCH_SPAN * 64;
     uint64_t n = 0, start = 0, sink = 0;
     int started = 0;
+    if (op == OP_RDBATCH || op == OP_WBBATCH) {
+        /* Count lines: one loop pass below = 64 ops = one batch of 64 lines. */
+        pthread_barrier_wait(&bar);
+        for (;;) {
+            if (op == OP_RDBATCH) {
+                for (int k = 0; k < BATCH; k++)
+                    _mm_clflushopt(bl + k * 64);
+                _mm_mfence();
+                for (int k = 0; k < BATCH; k++)
+                    sink += *(volatile uint64_t *)(bl + k * 64);
+            } else {
+                for (int k = 0; k < BATCH; k++)
+                    *(volatile uint64_t *)(bl + k * 64) = n + (uint64_t)k;
+                ncl_data_writeback(bl, BATCH * 64);
+            }
+            n += BATCH;
+            int p = atomic_load_explicit(&phase, memory_order_relaxed);
+            if (p == 1 && !started) {
+                start = n;
+                started = 1;
+            } else if (p == 2) {
+                counted[t] = started ? n - start : 0;
+                break;
+            }
+        }
+        sink_all += sink;
+        return NULL;
+    }
     pthread_barrier_wait(&bar);
     for (;;) {
         for (int k = 0; k < 64; k++) {
@@ -120,13 +163,13 @@ static double now_s(void)
 
 static const char *HEADER =
     "backend,meta_memtype,mem_node,uc_pool_node,wb,op,threads,secs,mops,"
-    "ns_per_op_per_thread,thread_min_max_ratio,cpus";
+    "ns_per_op_per_thread,thread_min_max_ratio,cpus,line_gbps";
 
 int main(int argc, char **argv)
 {
     struct ncl_mem_cfg mc = {.backend = NCL_BACKEND_UC, .meta_size = 1 << 20,
-                             .scan_size = 1 << 16, .data_size = 1 << 20};
-    const char *tlist = "1,2,4,8,16", *olist = "load,store,storef,dekker,shload,wb64,nt8,nt64";
+                             .scan_size = 1 << 16, .data_size = 4 << 20};
+    const char *tlist = "1,2,4,8,16", *olist = "load,store,storef,dekker,shload,wb64,nt8,nt64,rdbatch,wbbatch";
     double secs = 1.0, warm = 0.2;
     int csv = 0;
     static struct option lo[] = {{"mem-node", required_argument, 0, 1001},
@@ -159,7 +202,7 @@ int main(int argc, char **argv)
         default:
             fprintf(stderr, "usage: %s -b uc|cached-flush|coherent [-T 1,2,4] [-o ops] [-s S] "
                             "[-W S] [--mem-node N] [--cpus LIST] [--wb clwb] [-C] [-H]\n"
-                            "ops: load store storef dekker shload wb64 nt8 nt64\n", argv[0]);
+                            "ops: load store storef dekker shload wb64 nt8 nt64 rdbatch wbbatch\n", argv[0]);
             return 2;
         }
     }
@@ -187,9 +230,11 @@ int main(int argc, char **argv)
     mlines = (ncl_line_t *)ncl_mem.meta + 64;
     shared_line = mlines + MAXT * META_STRIDE + 8;
     dlines = ncl_mem.data;
+    blines = ncl_mem.data + (1 << 20); /* MAXT * BATCH_SPAN * 64 = 2 MiB */
     if (!csv) {
         printf("mem: %s\ncpus: %s\n", ncl_mem_describe(), ncl_cpus_describe());
-        printf("%-7s %4s %10s %14s %8s\n", "op", "T", "Mops/s", "ns/op/thread", "min/max");
+        printf("%-7s %4s %10s %14s %8s %9s\n", "op", "T", "Mops/s", "ns/op/thread", "min/max",
+               "line GB/s");
     }
     char cpus_csv[512];
     snprintf(cpus_csv, sizeof cpus_csv, "%s", ncl_cpus_describe());
@@ -225,12 +270,14 @@ int main(int argc, char **argv)
             double nspt = tot ? nthreads * el * 1e9 / tot : 0;
             double mm = mx ? (double)mn / mx : 0;
             if (csv)
-                printf("%s,%s,%d,%d,%s,%s,%d,%.3f,%.3f,%.1f,%.3f,%s\n",
+                printf("%s,%s,%d,%d,%s,%s,%d,%.3f,%.3f,%.1f,%.3f,%s,%.2f\n",
                        ncl_backend_name(mc.backend), ncl_mem.meta_memtype, ncl_mem_node(),
                        mc.backend == NCL_BACKEND_UC ? ncl_mem.uc_pool_node : -1,
-                       ncl_wb_mode_name(), op_names[op], nthreads, el, mops, nspt, mm, cpus_csv);
+                       ncl_wb_mode_name(), op_names[op], nthreads, el, mops, nspt, mm, cpus_csv,
+                       mops * 64 / 1e3);
             else
-                printf("%-7s %4d %10.2f %14.1f %8.3f\n", op_names[op], nthreads, mops, nspt, mm);
+                printf("%-7s %4d %10.2f %14.1f %8.3f %9.2f\n", op_names[op], nthreads, mops, nspt,
+                       mm, mops * 64 / 1e3);
             fflush(stdout);
         }
     }

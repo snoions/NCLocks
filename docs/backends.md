@@ -344,14 +344,19 @@ and separates the uncached memory type from partial writes. Ops:
   full-line write.
 - `nt8` / `nt64`: one 8-byte movnti / eight filling the line, sfence: a partial vs a full
   line write from write-back memory, with no UC mapping involved.
+- `rdbatch` / `wbbatch`: 64 own data lines per batch, flushed then loaded (64 misses in
+  flight) / written and written back; counted per line. They measure the bandwidth the
+  device sustains (`line_gbps` = Mops x 64 B), to compare with what the uc ops reach.
 
-If uc `store`/`storef` flatten with T on the device while `nt64` and `wb64` scale, and `nt8`
-flattens too, the limit is partial writes; if `nt8` scales, it is the UC path. Sweep phase
+If the uc ops flatten at a `line_gbps` well below `rdbatch`/`wbbatch`, the limit is not
+device bandwidth. Then, if uc `store`/`storef` flatten while `nt64` and `wb64` scale, and
+`nt8` flattens too, the limit is partial writes; if `nt8` scales, it is the UC path. Sweep phase
 `conc` (`scripts/cxl_sweep.sh conc`) runs uc (pool on MEMNODE), cf on MEMNODE and cf on
 the CPU node's DRAM, at T = 1-60.
 
 Dev box (uc pool and cf on node 0 DRAM, T = 1 / 8, Mops/s): uc `load` 11.5 / 142, `store`
 32 / 246, `storef` 22 / 170, `dekker` 8 / 76; `nt8` 22 / 211, `nt64` 21 / 199, `wb64` 7.6 /
-62. Everything scales with T except `shload`, which stops at ~21M/s from T=4 on every
+62; `rdbatch` 9.5 / 32 GB/s (flat from T=8), `wbbatch` 7.4 / 18 GB/s (peak at T=4).
+Everything else scales with T except `shload`, which stops at ~21M/s from T=4 on every
 backend: same-line loads are served one at a time (the reason waiters poll their own
 line, `--wait own`).
