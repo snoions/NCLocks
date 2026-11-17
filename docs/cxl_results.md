@@ -482,3 +482,88 @@ Closed loop, L=256 (`-X adaptive` -> `scan`, k/s): tournament 1582 -> 1532 (16x1
   closed-loop many-locks results.
 - `--ho none` (the old 2b default) saturates at ~300k: the `--ho` default is confirmed in
   open loop too.
+
+## Multi-threaded nodes (`mt` phase, T>1, cf)
+
+`results/cxl_20261117_2215/mt.csv`: 3 reps, 564 runs, no errors, rep spread <=7.6%
+(median 0.8%). 16x3 and `-K 64` unless noted; 2b = `--ho all`. Nodes run several threads
+in the deployment, so this is the main result set; the T=1 sections above are worst
+cases.
+
+**Local-handoff cap** (L=1; k/s, lock p99 in us):
+
+| `-K` | 8 | 16 | 64 | 256 |
+|---|---|---|---|---|
+| tournament-2a | 1177, 123 | 1317, 205 | 1454, 688 | 1496, 2621 |
+| tournament-2b / Lamport-2b | 1157, 123 | 1286-1288, 205 | 1444-1450, 688 | 1495-1504, 2621 |
+| server chain | 1064, 139 | 1212, 229 | 1390, 721 | 1453, 2753 |
+| Lamport-2a (fairness 0.81-0.83) | 274, 1901 | 442, 1770 | 924, 1704 | 1316, 410 |
+| local handoff fraction | 0.889 | 0.941 | 0.985 | 0.996 |
+
+- **The cap sets a protocol-independent trade-off:** K=8 -> 256 gives +27-29% throughput
+  for 21x the p99 (123 us -> 2.6 ms). Every protocol except Lamport-2a sits on the same
+  curve, with fairness 1.0: once ~90% of handoffs are local, the global algorithm hardly
+  matters.
+- **Lamport-2a fails on a hot lock** at every cap (274-1316k, fairness 0.81-0.83, p99
+  up to 1.9 ms).
+
+**Number of locks** (k/s; fairness in parentheses where below 0.93):
+
+| | L=1 | 4 | 16 | 64 | 256 |
+|---|---|---|---|---|---|
+| tournament-2a | **1444** | **2374** | **4304** | 5517 | 5797 |
+| tournament Phase 1 | 481 | 1621 | 3841 | 5314 | 5808 |
+| tournament-2b | 1443 | 2046 | 2813 | 3358 | 4081 |
+| Lamport-2a | 922 (0.87) | **489** | 1534 | 5197 | **9645** |
+| Lamport Phase 1 | 36 (0.85) | 143 (0.83) | 587 (0.82) | 2386 (0.82) | **9591** |
+| Lamport-2b | 1455 | 2003 | 2257 | 4577 | 6418 |
+| server chain | 1392 | 2017 | 4145 (0.88) | 5777 (0.89) | 6913 (0.91) |
+| server Phase 1 | 305 | 1127 | 2651 | **5830** (0.90) | 6832 (0.90) |
+
+- **Hot to warm locks (L <= 16): tournament-2a** is first or tied, with the lowest p99 from
+  L=4 on (13.8-47 us).
+- **Cold locks (L=256): Lamport** (2a = Phase 1, nobody local to pass to): 9.6M, **1.66x**
+  tournament-2a, fairness 0.95. The crossover is between L=64 (tournament-2a, server and
+  Lamport-2a within 12%) and L=256.
+- **Lamport is unusable while a lock is hot**, even with 2a: 489k at L=4 (tournament-2a
+  2374k, 4.9x), 922k at L=1.
+- **Gate-based 2b never beats 2a**: tournament-2b loses 14-35% from L=4 on. Lamport-2b
+  fixes Lamport's hot-lock collapse (1455k at L=1, fair) but trails the best choice at
+  every L (tournament-2a when hot, Lamport-2a when cold: 6418 vs 9645 at L=256).
+- The server leads only at L=64 (5.8M, tied with tournament-2a within 6%) and gets
+  unfair (0.88-0.91) from L=16 on.
+
+**Threads per node** (K=64): at L=1 every cohort variant gives 1.40-1.58M at 4x3, 16x2,
+16x3, 16x4 and 32x2 (Phase 1 tournament 415-486k). At L=256, tournament-2a = Phase 1
+(4.0-7.3M) and Lamport-2b (4.7-7.9M) or the server chain (5.2-8.0M) lead; Lamport-2a was
+not in this part.
+
+**Open loop** (lock p50 / p99 in us):
+
+| L=1, offered | 100k | 250k | 500k | 1M | 1.25M |
+|---|---|---|---|---|---|
+| tournament-2a | 5.6 / **13.8** | 6.9 / 24.6 | **13.3 / 55** | **47 / 172** | **94 / 311** |
+| tournament Phase 1 | 5.6 / 15.4 | 7.4 / 34.8 | 5% unserved | saturated (~480k) | |
+| server chain | **4.1** / 20.5 | **5.6 / 18.4** | 22.5 / 74 | 78 / 246 | 156 / 475 |
+| tournament-2b | 9.2 / 53 | 12.3 / 57 | 24.6 / 90 | 57 / 197 | 111 / 360 |
+| Lamport-2b | 5.4 / 74 | 15.9 / 180 | 25.6 / 94 | 55 / 197 | 115 / 360 |
+| Lamport Phase 1 | saturated (36k) | | | | |
+
+| L=256, offered | 500k | 1M | 2M | 3M | 4M | 5M | 6M |
+|---|---|---|---|---|---|---|---|
+| Lamport Phase 1 | **2.4 / 5.9** | **2.4 / 6.9** | **2.4 / 9.2** | **2.6 / 11.8** | **2.7 / 14.8** | **2.8 / 20.5** | **4.4 / 27.6** |
+| server chain | 5.4 / 21.5 | 4.4 / 20.5 | 4.1 / 19.5 | 4.6 / 20.5 | 5.1 / 24.6 | 7.2 / 36.9 | 14.9 / 90 |
+| tournament-2a (= Phase 1) | 5.6 / 12.8 | 5.6 / 15.4 | 5.9 / 22.5 | 6.4 / 34.8 | 11.3 / 55 | 22.5 / 148 | 4.5% unserved |
+| Lamport-2b | 4.6 / 10.8 | 4.6 / 13.3 | 4.9 / 19.5 | 5.1 / 27.6 | 7.2 / 41 | 11.3 / 70 | 37 / 238 |
+| tournament-2b | 8.7 / 20.5 | 8.7 / 28.7 | 9.2 / 47 | 17.4 / 98 | saturated at ~4.06M | | |
+
+- **Hot lock: tournament-2a** has the best tail at every load and the best median from
+  500k on; the server chain has the best median at light load (4.1-5.6 us up to 250k).
+- **Cold locks: Lamport** has 2.2-2.6x lower median and 2-3x lower p99 than the
+  tournament up to 5M/s, and serves 6M without loss.
+
+**Summary for T>1:** tournament-2a for hot and warm locks, Lamport (2a or Phase 1) for cold
+locks, the local-handoff cap as the latency/throughput knob. The wrong choice costs
+1.66x on cold locks (tournament) and up to 4.9x plus unfairness on hot ones (Lamport).
+That gap is what a per-lock reactive Lamport/tournament lock would recover on mixed
+workloads (Zipfian KV). Gate-based 2b is dominated in every regime measured with T>1.
