@@ -378,7 +378,7 @@ spread <=3%. k/s, then time per acquisition per thread (N / throughput) in us:
   On CXL it doubles or triples instead. Since cf on CXL scales too, the limit is not
   CXL bandwidth in general but **uncached accesses to the CXL device under concurrency**:
   at 32 nodes, L=256, DRAM is 6-12x faster for uc versus 2.4-2.7x at one lock. A
-  candidate is that 8-byte UC stores reach the device as partial writes (`MemWrPtl`) that
+  candidate (confirmed below, "Device concurrency") is that 8-byte UC stores reach the device as partial writes (`MemWrPtl`) that
   it serves slowly or serially; untested (it would need device-side counters or a
   memlat run with concurrent UC streams).
 - **With the ceiling gone, uc beats cf on CXL everywhere** (tournament 7.1M vs 3.4M,
@@ -388,3 +388,97 @@ spread <=3%. k/s, then time per acquisition per thread (N / throughput) in us:
 - **Server unfairness persists but is smaller:** 0.94 at 16x1 and 0.80 at 32x1, L=256
   (CXL 0.78 / 0.64). It grows with load on the servers, so it is a server-side effect, not
   a CXL one.
+
+## Device concurrency (`conc` phase, `ncl_memconc`)
+
+`results/cxl_20261117_0804/conc.csv`: 3 reps, T = 1-60 threads on socket 0 (one per
+core), no errors. Configs: `uc` (metadata ops on the kmod pool, node 2 = CXL), `cf_cxl`
+(everything on node 2), `cf_dram` (node 0). The `uc` config's data ops (`wb64`, `nt*`,
+`*batch`) ran on DRAM (the sweep did not bind its data region; fixed since) and match
+`cf_dram`. Aggregate Mops/s; `line GB/s` = Mops x 64 B:
+
+| op | T=1 | T=8 | T=16 | T=32 | T=60 | at T=60 |
+|---|---|---|---|---|---|---|
+| uc `load` (CXL) | 2.6 | 19.4 | 38.1 | 74.8 | **137.6** | 436 ns/op, flat |
+| uc `store` (CXL) | 1.9 | 9.2 | 9.0 | 9.0 | **9.0** | 6.7 us/op |
+| uc `storef` (CXL) | 1.8 | 9.2 | 9.0 | 9.0 | **9.0** | |
+| uc `dekker` (CXL) | 1.0 | 4.7 | 6.4 | 7.3 | 6.0 | |
+| `nt8` (CXL) | 2.9 | 8.5 | 8.4 | 8.4 | **8.4** | 7.2 us/op |
+| `nt64` (CXL) | 2.9 | 25.0 | 50.5 | 100.1 | **179.8** | 11.5 GB/s |
+| `wb64`, cf `store` (CXL, full line + clwb) | 2.4 | 21.1 | 42.7 | 84.6 | **153-174** | ~10-11 GB/s |
+| `rdbatch` (CXL) | 40 | 307 | **374** | 275 | 263 | peak 24 GB/s |
+| `wbbatch` (CXL) | 69 | **411** | 252 | 176 | 200 | peak 26 GB/s |
+| `nt8` (DRAM) | 4.7 | 38.1 | 76.6 | 154.0 | 287.3 | scales |
+| `rdbatch` / `wbbatch` (DRAM) | 86 / 90 | 670 / 715 | 1325 / 1444 | 2490 / 2407 | 4099 / 3060 | 262 / 196 GB/s |
+| `shload` uc / cf CXL / cf DRAM | 2.3 / 2.0 / 4.6 | 2.6 / 2.8 / 6.7 | | | 2.6 / 2.8 / 6.9 | one line, serialized |
+
+- **The uc ceiling is a cap on partial writes, not device bandwidth.** Every 8-byte
+  write to the CXL node, UC store or 8-byte movnti from write-back memory alike, stops at
+  **8.4-9.0M/s in total from T=8 on**, about 0.55 GB/s even counting a full line each:
+  1/45 of the 24-26 GB/s the device sustains for full-line traffic. Full-line writes
+  through the same path (`nt64`, `wb64`, cf stores) scale linearly to 150-180M/s at
+  T=60, and so do UC loads (138M/s, latency flat at 436 ns). On DRAM, `nt8` scales like
+  `nt64`. So the device (or the host's CXL path) serves partial writes (`MemWrPtl`) at a
+  fixed aggregate rate. The memory type does not matter: `nt8` and the UC store hit
+  the same cap.
+- **It accounts for the lock measurements.** uc locks write a few metadata words per
+  acquisition (tournament: flag and turn per level plus the release; Lamport: x, y,
+  b[], release), and the uc rates at the "Many locks" plateau (tournament 757k, Lamport
+  2.5M at 32x1 L=256) times those counts land at the ~9M/s cap. cf writes whole lines
+  (store + clwb) and is not capped, which is why cf beat uc in every phase.
+- **Device bandwidth itself:** 24 GB/s read (T=16) and 26 GB/s write (T=8), against
+  262 / 196 GB/s for local DRAM; both fall by a third or more with more threads, with
+  large rep spread (oversubscribed device queues).
+- **Same-line loads are served one at a time** on every backend (2.6-2.8M/s on CXL,
+  6.9M/s on DRAM), which is why waiters poll their own line (`--wait own`).
+
+## Open loop with 2b (`open2b` phase, N=16, T=1, cf)
+
+`results/cxl_20261117_0804/open2b.csv`: 3 reps, no errors. Lock latency p50 / p99 in
+us (from the scheduled arrival, no coordinated omission); 2b = `--ho all`
+(`grant,clear,skip`):
+
+| L=1, offered | 25k | 100k | 200k | 300k | 400k | 450k |
+|---|---|---|---|---|---|---|
+| Phase 1 tournament | **5.4 / 10** | **5.4 / 14** | 6.1 / 25 | 8.2 / 41 | **12.8 / 98** | **25 / 254** |
+| Phase 1 Lamport | 2.2 / 9 | saturated (37k) | | | | |
+| server chain | 5.4 / 15 | **3.7 / 15** | **4.4 / 16** | **6.7 / 31** | 2% unserved | 18% unserved |
+| 2b tournament `-X adaptive` | 7.9 / 29 | 8.7 / 51 | 12.3 / 61 | 18.4 / 98 | 74 / 459 | 279 / 1638 |
+| 2b tournament `-X scan` | 7.9 / 15 | 8.7 / 25 | 9.2 / 39 | 15.4 / 94 | 78 / 459 | 426 / 2621 |
+| 2b tournament `--ho none` | 8.7 / 31 | 9.2 / 57 | 24 / 127 | 393 / 2490 | 30% unserved | |
+| 2b Lamport `-X adaptive` | 4.4 / 18 | 4.9 / 82 | 16.4 / 197 | 25 / 221 | 78 / 475 | 328 / 2032 |
+| 2b Lamport `-X scan` | 4.1 / 12 | 4.6 / 41 | 7.9 / 82 | 16.4 / 111 | 74 / 442 | 279 / 1770 |
+| 2b hybrid `-X scan` | 7.2 / 25 | 7.9 / 45 | 12.3 / 61 | 18.4 / 102 | 82 / 492 | 246 / 1573 |
+
+| L=256, offered | 250k | 1M | 1.5M | 2M | 2.5M | 3M |
+|---|---|---|---|---|---|---|
+| Phase 1 Lamport | **2.3 / 6** | **2.3 / 9** | **2.4 / 12** | **2.7 / 16** | **4.4 / 25** | **6.1 / 39** |
+| Phase 1 tournament | 5.1 / 13 | 5.6 / 29 | 11 / 59 | 94 / 721 | 21% unserved | |
+| server chain | 6.4 / 22 | 5.1 / 27 | 5.9 / 31 | 7.4 / 41 | 12 / 74 | 127 / 88k |
+| 2b Lamport `-X adaptive` | 4.4 / 10 | 4.6 / 21 | 6.4 / 32 | 11 / 64 | 74 / 590 | 16% unserved |
+| 2b tournament / hybrid | 8 / 21 | 12 / 60 | 60-130 / 0.4-11k | ~24% unserved (cap ~1.6M) | | |
+
+Closed loop, L=256 (`-X adaptive` -> `scan`, k/s): tournament 1582 -> 1532 (16x1), 2550 ->
+2410 (32x1); Lamport 2583 -> 2311, 4769 -> 3894. Fairness 0.89-0.99 either way.
+
+- **2b costs latency whenever the lock is not saturated.** At L=1 its median is
+  2.5-3.3 us above Phase 1 tournament (7.9-8.7 vs 5.4 us at 25-100k, +50%), its p99 2-4x
+  higher, and near saturation (400-450k) its queueing is far worse (p50 74-426 vs 13-25
+  us), because its capacity (~470k closed loop) is slightly below Phase 1's (~500k).
+  There is no load at which 2b tournament beats Phase 1 tournament on CXL. (At 4-16
+  nodes Phase 1 tournament is also fair, 0.999.)
+- **The adaptive pick misses 6-14% of announces at L=1** below saturation (a holder that
+  got the lock uncontended probes one slot); a missed waiter waits for its next owner
+  re-read. `-X scan` removes the misses and halves p99 (2b tournament 29 -> 15 us at
+  25k, 51 -> 25 at 100k) at the same median. But on CXL the scan costs closed-loop
+  throughput when locks are mostly uncontended: 3-6% for the tournament and 11-18% for
+  Lamport at L=256 (16 / 32 slots). Neither policy is right everywhere; the default stays
+  `adaptive`.
+- **The server chain has the best median and tail from 50k to 300k at L=1** (3.7-6.7 /
+  15-31 us) but saturates below 400k. At L=256 it is second to Phase 1 Lamport and serves
+  ~3M.
+- **Phase 1 Lamport is unusable at one lock** (saturates at 37k) and **best at 256
+  locks** at every load (p50 2.3-6.1 us up to 3M/s): the open-loop picture matches the
+  closed-loop many-locks results.
+- `--ho none` (the old 2b default) saturates at ~300k: the `--ho` default is confirmed in
+  open loop too.

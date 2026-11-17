@@ -244,7 +244,7 @@ conc() {
   [ -s "$csv" ] || echo "rep,config,$("$MEMCONC" -H)" >"$csv"
   local ts; ts=$(echo $CONC_T | tr ' ' ',')
   local -A CC=(
-    [uc]="-b uc --wb $WB"
+    [uc]="-b uc --wb $WB --mem-node $MEMNODE" # metadata: kmod pool; data region bound too
     [cf_cxl]="-b cached-flush --wb $WB --mem-node $MEMNODE"
     [cf_dram]="-b cached-flush --wb $WB --mem-node $CPUNODE"
   )
