@@ -22,6 +22,10 @@
 #              with Phase 1 tournament and the server chain as references, L=1 and 256 (done)
 #   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms (done)
 #   dram       main uc configs with metadata on DRAM: RELOAD THE DRIVER WITH nid=0 FIRST
+#   mt         multi-threaded nodes (the deployment case): 2a / 2b / server chain vs Phase 1,
+#              tournament and Lamport, at T>1. Four parts, tagged in the config column:
+#              cap (local-handoff cap -K, 16x3, L=1), locks (L = 1..256, 16x3), open (open
+#              loop, 16x3, L=1 and 256) and nt (threads per node: MT_NT, L=1 and 256)
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
 #              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
@@ -41,6 +45,8 @@
 #      CFGS ("cf_clwb"; add uc_split_clwb for uc),
 #      LOCKS ("1 4 16 64 256"), LOCKS_NT ("16x1 32x1"),
 #      HO_NT ("4x1 16x1 32x1 16x3"), HO_LOCKS ("1 256"), HO_OPTS ("none grant,clear all"), RUN_TIMEOUT (120 s per run), WB (clwb),
+#      MT_MAIN ("16x3"), MT_CAPS ("8 16 64 256"), MT_LOCKS ("1 4 16 64 256"), MT_NT ("4x3 16x2 16x3 16x4 32x2"),
+#      MT_RATES1 / MT_RATES256 (mt open loop at L=1 / 256),
 #      CONC_T ("1 2 4 8 16 24 32 48 60"), CONC_SECS (1), MEMCONC (build/ncl_memconc),
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16)
 set -uo pipefail
@@ -55,10 +61,12 @@ CS=${CS:-200}
 BACKOFF=${BACKOFF:-16}
 MEMNODE=${MEMNODE:-2}
 CPUNODE=${CPUNODE:-0}
-NT=${NT:-"4x1 8x1 16x1 32x1 4x3 8x3 16x3"}
+# Nodes run several threads (T>1) in the deployment; T=1 makes every handoff
+# cross-node and is a worst case only (NT="... 16x1" to include it).
+NT=${NT:-"4x3 8x3 16x2 16x3 32x2"}
 OWN_NT=${OWN_NT:-"4x1 8x1 16x1 32x1 16x3"} # phase own
 LOCKS=${LOCKS:-"1 4 16 64 256"}             # phase locks
-LOCKS_NT=${LOCKS_NT:-"16x1 32x1"}
+LOCKS_NT=${LOCKS_NT:-"16x3 32x2"}
 HO_NT=${HO_NT:-"4x1 16x1 32x1 16x3"}         # phase ho
 HO_LOCKS=${HO_LOCKS:-"1 256"}
 HO_OPTS=${HO_OPTS:-"none grant,clear all"}
@@ -68,7 +76,14 @@ CONC_SECS=${CONC_SECS:-1}
 MEMCONC=${MEMCONC:-$ROOT/build/ncl_memconc}
 RATES1=${RATES1:-"25k 50k 100k 200k 300k 400k 450k"}             # phase open2b, L=1
 RATES256=${RATES256:-"250k 500k 1000k 1500k 2000k 2500k 3000k"} # phase open2b, L=256
-OPEN2B_N=${OPEN2B_N:-16}
+OPEN2B_N=${OPEN2B_N:-16} # open2b is the T=1 (worst-case) study; mt covers T>1
+OPEN_T=${OPEN_T:-3}       # phase open: threads per node
+MT_MAIN=${MT_MAIN:-16x3} # mt parts cap, locks, open
+MT_CAPS=${MT_CAPS:-"8 16 64 256"}
+MT_LOCKS=${MT_LOCKS:-"1 4 16 64 256"}
+MT_NT=${MT_NT:-"4x3 16x2 16x3 16x4 32x2"}
+MT_RATES1=${MT_RATES1:-"100k 250k 500k 750k 1000k 1250k"}
+MT_RATES256=${MT_RATES256:-"500k 1000k 2000k 3000k 4000k 5000k 6000k"}
 WB=${WB:-clwb} # writeback instruction of the main configs (clflushopt for hosts without clwb)
 
 NUMA=(numactl --cpunodebind="$CPUNODE" --membind="$CPUNODE")
@@ -232,7 +247,7 @@ open_loop() {
   local rates=${RATES:-"25k 50k 100k 150k 200k 250k 300k 400k"}
   for rep in $(seq "$REPS"); do
     for a in $OPEN_ALGS; do for c in $MAIN_CFGS; do for r in $rates; do
-      run "$csv" "$rep" "$c" -a "$a" -n 16 -t 1 -r "$r" -A poisson ${CFG[$c]} "${COMMON[@]}"
+      run "$csv" "$rep" "$c" -a "$a" -n 16 -t "$OPEN_T" -r "$r" -A poisson ${CFG[$c]} "${COMMON[@]}"
     done; done; done
   done
 }
@@ -246,6 +261,41 @@ dram() {
       run "$csv" "$rep" uc_split_clwb_dram -a "$a" -n "$N" -t "$T" -b uc -U split --wb clwb \
         --mem-node "$CPUNODE" "${COMMON[@]}"
     done
+  done; done
+}
+
+mt() {
+  # Multi-threaded nodes. Variants: Phase 1 references, cohort passing (2a) and
+  # cross-node handoff (2b, --ho all default) for the tournament and Lamport, and
+  # the server chain. Config column: <cfg>:<part>.
+  local csv=$OUT/mt.csv; header "$csv"
+  local V_CLOSED=("-a tournament" "-a lamport" "-a server"
+                  "-a tournament -M local" "-a lamport -M local"
+                  "-a tournament -M handoff" "-a lamport -M handoff" "-a server -M handoff")
+  local V_CAP=("-a tournament -M local" "-a lamport -M local" "-a tournament -M handoff"
+               "-a lamport -M handoff" "-a server -M handoff")
+  local V_OPEN=("-a tournament" "-a lamport" "-a tournament -M local"
+                "-a tournament -M handoff" "-a lamport -M handoff" "-a server -M handoff")
+  local V_NT=("-a tournament" "-a tournament -M local" "-a tournament -M handoff"
+              "-a lamport -M handoff" "-a server -M handoff")
+  local v MN MT
+  MN=${MT_MAIN%x*}; MT=${MT_MAIN#*x}
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for k in $MT_CAPS; do for v in "${V_CAP[@]}"; do
+      run "$csv" "$rep" "$c:cap" $v -K "$k" -n "$MN" -t "$MT" -l 1 ${CFG[$c]} "${COMMON[@]}"
+    done; done
+    for l in $MT_LOCKS; do for v in "${V_CLOSED[@]}"; do
+      run "$csv" "$rep" "$c:locks" $v -n "$MN" -t "$MT" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+    done; done
+    for l in 1 256; do
+      local rates=$MT_RATES1; [ "$l" = 256 ] && rates=$MT_RATES256
+      for r in $rates; do for v in "${V_OPEN[@]}"; do
+        run "$csv" "$rep" "$c:open" $v -n "$MN" -t "$MT" -l "$l" -r "$r" -A poisson ${CFG[$c]} "${COMMON[@]}"
+      done; done
+    done
+    for nt in $MT_NT; do nt_split "$nt"; for l in 1 256; do for v in "${V_NT[@]}"; do
+      run "$csv" "$rep" "$c:nt" $v -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+    done; done; done
   done; done
 }
 
@@ -313,6 +363,7 @@ for ph in $PHASES; do
     dram) dram ;;
     conc) conc ;;
     open2b) open2b ;;
+    mt) mt ;;
     *) die "unknown phase $ph" ;;
   esac
 done

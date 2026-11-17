@@ -62,6 +62,10 @@ correctness is still checked by `emu`.
 6. Experiments: `scripts/cxl_sweep.sh` runs them all under the numactl prefix, writing
    one CSV per phase to `results/cxl_<date>/`. It refuses to start if the CPUs, the
    memory node or the uc pool node are wrong, and it aborts on any placement warning.
+   - Nodes run several threads (default `NT="4x3 8x3 16x2 16x3 32x2"`, `LOCKS_NT="16x3 32x2"`,
+     phase `open` at T=3); T=1 makes every handoff cross-node and is a worst case only.
+     Phase `mt` studies T>1 directly: the local-handoff cap, lock count, open loop and
+     threads per node, for 2a / 2b / server chain against Phase 1.
    - Phases: `preflight p1 2a 2b base open` (the default; `abl`, `own`, `ho` are done), plus
      `dram` after reloading the driver with `nid=0`.
    - Main configuration: `cached-flush --wb clwb` (the default since 0285ab6; add

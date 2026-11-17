@@ -2,8 +2,8 @@
 """Median tables for a scripts/cxl_sweep.sh result directory (needs pandas).
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
-Phases: p1 abl 2a 2b own ho locks base open dram conc open2b (default: those whose CSV
-exists).
+Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt (default: those whose
+CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -70,6 +70,47 @@ def open2b(d):
     return out
 
 
+def mt(d):
+    """Phase mt: one table per part (config column <cfg>:<part>)."""
+    d = d.copy()
+    d["part"] = d.config.str.split(":").str[1]
+    d["cfg"] = d.config.str.split(":").str[0]
+    d["variant"] = d.alg + "/" + d["mode"]
+    d["NT"] = d.nodes.astype(str) + "x" + d.threads_per_node.astype(str)
+    out = []
+
+    def agg(g):
+        r = g.agg(thr=("achieved_rps", "median"), fair=("node_min_max_ratio", "median"),
+                  p99=("lock_p99", "median"), local=("local_handoff_frac", "median"))
+        r["thr"] = (r.thr / 1e3).round(0)
+        r["p99"] = (r.p99 / 1e3).round(1)
+        return r.round(3)
+
+    c = d[d.part == "cap"]
+    if len(c):
+        out.append("cap (MT_MAIN, L=1): k/s, fairness, lock p99 us, local handoff fraction\n"
+                   + agg(c.groupby(["variant", "local_cap", "cfg"])).unstack("local_cap").to_string())
+    c = d[d.part == "locks"]
+    if len(c):
+        r = agg(c.groupby(["locks", "variant", "cfg"]))[["thr", "fair", "p99"]]
+        out.append("locks (MT_MAIN, K=64):\n" + r.unstack("locks").to_string())
+    c = d[d.part == "nt"]
+    if len(c):
+        r = agg(c.groupby(["locks", "NT", "variant", "cfg"]))[["thr", "fair"]]
+        out.append("threads per node (K=64):\n" + r.unstack("variant").to_string())
+    c = d[d.part == "open"]
+    if len(c):
+        r = c.groupby(["locks", "target_rps", "variant", "cfg"]).agg(
+            ach=("achieved_rps", "median"), unserved=("unserved_frac", "median"),
+            p50=("lock_p50", "median"), p99=("lock_p99", "median"),
+            fair=("node_min_max_ratio", "median"))
+        r["ach"] = (r.ach / 1e3).round(0)
+        r["p50"] = (r.p50 / 1e3).round(2)
+        r["p99"] = (r.p99 / 1e3).round(1)
+        out.append("open loop (MT_MAIN, Poisson): k/s achieved, lock p50 / p99 us\n" + r.round(3).to_string())
+    return "\n\n".join(out)
+
+
 EXTRA = {
     "p1": ["fast_frac", "lock_p99"],
     "2a": ["local_handoff_frac"],
@@ -85,7 +126,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b"]
+                              "conc", "open2b", "mt"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -102,6 +143,8 @@ def main():
             print(conc(d).to_string())
         elif ph == "open2b":
             print(open2b(d))
+        elif ph == "mt":
+            print(mt(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()
