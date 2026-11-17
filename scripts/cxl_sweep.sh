@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 # Evaluation sweep for a NUMA host with a CXL memory node (docs/cxl_host.md).
 #
-# Usage: scripts/cxl_sweep.sh [PHASE...]        (default: preflight p1 abl 2a 2b base open)
+# Usage: scripts/cxl_sweep.sh [PHASE...]        (default: preflight p1 2a 2b base open)
+#
+# Defaults cover what still wins somewhere on CXL (docs/cxl_results.md): cf only,
+# algorithms tournament, Lamport and the server (ALGS), and in 2b the server chain
+# (GATE_ALGS). Hybrid, AK, fastsrv and aksrv lost to one of those three in every
+# measured regime, and gate-based 2b never beat Phase 1 tournament; setting ALGS and
+# GATE_ALGS to the full lists (ALL_VARIANTS, ALL_GATE_ALGS below) brings them back.
+# Phases abl, own and ho answered their questions (results/cxl_2026111*); they stay
+# for reruns but are not in the default.
 #   preflight  check placement (CPUs, mem node, uc pool node) and stop on mismatch
-#   p1         Phase 1, closed loop, every algorithm, main configs, all (N,T)
-#   abl        Phase 1 ablation: uc uniform + clflushopt (the dev-box default), N=8,16
+#   p1         Phase 1, closed loop, ALGS, main configs, all (N,T)
+#   abl        Phase 1 ablation: uc uniform + clflushopt (the dev-box default), N=8,16 (done)
 #   2a         Phase 2a local handoff (-M local), T=3
-#   2b         Phase 2b cross-node handoff (-M handoff, defaults --wait own, --ho all), gate algorithms + server chain
+#   2b         Phase 2b cross-node handoff (-M handoff, defaults --wait own, --ho all), GATE_ALGS
 #   base       coherent baselines: tournament and pthread (+ no-submutex) on CXL and DRAM
 #   open       open loop (Poisson) at N=16, T=1, offered load scaled to CXL capacity
-#   locks      Phase 1 with L locks chosen uniformly per acquisition (-l), all algorithms, N=16,32
+#   locks      Phase 1 with L locks chosen uniformly per acquisition (-l), ALGS, N=16,32
 #   ho         2b shorter handoff path (--ho none | grant,clear | all = grant,clear,skip), gate algorithms,
-#              with Phase 1 tournament and the server chain as references, L=1 and 256
-#   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms
+#              with Phase 1 tournament and the server chain as references, L=1 and 256 (done)
+#   own        2b waiters: shared owner word vs own announce line (--wait), gate algorithms (done)
 #   dram       main uc configs with metadata on DRAM: RELOAD THE DRIVER WITH nid=0 FIRST
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
@@ -26,6 +34,8 @@
 # sequential (one uc experiment at a time) and repetitions are interleaved.
 #
 # env: OUT, BENCH, REPS (3), SECS (3), WARMUP (0.5), CS (200), BACKOFF (16),
+#      ALGS ("tournament lamport server"), GATE_ALGS ("server"; -M handoff),
+#      OPEN_ALGS (= ALGS),
 #      MEMNODE (2: CXL), CPUNODE (0: the socket the device hangs off),
 #      NT ("4x1 8x1 16x1 32x1 4x3 8x3 16x3"), OWN_NT ("4x1 8x1 16x1 32x1 16x3"),
 #      CFGS ("cf_clwb"; add uc_split_clwb for uc),
@@ -63,8 +73,11 @@ WB=${WB:-clwb} # writeback instruction of the main configs (clflushopt for hosts
 
 NUMA=(numactl --cpunodebind="$CPUNODE" --membind="$CPUNODE")
 COMMON=(-s "$SECS" -W "$WARMUP" -c "$CS" -B "$BACKOFF" -C)
-ALL_ALGS="tournament hybrid ak server fastsrv aksrv lamport"
-GATE_ALGS="lamport tournament hybrid ak server" # -M handoff (server = chain)
+ALL_VARIANTS="tournament hybrid ak server fastsrv aksrv lamport"
+ALL_GATE_ALGS="lamport tournament hybrid ak server" # -M handoff (server = chain)
+ALL_ALGS=${ALGS:-"tournament lamport server"}
+GATE_ALGS=${GATE_ALGS:-"server"}
+OPEN_ALGS=${OPEN_ALGS:-$ALL_ALGS}
 
 # Main configurations: name -> ncl_bench options.
 declare -A CFG=(
@@ -218,7 +231,7 @@ open_loop() {
   local csv=$OUT/open.csv; header "$csv"
   local rates=${RATES:-"25k 50k 100k 150k 200k 250k 300k 400k"}
   for rep in $(seq "$REPS"); do
-    for a in tournament hybrid ak server fastsrv aksrv; do for c in $MAIN_CFGS; do for r in $rates; do
+    for a in $OPEN_ALGS; do for c in $MAIN_CFGS; do for r in $rates; do
       run "$csv" "$rep" "$c" -a "$a" -n 16 -t 1 -r "$r" -A poisson ${CFG[$c]} "${COMMON[@]}"
     done; done; done
   done
@@ -283,7 +296,7 @@ open2b() {
   done; done
 }
 
-PHASES=${*:-"preflight p1 abl 2a 2b base open"}
+PHASES=${*:-"preflight p1 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
   case $ph in

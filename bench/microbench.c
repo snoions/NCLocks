@@ -352,9 +352,9 @@ static void usage(const char *argv0)
             "              holder passes to the server-published successor)\n"
             "  -K CAP      local/handoff: max consecutive local handoffs (default 64)\n"
             "  -G PLACE    handoff: announce before (announce, fence, gate; default) | inside\n"
-            "              (spec baseline) | lazy (inside the gate, only after reading a held owner)\n"
+            "              (spec baseline)\n"
             "  -X PICK     handoff release: adaptive (probe one slot if this node's acquisition\n"
-            "              was uncontended, else scan; default) | scan (spec) | probe.\n"
+            "              was uncontended, else scan; default) | scan (spec).\n"
             "              server: adaptive = read succ[] only if the grant's hint bit is set;\n"
             "              scan = always read\n"
             "  --wait W    handoff, gate algorithms: waiters poll their own announce line, granted\n"
@@ -462,22 +462,18 @@ int main(int argc, char **argv)
                 cfg.announce_place = NCL_ANNOUNCE_INSIDE;
             else if (!strcmp(optarg, "before"))
                 cfg.announce_place = NCL_ANNOUNCE_BEFORE;
-            else if (!strcmp(optarg, "lazy"))
-                cfg.announce_place = NCL_ANNOUNCE_LAZY;
             else {
-                fprintf(stderr, "-G: inside|before|lazy\n");
+                fprintf(stderr, "-G: before|inside\n");
                 return 2;
             }
             break;
         case 'X':
             if (!strcmp(optarg, "scan"))
                 cfg.pick_policy = NCL_PICK_SCAN;
-            else if (!strcmp(optarg, "probe"))
-                cfg.pick_policy = NCL_PICK_PROBE;
             else if (!strcmp(optarg, "adaptive"))
                 cfg.pick_policy = NCL_PICK_ADAPTIVE;
             else {
-                fprintf(stderr, "-X: scan|probe|adaptive\n");
+                fprintf(stderr, "-X: adaptive|scan\n");
                 return 2;
             }
             break;
@@ -652,8 +648,8 @@ int main(int argc, char **argv)
     fast = tot->paths[NCL_PATH_LAMPORT_FAST] + tot->paths[NCL_PATH_HYBRID_FAST] +
            tot->paths[NCL_PATH_FASTSRV_FAST];
     const struct hist *hl = &tot->h[H_LOCK], *hs = &tot->h[H_SERVICE], *hj = &tot->h[H_SOJOURN];
-#define ANN_NAME(a) ((a) == NCL_ANNOUNCE_LAZY ? "lazy" : (a) == NCL_ANNOUNCE_INSIDE ? "inside" : "before")
-#define PICK_NAME(x) ((x) == NCL_PICK_PROBE ? "probe" : (x) == NCL_PICK_SCAN ? "scan" : "adaptive")
+#define ANN_NAME(a) ((a) == NCL_ANNOUNCE_INSIDE ? "inside" : "before")
+#define PICK_NAME(x) ((x) == NCL_PICK_SCAN ? "scan" : "adaptive")
 #define WAIT_NAME(w) ((w) == NCL_WAIT_OWN ? "own" : "owner")
 #define PER(x) (all_paths ? (double)(x) / (double)all_paths : 0.0)
     char arrdesc[64];

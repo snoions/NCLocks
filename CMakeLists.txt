@@ -78,30 +78,30 @@ foreach(alg lamport tournament hybrid server fastsrv ak)
     COMMAND ncl_stress -a ${alg} -b emu -n 4 -t 3 -l 2 -i 10000 -M local -K 1)
 endforeach()
 # Phase 2b: gate + owner handoff (design §3.3). Default = announce before the
-# gate + adaptive pick_waiter; also the spec baseline (inside/scan), lazy
-# announce, and always-probe. -K 1 makes almost every release a cross-node handoff.
+# gate + adaptive pick_waiter; also the spec baseline (inside/scan), and each
+# of inside and scan alone. -K 1 makes almost every release a cross-node handoff.
 foreach(alg lamport tournament hybrid ak)
   foreach(be emu uc)
     add_test(NAME stress_${alg}_${be}_handoff
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 3 -l 2 -i 10000 -M handoff -H)
-    add_test(NAME stress_${alg}_${be}_handoff_lazy_cap1
-      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -G lazy -K 1)
+    add_test(NAME stress_${alg}_${be}_handoff_inside_cap1
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -G inside -K 1)
     add_test(NAME stress_${alg}_${be}_handoff_cap1
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -K 1)
     add_test(NAME stress_${alg}_${be}_handoff_inside_scan
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -G inside -X scan)
-    add_test(NAME stress_${alg}_${be}_handoff_probe_cap1
-      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -X probe -K 1)
+    add_test(NAME stress_${alg}_${be}_handoff_scan_cap1
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff -X scan -K 1)
     # Default wait = own line (docs/handoff.md); also the shared-owner poll.
     add_test(NAME stress_${alg}_${be}_handoff_owner_cap1
       COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 2 -l 2 -i 10000 -M handoff --wait owner -K 1 --timeout 100)
-    add_test(NAME stress_${alg}_${be}_handoff_owner_lazy
-      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 3 -l 2 -i 10000 -M handoff --wait owner -G lazy -H --timeout 100)
+    add_test(NAME stress_${alg}_${be}_handoff_owner_inside
+      COMMAND ncl_stress -a ${alg} -b ${be} -n 4 -t 3 -l 2 -i 10000 -M handoff --wait owner -G inside -H --timeout 100)
     if(be STREQUAL "uc")
-      set_tests_properties(stress_${alg}_uc_handoff stress_${alg}_uc_handoff_lazy_cap1
+      set_tests_properties(stress_${alg}_uc_handoff stress_${alg}_uc_handoff_inside_cap1
         stress_${alg}_uc_handoff_cap1 stress_${alg}_uc_handoff_inside_scan
-        stress_${alg}_uc_handoff_probe_cap1 stress_${alg}_uc_handoff_owner_cap1
-        stress_${alg}_uc_handoff_owner_lazy
+        stress_${alg}_uc_handoff_scan_cap1 stress_${alg}_uc_handoff_owner_cap1
+        stress_${alg}_uc_handoff_owner_inside
         PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
     endif()
   endforeach()
@@ -151,9 +151,9 @@ add_test(NAME ho_rejects_phase1
   COMMAND ncl_stress -a tournament -b emu --ho all)
 add_test(NAME ho_rejects_server
   COMMAND ncl_stress -a server -b emu -M handoff --ho clear)
-add_test(NAME ho_rejects_skip_lazy
-  COMMAND ncl_stress -a tournament -b emu -M handoff -G lazy --ho skip)
-set_tests_properties(ho_rejects_grant_owner_wait ho_rejects_phase1 ho_rejects_server ho_rejects_skip_lazy
+add_test(NAME ho_rejects_skip_inside
+  COMMAND ncl_stress -a tournament -b emu -M handoff -G inside --ho skip)
+set_tests_properties(ho_rejects_grant_owner_wait ho_rejects_phase1 ho_rejects_server ho_rejects_skip_inside
   PROPERTIES WILL_FAIL TRUE)
 add_test(NAME wait_rejects_server
   COMMAND ncl_stress -a server -b emu -M handoff --wait own)
@@ -220,9 +220,9 @@ foreach(be emu uc)
       COMMAND ncl_stress -a ${alg} -b ${be} -U split -n 4 -t 2 -l 2 -i 10000 -M handoff --wait own -K 1 --timeout 100)
     list(APPEND split_tests_${be} stress_${alg}_${be}_split_handoff_own_cap1)
   endforeach()
-  add_test(NAME stress_tournament_${be}_split_handoff_own_n8_probe
-    COMMAND ncl_stress -a tournament -b ${be} -U split -n 8 -t 1 -l 1 -i 20000 -M handoff --wait own -X probe --timeout 100)
-  list(APPEND split_tests_${be} stress_tournament_${be}_split_handoff_own_n8_probe)
+  add_test(NAME stress_tournament_${be}_split_handoff_own_n8_scan
+    COMMAND ncl_stress -a tournament -b ${be} -U split -n 8 -t 1 -l 1 -i 20000 -M handoff --wait own -X scan --timeout 100)
+  list(APPEND split_tests_${be} stress_tournament_${be}_split_handoff_own_n8_scan)
   # Shorter handoff path (--ho, docs/handoff.md): all three options and each
   # alone; clear+skip with the shared-owner wait (grant needs --wait own).
   foreach(alg lamport tournament hybrid ak)

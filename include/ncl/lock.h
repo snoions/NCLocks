@@ -33,14 +33,14 @@
  *                     uses holder-to-waiter passing instead (below).
  *                     cfg.announce_place selects the §3.5 Open placement:
  *                     NCL_ANNOUNCE_BEFORE (default: announce, fence, then
- *                     the gate), _INSIDE (spec baseline), _LAZY (inside the
- *                     gate, only after reading a held owner; collapses when
- *                     the gate is slow, see docs/backends.md).
+ *                     the gate), _INSIDE (spec baseline). (A LAZY variant,
+ *                     announcing only after reading a held owner, was removed:
+ *                     it collapses when the gate is slow, docs/handoff.md.)
  *                     cfg.pick_policy (NCL_PICK_*): release probes one
  *                     announce[] slot at a per-node round-robin pointer if
  *                     this node's own acquisition was uncontended, else scans
- *                     (ADAPTIVE, default); always scans (SCAN, spec); always
- *                     probes (PROBE; collapses at moderate load).
+ *                     (ADAPTIVE, default); always scans (SCAN, spec). (Always
+ *                     probing was removed: it misses waiters under contention.)
  *                     cfg.handoff_wait (NCL_WAIT_*): waiters poll their own
  *                     announce line, granted by the releaser (OWN, default),
  *                     or the owner word (OWNER).
@@ -87,15 +87,13 @@ typedef enum {
     NCL_MODE_LOCAL = 2,
 } ncl_mode_t;
 
-/* Announce placement in MODE_HANDOFF (design §3.5 Open). BEFORE (default):
+/* Announce placement in MODE_HANDOFF (design §3.5). BEFORE (default):
  * announce, fence, then enter the gate, so a releaser sees every waiter even
- * while the gate is congested. LAZY: inside the gate, and only after reading a
- * held owner (an uncontended take never announces); cheaper uncontended, but
- * with a slow gate (Lamport on cached-flush) waiters pile up in the gate
- * unannounced, releasers store FREE, and 2b degrades to Phase 1. */
-enum { NCL_ANNOUNCE_BEFORE = 0, NCL_ANNOUNCE_INSIDE = 1, NCL_ANNOUNCE_LAZY = 2 }; /* 0 = default */
+ * while the gate is congested. INSIDE: the spec baseline, announce inside the
+ * gate before reading owner. */
+enum { NCL_ANNOUNCE_BEFORE = 0, NCL_ANNOUNCE_INSIDE = 1 }; /* 0 = default */
 
-enum { NCL_PICK_ADAPTIVE = 0, NCL_PICK_SCAN = 1, NCL_PICK_PROBE = 2 }; /* 0 = default */
+enum { NCL_PICK_ADAPTIVE = 0, NCL_PICK_SCAN = 1 }; /* 0 = default */
 
 /* How MODE_HANDOFF waiters learn of a handoff (gate algorithms; docs/handoff.md).
  * OWN (default): the announce word carries a per-node sequence number; the

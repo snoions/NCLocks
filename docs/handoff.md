@@ -22,12 +22,15 @@ local`), as is the no-submutex ablation.
 - **Announce placement (§3.5 Open), `-G`:** `before` (**default** since the backend
   study, see "Announce placement revisited" below): announce, fence, then the gate.
   `inside` (the spec's baseline): announce right after entering the gate. `lazy` (the
-  default before that): inside the gate, and only after reading a held owner, so an
-  uncontended take never touches `announce[]`. All are safe by the "owner == me means handoff" rule plus
+  default before that, **removed 2026-11-17**: it collapses with a slow gate, cannot use
+  `--ho skip`, and its gain was measured on uc only): inside the gate, and only after
+  reading a held owner, so an uncontended take never touches `announce[]`. Both are safe by the "owner == me means handoff" rule plus
   the missed-announcement recovery.
 - **`pick_waiter`, `-X`:** `adaptive` (**default**): if this node's own global acquisition
   was uncontended (it took a FREE owner without waiting), probe ONE `announce[]` slot at a
   per-node round-robin pointer; otherwise scan round-robin from me+1 as the spec says.
+  `scan` always scans. (`probe`, always one slot, was removed 2026-11-17: rejected as a
+  default below, it misses waiters under contention.)
   `scan`: always scan (spec). `probe`: always one probe, which collapses at moderate load
   (below). A probe that misses stores FREE; a waiter it skipped recovers through the gate.
   The pointer advances past the node served (or by one on a miss), so under saturation the
@@ -46,7 +49,7 @@ local`), as is the no-submutex ablation.
   `local_handoff_frac`, `missed_announce_per_acq`, `owner_polls_per_acq`,
   `gate_entries_per_acq`, `announce_loads_per_acq`); path `NCL_PATH_GLOBAL_HANDOFF`.
 - **Tests:** `stress_{lamport,tournament,hybrid}_{emu,uc}_handoff{,_cap1,_inside_scan,
-  _lazy_cap1,_probe_cap1}` (`-K 1` makes almost every release a cross-node handoff;
+  _inside_cap1,_scan_cap1}` (until 2026-11-17 `_lazy_cap1,_probe_cap1`) (`-K 1` makes almost every release a cross-node handoff;
   defaults are before/adaptive), emu negative tests with
   `--skip-wb` / `--skip-inv` in handoff mode, and `handoff_rejects_server`.
 
@@ -119,7 +122,8 @@ cycle.
 ## Optimizations: lazy announce and adaptive `pick_waiter`
 
 (Lazy announce was the default until "Announce placement revisited" below; adaptive
-`pick_waiter` still is.)
+`pick_waiter` still is. `-G lazy` and `-X probe` were removed on 2026-11-17; the
+measurements below are kept as the record of why.)
 
 Raw data: `results/handoff_opt_uc.csv` (Phase 1, inside/scan, lazy/scan, inside/probe,
 lazy/probe; 4x1, 8x1, Poisson 100k at N=4 and 100k-900k at N=8, on/off at N=8) and
@@ -261,7 +265,7 @@ at 16-32 nodes and +18-20% for the tournament at 32, and leaves the rest unchang
 **Tests:** all `-M handoff` gate tests run `own` (the default), including the split
 layout (`..._split_handoff_own_cap1`, `stress_tournament_{emu,uc}_split_handoff_own_n8_probe`,
 `stress_tournament_cached-flush_handoff_own_n8`). `owner` is covered by
-`stress_{lamport,tournament,hybrid,ak}_{emu,uc}_handoff_owner_{cap1,lazy}` and
+`stress_{lamport,tournament,hybrid,ak}_{emu,uc}_handoff_owner_{cap1,inside}` and
 `stress_hybrid_{emu,uc}_split_handoff_owner_cap1`. Also `wait_rejects_{server,phase1}`.
 CSV columns `wait`, `grant_polls_per_acq`.
 
@@ -274,7 +278,7 @@ at 16 nodes): between one critical section and the next, 2b adds a pick load, an
 `skip`; `all` = the three) takes these, and the gate pass itself, off the critical path;
 default `all` since the CXL measurements (`docs/cxl_results.md`): it never lost to
 `none` in 112 configurations. As a default it drops the options a config cannot use
-(`grant` with `--wait owner`, `skip` with `-G inside|lazy`); an explicit `--ho` is
+(`grant` with `--wait owner`, `skip` with `-G inside`); an explicit `--ho` is
 checked strictly. `--ho none` restores the original §3.3 path. Gate algorithms only.
 
 - **`grant`**: `owner` holds only FREE or HELD (`OWNER_HELD`, never a node), and a handoff
@@ -300,7 +304,7 @@ checked strictly. `--ho none` restores the original §3.3 path. Gate algorithms 
   a FREE lock (`gate_entries_per_acq` ~0, `gate_skips_per_acq` ~1), so the gate algorithm
   matters only when the lock goes idle. Adaptive: the early read is done only if this
   node's last global acquisition of the lock waited (like `-X adaptive`), so an
-  uncontended acquisition goes straight to the gate. Rejected with `-G inside|lazy`.
+  uncontended acquisition goes straight to the gate. Rejected with `-G inside`.
 
 Not model-checked. Stress: `stress_{lamport,tournament,hybrid,ak}_{emu,uc}_split_handoff_hoall_{cap1,scan}`,
 `stress_tournament_{emu,uc}_split_handoff_ho{grant,clear,skip}_n8`,

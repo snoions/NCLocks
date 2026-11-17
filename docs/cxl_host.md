@@ -62,7 +62,7 @@ correctness is still checked by `emu`.
 6. Experiments: `scripts/cxl_sweep.sh` runs them all under the numactl prefix, writing
    one CSV per phase to `results/cxl_<date>/`. It refuses to start if the CPUs, the
    memory node or the uc pool node are wrong, and it aborts on any placement warning.
-   - Phases: `preflight p1 abl 2a 2b base open` (the default, about 75 minutes), plus
+   - Phases: `preflight p1 2a 2b base open` (the default; `abl`, `own`, `ho` are done), plus
      `dram` after reloading the driver with `nid=0`.
    - Main configuration: `cached-flush --wb clwb` (the default since 0285ab6; add
      `CFGS="uc_split_clwb cf_clwb"` for uc). It is the recommended configuration on this

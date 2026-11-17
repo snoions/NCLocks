@@ -199,9 +199,12 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         fprintf(stderr, "ncl: chain window must be a power of two in [2, %d]\n", NCL_SRV_CHAIN_MAX);
         return -1;
     }
-    if (c->mode == NCL_MODE_HANDOFF && c->alg == NCL_ALG_SERVER && c->pick_policy == NCL_PICK_PROBE) {
-        fprintf(stderr, "ncl: server handoff: pick policy is adaptive (follow the hint) or scan "
-                        "(always read succ[])\n");
+    if (c->announce_place != NCL_ANNOUNCE_BEFORE && c->announce_place != NCL_ANNOUNCE_INSIDE) {
+        fprintf(stderr, "ncl: bad announce_place %d\n", c->announce_place);
+        return -1;
+    }
+    if (c->pick_policy != NCL_PICK_ADAPTIVE && c->pick_policy != NCL_PICK_SCAN) {
+        fprintf(stderr, "ncl: bad pick_policy %d\n", c->pick_policy);
         return -1;
     }
     if ((c->debug_skip_meta_wb || c->debug_skip_meta_inv) && !c->meta_split) {
@@ -482,15 +485,6 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
                 }
                 break;
             }
-            if (place == NCL_ANNOUNCE_LAZY && !announced) {
-                /* Lazy: announce only now that the owner is known to be held.
-                 * Same argument as above: if the holder's pick_waiter misses
-                 * this store, its FREE lands after our read of "held", and our
-                 * poll sees FREE and retries the gate. */
-                ncl_uc_store(ann, aval);
-                ncl_fence();
-                announced = 1;
-            }
             ncl_base_unlock(&L->base, me, gpath, bst);
         }
 
@@ -603,24 +597,21 @@ static void handoff_release(struct ncl_local_lock *L, int me)
         L->ann_set = 0;
     }
 
-    int probe = cfg.pick_policy == NCL_PICK_PROBE ||
-                (cfg.pick_policy == NCL_PICK_ADAPTIVE && !L->acq_contended);
+    int probe = cfg.pick_policy == NCL_PICK_ADAPTIVE && !L->acq_contended;
     if (probe && P > 1) {
-        /* One probe at this node's round-robin pointer. Hit: hand off and
-         * continue after that node next time. Miss: FREE (a waiter we did
-         * not probe recovers through the gate) and advance by one. Under
-         * saturation every slot is set, so the pointers sweep the ring. */
+        /* Uncontended acquisition: one probe at this node's round-robin
+         * pointer. Hit: hand off and continue after that node next time.
+         * Miss: FREE (a waiter we did not probe recovers through the gate)
+         * and advance by one. */
         int j = L->pw_next;
-        if (w < 0) {
-            NCL_STAT(h->announce_loads++);
-            if ((seq = ncl_uc_load(&L->announce[j])))
-                w = j;
-        }
+        NCL_STAT(h->announce_loads++);
+        if ((seq = ncl_uc_load(&L->announce[j])))
+            w = j;
         int nx = (j + 1) % P;
         if (nx == me)
             nx = (nx + 1) % P;
         L->pw_next = nx;
-    } else if (w < 0) {
+    } else {
         w = ncl_uc_scan_first_v(L->announce, P, me + 1, P - 1, me, &h->announce_loads, &seq); /* round-robin after me */
     }
     ncl_fence(); /* CS effects, data writeback, our clear and the scan before the handoff */
