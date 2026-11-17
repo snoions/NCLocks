@@ -207,6 +207,10 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         fprintf(stderr, "ncl: bad pick_policy %d\n", c->pick_policy);
         return -1;
     }
+    if (c->emu_word_wb && !(c->backend == NCL_BACKEND_EMU && c->meta_split)) {
+        fprintf(stderr, "ncl: --emu-word-wb applies to -b emu -U split only\n");
+        return -1;
+    }
     if ((c->debug_skip_meta_wb || c->debug_skip_meta_inv) && !c->meta_split) {
         fprintf(stderr, "ncl: --skip-meta-wb/--skip-meta-inv apply to the split layout only\n");
         return -1;
@@ -344,6 +348,7 @@ int ncl_node_attach(int node_id)
     my_node = node_id;
     ncl_mem.debug_skip_meta_wb = cfg.debug_skip_meta_wb;
     ncl_mem.debug_skip_meta_inv = cfg.debug_skip_meta_inv;
+    ncl_mem.emu_word_wb = cfg.emu_word_wb;
     ncl_mem_node_attach();
 
     local = aligned_alloc(NCL_CACHELINE, sizeof(*local) * (size_t)cfg.nlocks);
@@ -404,6 +409,8 @@ static void check_owner(uint64_t o)
 
 /* Design §3.3 acquire, caller holds the submutex. Returns the NCL_PATH_*:
  * the gate's base path if the owner was FREE, else NCL_PATH_GLOBAL_HANDOFF. */
+uint64_t ncl_debug_grant_delay = 0;
+
 static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_stats *bst)
 {
     struct ncl_handoff_stats *h = &L->st.ho;
@@ -422,6 +429,12 @@ static int handoff_acquire(struct ncl_local_lock *L, int me, struct ncl_base_sta
     const int grant = cfg.handoff_opts & NCL_HO_GRANT;
     const uint64_t taken = grant ? OWNER_HELD : mine;
 
+    if (cfg.check_announce && ncl_uc_load(ann) != 0) {
+        /* We cleared it and have not announced since: a writeback of a stale
+         * copy of our line (another node's grant, design §2) landed after our
+         * clear. Not wrapped in NCL_STAT: the stress test fails on it. */
+        h->stale_announce++;
+    }
     const int place = cfg.announce_place;
     int announced = 0, waited = 0, skip = 0;
     uint64_t o;
@@ -553,7 +566,7 @@ acquired:
         L->need_grant = need_grant;
         ncl_fence(); /* ownership observed before the CS */
     } else {
-        if (need_grant) {
+        if (need_grant && !cfg.debug_no_grant_wait) {
             /* The releaser that set owner = us stores our grant next (owner,
              * fence, grant). Wait for it before clearing the announce: the two
              * share a line, and on a cached scan region a whole-line writeback
@@ -584,7 +597,7 @@ static void handoff_release(struct ncl_local_lock *L, int me)
          * now; the fence before the handoff store makes it visible before
          * anyone else can hold the lock and scan. */
         ncl_line_t *ann = &L->announce[me];
-        if (L->need_grant) {
+        if (L->need_grant && !cfg.debug_no_grant_wait) {
             /* See handoff_acquire: a grant still on its way must land before
              * our clear. Long since done by now, in practice. */
             unsigned n = 0;
@@ -633,6 +646,8 @@ static void handoff_release(struct ncl_local_lock *L, int me)
              * its writeback is not ordered after the UC store without a full
              * fence. Our copy of w's line is current: we just read it after
              * an invalidate, and w writes it only after seeing this grant. */
+            if (NCL_UNLIKELY(ncl_debug_grant_delay))
+                ncl_lat_spin_cycles(ncl_debug_grant_delay);
             if (ncl_meta_cached(&L->announce[w]))
                 ncl_fence();
             else

@@ -40,6 +40,7 @@ static int nnodes = 4, nthreads = 2, nlocks = 4, nwords = 16, pin = 0, precise =
 static long iters = 100000;
 static int timeout_s = 0;
 static unsigned reset_delay_ns = 0;
+static unsigned grant_delay_ns = 0;
 static unsigned max_delay_ns = 200;
 static size_t stride;
 static uint64_t delay_cycles;
@@ -170,7 +171,8 @@ static int node_main(int node)
     ncl_node_detach(); /* all nodes done; servers stopped */
     struct ncl_node_stats st;
     ncl_node_stats(&st);
-    viol += st.srv.errors; /* server-detected protocol violations */
+    viol += st.srv.errors;       /* server-detected protocol violations */
+    viol += st.ho.stale_announce; /* resurrected announce words (2b) */
     ncl_uc_store(res_line(node, RES_ACQ), acq);
     ncl_uc_store(res_line(node, RES_VIOL), viol);
     ncl_uc_store(res_line(node, RES_CKSUM), ck);
@@ -195,6 +197,8 @@ static int node_main(int node)
     if (sb.split_resets || sb.split_reset_skips)
         printf(" door_resets=%lu reset_skips=%lu", (unsigned long)sb.split_resets,
                (unsigned long)sb.split_reset_skips);
+    if (st.ho.stale_announce)
+        printf(" STALE_ANNOUNCE=%lu", (unsigned long)st.ho.stale_announce);
     if (st.global_releases != st.acquires)
         printf(" global_releases=%lu cap_releases=%lu", (unsigned long)st.global_releases,
                (unsigned long)st.cap_releases);
@@ -240,6 +244,12 @@ static void usage(const char *argv0)
             "  --skip-inv    DEBUG: skip data invalidate (emu must fail)\n"
             "  --skip-meta-wb / --skip-meta-inv\n"
             "                DEBUG: split layout: skip scan-region writeback / invalidate\n"
+            "  --emu-word-wb emu split: write back only the stored word of a cached metadata\n"
+            "                line (old model; default: the node's whole line, as hardware)\n"
+            "  --debug-no-grant-wait  DEBUG: handoff --wait own without --ho grant: clear the\n"
+            "                announce without waiting for a grant still on its way (must FAIL\n"
+            "                on emu split with full-line writeback; see design.md §5)\n"
+            "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
             "  --debug-unsafe-reopen  DEBUG: (d)/(e) fast winner probes one present[] slot\n"
             "                and reopens on a miss (the old -F hint; reset race, must FAIL\n"
@@ -260,6 +270,7 @@ int main(int argc, char **argv)
         .alg = NCL_ALG_LAMPORT,
         .mode = NCL_MODE_PHASE1,
         .handoff_opts = NCL_HO_DEFAULT,
+        .check_announce = 1, /* the stress test checks the 2b announce invariant */
     };
     static struct option lopts[] = {
         {"mem-node", required_argument, 0, 1001},
@@ -274,6 +285,9 @@ int main(int argc, char **argv)
         {"timeout", required_argument, 0, 5},
         {"reset-delay", required_argument, 0, 6},
         {"debug-unsafe-reopen", no_argument, 0, 7},
+        {"emu-word-wb", no_argument, 0, 8},
+        {"debug-no-grant-wait", no_argument, 0, 9},
+        {"grant-delay", required_argument, 0, 10},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -350,6 +364,9 @@ int main(int argc, char **argv)
         case 5: timeout_s = atoi(optarg); break;
         case 6: reset_delay_ns = (unsigned)atoi(optarg); break;
         case 7: ncl_fast_release = NCL_FASTREL_HINT; break;
+        case 8: cfg.emu_word_wb = 1; break;
+        case 9: cfg.debug_no_grant_wait = 1; break;
+        case 10: grant_delay_ns = (unsigned)atoi(optarg); break;
         case 1001: cfg.mem_node = atoi(optarg) + 1; break;
         case 1002: if (ncl_cpus_set(optarg) < 0) return 2; break;
         case 1003:
@@ -406,6 +423,7 @@ int main(int argc, char **argv)
     }
     delay_cycles = ncl_ns_to_cycles(max_delay_ns);
     ncl_debug_reset_delay = ncl_ns_to_cycles(reset_delay_ns);
+    ncl_debug_grant_delay = ncl_ns_to_cycles(grant_delay_ns);
 
     for (int l = 0; l < nlocks; l++) {
         if (ncl_lock_set_data(l, (ncl_off_t)l * stride, stride) < 0)
@@ -416,13 +434,14 @@ int main(int argc, char **argv)
     }
 
     printf("stress: alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d participants=%d "
-           "locks=%d iters/thread=%ld words=%d delay<=%uns lat=%uns%s%s%s%s%s\n",
+           "locks=%d iters/thread=%ld words=%d delay<=%uns lat=%uns%s%s%s%s%s%s%s\n",
            ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), ncl_mode_name(cfg.mode),
            cfg.no_submutex ? "+no_submutex" : "", nnodes, nthreads, ncl_participants(),
            nlocks, iters, nwords, max_delay_ns, cfg.dev_lat_ns, precise ? " precise-hints" : "",
            cfg.debug_skip_data_wb ? " SKIP-WB" : "", cfg.debug_skip_data_inv ? " SKIP-INV" : "",
            cfg.debug_skip_meta_wb ? " SKIP-META-WB" : "",
-           cfg.debug_skip_meta_inv ? " SKIP-META-INV" : "");
+           cfg.debug_skip_meta_inv ? " SKIP-META-INV" : "",
+           cfg.emu_word_wb ? " EMU-WORD-WB" : "", cfg.debug_no_grant_wait ? " NO-GRANT-WAIT" : "");
     fflush(stdout);
 
     pid_t *pids = calloc((size_t)nnodes, sizeof *pids);

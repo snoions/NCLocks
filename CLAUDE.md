@@ -19,11 +19,15 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
     **recommended configuration**: there, 8-byte (partial) writes to CXL memory are capped at
     ~9M/s in total, and every hot-metadata write is a full line on cf (design.md §2,
     `docs/cxl_results.md` "Device concurrency"). It relies on §1's no-clean-writebacks
-    assumption. The emulator does not model its full-line overwrite of the two-writer
-    announce line (design.md §5).
+    assumption.
   - `emu`: software non-coherence. Each node's data view is private, and writeback and
     invalidate copy whole lines to and from the device. Metadata is physically WB but
-    behaves as uncached. Use it to check correctness.
+    behaves as uncached, except the split layout's scan region (cached, private views):
+    a store there writes back the node's whole line, including stale copies of words
+    other nodes wrote, as hardware does (`--emu-word-wb`: the stored word only).
+    `ncl_stress` checks the 2b announce invariant (`stale_announce`); `--grant-delay` and
+    `--debug-no-grant-wait` show it catches the two-writer announce-line hazard
+    (design.md §5). Use it to check correctness.
   - Multi-line metadata reads (scans, server poll) go through `ncl_uc_load_many` /
     `ncl_uc_scan_first`: batched on cached-flush (all flushes, one mfence, parallel loads;
     scans probe the first, hinted slot alone first: `-Q probe`, default; `batch`, `serial`), serial with early exit elsewhere. Loads within a batch are

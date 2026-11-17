@@ -265,6 +265,29 @@ foreach(k wb inv)
   set_tests_properties(emu_split_detects_missing_meta_${k}_hybrid
     emu_split_detects_missing_meta_${k}_server PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Full-line writeback of cached metadata (the emulator's default, as hardware):
+# the two-writer announce line (waiter's announce + releaser's grant) is safe
+# only because a waiter that learned of its handoff from `owner` waits for the
+# grant before clearing its announce (design §2, §5). --grant-delay widens that
+# window (otherwise reached ~once per 10^5 handoffs). With the wait: PASS, at
+# the acquire (--ho none) and at the release (--ho clear,skip). Without it
+# (--debug-no-grant-wait): the releaser's late full-line writeback resurrects
+# the cleared announce: stale_announce (--ho none) or, at the release (clear),
+# a lock granted to a node that is not waiting, a hang the watchdog catches -> FAIL. The old word-only model
+# (--emu-word-wb) cannot express the overwrite and passes the broken protocol.
+foreach(ho none clear,skip)
+  string(REPLACE "," "" hn ${ho})
+  add_test(NAME emu_line_wb_grant_wait_${hn}
+    COMMAND ncl_stress -a tournament -b emu -U split -n 4 -t 2 -l 1 -i 3000 -M handoff --ho ${ho} -K 1 --grant-delay 50000 --timeout 60)
+  add_test(NAME emu_line_wb_detects_no_grant_wait_${hn}
+    COMMAND ncl_stress -a tournament -b emu -U split -n 4 -t 2 -l 1 -i 3000 -M handoff --ho ${ho} -K 1 --grant-delay 50000 --debug-no-grant-wait --timeout 5)
+  set_tests_properties(emu_line_wb_detects_no_grant_wait_${hn} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+add_test(NAME emu_word_wb_misses_no_grant_wait
+  COMMAND ncl_stress -a tournament -b emu -U split -n 4 -t 2 -l 1 -i 3000 -M handoff --ho none -K 1 --grant-delay 50000 --debug-no-grant-wait --emu-word-wb --timeout 60)
+add_test(NAME emu_word_wb_rejects_uniform
+  COMMAND ncl_stress -a tournament -b emu -M handoff --emu-word-wb)
+set_tests_properties(emu_word_wb_rejects_uniform PROPERTIES WILL_FAIL TRUE)
 # Anderson-Kim fast path (-a ak): as published (-F always) and the fairness
 # variant (default); -m runs it with P = all threads (Obstacle[]/indx over P);
 # -d 2000 stretches the windows the Obstacle mechanism guards.

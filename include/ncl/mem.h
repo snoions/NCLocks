@@ -121,6 +121,7 @@ struct ncl_mem {
     size_t cm_len;         /*   a split layout (0 otherwise) */
     int debug_skip_meta_wb;  /* DEBUG: split scan stores not written back */
     int debug_skip_meta_inv; /* DEBUG: split scan loads not invalidated first */
+    int emu_word_wb;         /* EMU split: write back only the stored word (see store) */
     size_t meta_size;
     size_t data_size;
     uint32_t dev_lat_ns;
@@ -298,17 +299,29 @@ static inline void ncl_uc_store_w(ncl_line_t *l, int k, uint64_t v)
     ncl_dev_delay();
     atomic_store_explicit(ncl__word(l, k), v, memory_order_relaxed);
     if (ncl_meta_cached(l)) {
-        /* Write back so other nodes can see it. EMU stores the VALUE to the
-         * device (not a re-read of the private copy): a same-node thread's
-         * concurrent invalidate may have refreshed the private copy in
-         * between, which real hardware (coherent within the node, clflushopt
-         * writes back dirty data) never loses. */
+        /* Write back so other nodes can see it. Hardware writes back the
+         * node's whole line, so EMU copies the node's copy of the line's other
+         * words too: a stale copy of a word another node wrote overwrites it
+         * at the device, as clwb/clflushopt would (design §2: the two-writer
+         * announce line relies on causal order against exactly this). Word k
+         * itself gets the VALUE, not a re-read of the private copy: a
+         * same-node thread's concurrent invalidate may have refreshed the
+         * private copy in between, which real hardware (coherent within the
+         * node, clflushopt writes back dirty data) never loses.
+         * emu_word_wb: only word k (the older, weaker model). */
         if (NCL_UNLIKELY(ncl_mem.debug_skip_meta_wb) && ncl_mem.split)
             return;
-        if (ncl_mem.backend == NCL_BACKEND_EMU)
-            atomic_store_explicit(ncl__emu_dev_w(l, k), v, memory_order_relaxed);
-        else
+        if (ncl_mem.backend == NCL_BACKEND_EMU) {
+            for (int j = 0; j < NCL_LINE_WORDS; j++) {
+                if (j != k && ncl_mem.emu_word_wb)
+                    continue;
+                uint64_t w = j == k ? v
+                                    : atomic_load_explicit(ncl__word(l, j), memory_order_relaxed);
+                atomic_store_explicit(ncl__emu_dev_w(l, j), w, memory_order_relaxed);
+            }
+        } else {
             ncl__wb(l);
+        }
     }
 }
 static inline void ncl_uc_store(ncl_line_t *l, uint64_t v) { ncl_uc_store_w(l, 0, v); }

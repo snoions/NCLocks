@@ -180,6 +180,15 @@ struct ncl_sys_cfg {
     int debug_skip_data_inv;
     int debug_skip_meta_wb;  /* split layout: scan-region stores not written back */
     int debug_skip_meta_inv; /* split layout: scan-region loads not invalidated */
+    int check_announce;      /* handoff, gate algorithms: at each global acquisition,
+                                check that our announce word is 0 (counted in
+                                ncl_handoff_stats.stale_announce; ncl_stress sets it) */
+    int debug_no_grant_wait; /* handoff, --wait own: clear the announce without waiting
+                                for a grant still on its way (unsafe with full-line
+                                writeback of the announce line) */
+    /* EMU split: write back only the stored word of a cached metadata line (the old
+     * model). Default 0: write back the node's whole line, as hardware does. */
+    int emu_word_wb;
 };
 
 struct ncl_range {
@@ -222,6 +231,8 @@ struct ncl_handoff_stats {
     uint64_t grant_polls;     /* WAIT_OWN: polls of the own grant word */
     uint64_t grant_waits;     /* WAIT_OWN: handoff seen via owner, then waited for the grant */
     uint64_t gate_skips;      /* SKIP: owner read held before the gate, gate not entered */
+    uint64_t stale_announce;  /* check_announce: own announce found set at a new global
+                                 acquisition (a late writeback resurrected it) */
 };
 #define NCL_HANDOFF_STATS_N (sizeof(struct ncl_handoff_stats) / sizeof(uint64_t))
 
@@ -241,6 +252,10 @@ struct ncl_node_stats {
 extern int ncl_wb_overlap;
 
 int ncl_sys_create(const struct ncl_sys_cfg *cfg);
+/* DEBUG (ncl_stress --grant-delay): cycles a 2b releaser spins between its
+ * owner store and the grant store (--wait own, no --ho grant), widening the
+ * window in which a waiter learns of the handoff from owner first. */
+extern uint64_t ncl_debug_grant_delay;
 void ncl_sys_destroy(void);
 
 /* Parent, before fork: associate [off, off+len) of the data region with lock. */
