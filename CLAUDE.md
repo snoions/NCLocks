@@ -15,7 +15,12 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
     `kmod/ncl_uc.ko` and is verified at startup via the live PTE and load timing (see
     `kmod/README.md`). Data is cached and uses clflushopt.
   - `cached-flush`: metadata is ordinary cached memory with a flush around every access.
-    It is a cost stand-in, NOT uncached.
+    NOT uncached. On the dev box it is a cost stand-in. On the CXL host it is the
+    **recommended configuration**: there, 8-byte (partial) writes to CXL memory are capped at
+    ~9M/s in total, and every hot-metadata write is a full line on cf (design.md §2,
+    `docs/cxl_results.md` "Device concurrency"). It relies on §1's no-clean-writebacks
+    assumption. The emulator does not model its full-line overwrite of the two-writer
+    announce line (design.md §5).
   - `emu`: software non-coherence. Each node's data view is private, and writeback and
     invalidate copy whole lines to and from the device. Metadata is physically WB but
     behaves as uncached. Use it to check correctness.
@@ -162,14 +167,17 @@ Writebacks" bit, spec §2.4.4); "own cache line" means the host's writeback gran
 patterns rely on the host's fence waiting for write completion. Untorn aligned 8-byte words
 are guaranteed by x86 and the CXL link but only *assumed* at the device. Partial writes
 (`MemWrPtl`, byte enables) exist, but their atomicity is unspecified: packing single-writer
-lines is low risk; multi-writer lines need verification on the target device.
+lines is low risk; multi-writer lines need verification on the target device. Measured on
+the CXL host, partial writes (UC 8-byte stores, 8-byte movnti) are served at ~9M/s in total
+while full-line writes scale to 150-180M/s, so packing does not pay there and hot metadata
+should be cached with full-line writeback (design.md §2).
 
 ## Memory regions (design §2)
 
 Keep the memory-access layer abstract so the backend (uncached mapping vs. explicit
 flush vs. emulator) can change. Four kinds of state:
 
-- **Hot metadata (uncached):** owner fields, base-algorithm variables (Peterson
+- **Hot metadata (uncached in the reference design; cached with full-line writeback on the measured CXL device, design §2):** owner fields, base-algorithm variables (Peterson
   `flag`/`turn`; Lamport `x`/`y`/`b[]`), announcement flags, queue slots, grant slots.
 - **Read-mostly metadata (cached, staleness-detected):** lock-to-home map (refreshed
   on NACK via version number), static config.

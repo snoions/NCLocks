@@ -64,8 +64,11 @@ correctness is still checked by `emu`.
    memory node or the uc pool node are wrong, and it aborts on any placement warning.
    - Phases: `preflight p1 abl 2a 2b base open` (the default, about 75 minutes), plus
      `dram` after reloading the driver with `nid=0`.
-   - Main configurations: `uc -U split --wb clwb` and `cached-flush --wb clwb`. On this
-     host those were the fastest at N=8 in the first single-run comparison.
+   - Main configuration: `cached-flush --wb clwb` (the default since 0285ab6; add
+     `CFGS="uc_split_clwb cf_clwb"` for uc). It is the recommended configuration on this
+     host: 8-byte writes to the CXL node are capped at ~9M/s in total, which caps every uc
+     lock, while cf writes whole lines (design.md §2, `docs/cxl_results.md` "Device
+     concurrency"). Check other devices with `scripts/cxl_sweep.sh conc`.
    - It covers (report throughput together with fairness):
    - Phase 1, 2a and 2b, every algorithm, `-b uc --mem-node 2`, N in {4, 8, 16, 32},
      T in {1, 3}.
