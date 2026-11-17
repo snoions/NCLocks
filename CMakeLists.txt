@@ -42,6 +42,8 @@ add_executable(ncl_memlat bench/memlat.c)
 target_link_libraries(ncl_memlat ncl)
 add_executable(ncl_memconc bench/memconc.c)
 target_link_libraries(ncl_memconc ncl)
+add_executable(ncl_kv bench/kv.c)
+target_link_libraries(ncl_kv ncl m)
 
 enable_testing()
 foreach(alg lamport tournament hybrid server fastsrv ak)
@@ -265,6 +267,50 @@ foreach(k wb inv)
   set_tests_properties(emu_split_detects_missing_meta_${k}_hybrid
     emu_split_detects_missing_meta_${k}_server PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# KV store (bench/kv.c, docs/kv.md): every run checks each read and, at the
+# end, every record and that versions sum to the updates; any error fails it.
+set(KV_ARGS -n 4 -t 2 -l 16 -k 20000 -s 0.5 -W 0.1 -P)
+foreach(m phase1 local handoff)
+  foreach(w A F)
+    add_test(NAME kv_emu_${m}_${w} COMMAND ncl_kv -b emu -M ${m} -w ${w} ${KV_ARGS})
+  endforeach()
+  add_test(NAME kv_emu_split_${m}_affinity COMMAND ncl_kv -b emu -U split -M ${m} -F 0.8 ${KV_ARGS})
+  add_test(NAME kv_emu_algmap_${m} COMMAND ncl_kv -b emu -M ${m} --algmap top:4 ${KV_ARGS})
+  add_test(NAME kv_uc_split_algmap_${m} COMMAND ncl_kv -b uc -U split -M ${m} --algmap top:4 ${KV_ARGS})
+  set_tests_properties(kv_uc_split_algmap_${m} PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+endforeach()
+add_test(NAME kv_emu_server_handoff COMMAND ncl_kv -b emu -a server -M handoff ${KV_ARGS})
+add_test(NAME kv_emu_full_local COMMAND ncl_kv -b emu --full -M local -d uniform ${KV_ARGS})
+add_test(NAME kv_cf_local_uniform COMMAND ncl_kv -b cached-flush -M local -d uniform ${KV_ARGS})
+# The emulator must catch each missing piece of precise data maintenance:
+# invalidate, writeback, refresh on a local handoff, and writing back dirty
+# lines before invalidating them (reached only with long local runs: -K 256,
+# few records per stripe).
+foreach(d skip-inv skip-wb no-local-refresh)
+  add_test(NAME kv_emu_detects_${d} COMMAND ncl_kv -b emu -M local --debug ${d} ${KV_ARGS})
+  set_tests_properties(kv_emu_detects_${d} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+add_test(NAME kv_emu_detects_no-dirty-wb
+  COMMAND ncl_kv -b emu -n 2 -t 4 -l 2 -k 2000 -M local -K 256 -s 1 -W 0.1 -P --debug no-dirty-wb)
+add_test(NAME kv_emu_dirty_wb_long_runs
+  COMMAND ncl_kv -b emu -n 2 -t 4 -l 2 -k 2000 -M local -K 256 -s 1 -W 0.1 -P)
+set_tests_properties(kv_emu_detects_no-dirty-wb PROPERTIES WILL_FAIL TRUE)
+# Per-lock algorithms (cfg.alg_per_lock, used by ncl_kv): even locks Lamport, odd
+# locks tournament, in each mode and layout.
+foreach(m phase1 local handoff)
+  foreach(be emu uc)
+    add_test(NAME stress_mixalgs_${be}_${m}
+      COMMAND ncl_stress -a tournament -b ${be} -n 4 -t 2 -l 4 -i 10000 -M ${m} --mix-algs --timeout 60)
+    add_test(NAME stress_mixalgs_${be}_split_${m}
+      COMMAND ncl_stress -a lamport -b ${be} -U split -n 4 -t 2 -l 4 -i 10000 -M ${m} --mix-algs --timeout 60)
+    if(be STREQUAL "uc")
+      set_tests_properties(stress_mixalgs_uc_${m} stress_mixalgs_uc_split_${m}
+        PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+    endif()
+  endforeach()
+endforeach()
+add_test(NAME mixalgs_rejects_hybrid COMMAND ncl_stress -a hybrid -b emu --mix-algs)
+set_tests_properties(mixalgs_rejects_hybrid PROPERTIES WILL_FAIL TRUE)
 # Full-line writeback of cached metadata (the emulator's default, as hardware):
 # the two-writer announce line (waiter's announce + releaser's grant) is safe
 # only because a waiter that learned of its handoff from `owner` waits for the

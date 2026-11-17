@@ -26,6 +26,10 @@
 #              tournament and Lamport, at T>1. Four parts, tagged in the config column:
 #              cap (local-handoff cap -K, 16x3, L=1), locks (L = 1..256, 16x3), open (open
 #              loop, 16x3, L=1 and 256) and nt (threads per node: MT_NT, L=1 and 256)
+#   kv         KV store (ncl_kv, docs/kv.md) at KV_NT (16x3), cf, 2a: per-lock algorithm map
+#              (top:H hottest stripes on the tournament, rest Lamport; H=0 all Lamport, H=L
+#              all tournament) vs the server chain; key skew x node affinity; precise vs
+#              full data maintenance; open loop. Parts tagged in the config column.
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
 #              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
@@ -47,6 +51,7 @@
 #      HO_NT ("4x1 16x1 32x1 16x3"), HO_LOCKS ("1 256"), HO_OPTS ("none grant,clear all"), RUN_TIMEOUT (120 s per run), WB (clwb),
 #      MT_MAIN ("16x3"), MT_CAPS ("8 16 64 256"), MT_LOCKS ("1 4 16 64 256"), MT_NT ("4x3 16x2 16x3 16x4 32x2"),
 #      MT_RATES1 / MT_RATES256 (mt open loop at L=1 / 256),
+#      KV (build/ncl_kv), KV_NT ("16x3"), KV_RATES ("1000k 2000k 4000k 6000k 8000k"),
 #      CONC_T ("1 2 4 8 16 24 32 48 60"), CONC_SECS (1), MEMCONC (build/ncl_memconc),
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16)
 set -uo pipefail
@@ -78,6 +83,9 @@ RATES1=${RATES1:-"25k 50k 100k 200k 300k 400k 450k"}             # phase open2b,
 RATES256=${RATES256:-"250k 500k 1000k 1500k 2000k 2500k 3000k"} # phase open2b, L=256
 OPEN2B_N=${OPEN2B_N:-16} # open2b is the T=1 (worst-case) study; mt covers T>1
 OPEN_T=${OPEN_T:-3}       # phase open: threads per node
+KV=${KV:-$ROOT/build/ncl_kv}
+KV_NT=${KV_NT:-16x3}
+KV_RATES=${KV_RATES:-"1000k 2000k 4000k 6000k 8000k"}
 MT_MAIN=${MT_MAIN:-16x3} # mt parts cap, locks, open
 MT_CAPS=${MT_CAPS:-"8 16 64 256"}
 MT_LOCKS=${MT_LOCKS:-"1 4 16 64 256"}
@@ -115,7 +123,7 @@ run() {
   local csv=$1 rep=$2 cfg=$3; shift 3
   local o e
   e=$(mktemp)
-  o=$(timeout "$RUN_TIMEOUT" "${NUMA[@]}" "$BENCH" "$@" 2>"$e")
+  o=$(timeout "$RUN_TIMEOUT" "${NUMA[@]}" "${RUNBIN:-$BENCH}" "$@" 2>"$e")
   local rc=$?
   if grep -q WARNING "$e"; then
     cat "$e" >>"$ERR"
@@ -299,6 +307,44 @@ mt() {
   done; done
 }
 
+kv() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/kv.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T c l h w v
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C)
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    # map: how much does a per-lock choice gain? (H=0 all Lamport, H=L all tournament)
+    for w in A B; do for l in 64 1024; do
+      local hs="0 1 4 16 64"; [ "$l" = 64 ] || hs="$hs $l"
+      for h in $hs; do
+        [ "$h" -le "$l" ] || continue
+        run "$csv" "$rep" "$c:map" -w "$w" -l "$l" --algmap "top:$h" -M local ${CFG[$c]} "${KC[@]}"
+      done
+      run "$csv" "$rep" "$c:map" -w "$w" -l "$l" -a server -M handoff ${CFG[$c]} "${KC[@]}"
+    done; done
+    # skew x affinity, L=1024, workload A
+    for v in "-d uniform" "-z 0.9" "-z 0.99"; do for f in 0 0.9; do
+      for h in 0 16 1024; do
+        run "$csv" "$rep" "$c:skew" $v -F "$f" -l 1024 --algmap "top:$h" -M local ${CFG[$c]} "${KC[@]}"
+      done
+      run "$csv" "$rep" "$c:skew" $v -F "$f" -l 1024 -a server -M handoff ${CFG[$c]} "${KC[@]}"
+    done; done
+    # precise vs full data maintenance (all tournament)
+    for l in 64 1024; do for d in "" --full; do
+      run "$csv" "$rep" "$c:data" -l "$l" --algmap "top:$l" -M local $d ${CFG[$c]} "${KC[@]}"
+    done; done
+    # open loop, L=1024, workload A, Zipf 0.99
+    for r in $KV_RATES; do
+      for h in 0 16 1024; do
+        run "$csv" "$rep" "$c:open" -l 1024 --algmap "top:$h" -r "$r" ${CFG[$c]} "${KC[@]}"
+      done
+      run "$csv" "$rep" "$c:open" -l 1024 -a server -M handoff -r "$r" ${CFG[$c]} "${KC[@]}"
+    done
+  done; done
+}
+
 conc() {
   # Device concurrency: does the aggregate of uncached 8-byte accesses flatten
   # with T while full-line writes scale (partial-write hypothesis)?
@@ -364,6 +410,7 @@ for ph in $PHASES; do
     conc) conc ;;
     open2b) open2b ;;
     mt) mt ;;
+    kv) kv ;;
     *) die "unknown phase $ph" ;;
   esac
 done

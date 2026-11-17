@@ -107,8 +107,16 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
 - `bench/memconc.c` (`ncl_memconc`): aggregate throughput of T threads issuing one access
   pattern (uc/cf load, store, Dekker step, same-line load, full-line writeback, 8- vs
   64-byte movnti), to locate the uc ceiling on CXL; `docs/backends.md`, sweep phase `conc`.
+- `bench/kv.c` (`ncl_kv`, `docs/kv.md`): YCSB-style KV store. Records striped over L locks
+  in the data region, static node-local key index, workloads A/B/C/F, uniform or scrambled
+  Zipfian keys, key-to-node affinity (`-F`), per-lock algorithm map (`--algmap top:H`: H
+  hottest stripes on the tournament, the rest Lamport; library: `cfg.alg_per_lock`,
+  `ncl_lock_set_alg`), precise data maintenance (`cfg.precise_data`,
+  `ncl_acquire_ranges`: only the named ranges are invalidated; release hints mandatory)
+  or `--full`. Every read and the final state are verified; `--debug ...` knobs must FAIL
+  on emu (ctests `kv_*`). Sweep phase `kv`.
 - Not yet implemented: home migration/NACK (2c), partial-write
-  stress test (§5), skewed/phased access, LiTL interposition, KV store.
+  stress test (§5), skewed/phased access in `ncl_bench`, LiTL interposition.
 
 Emulated nodes are forked processes sharing a memfd mapped at a fixed VA
 (`MAP_FIXED_NOREPLACE`). Process-private memory is node-local memory.
@@ -187,7 +195,8 @@ flush vs. emulator) can change. Four kinds of state:
   on NACK via version number), static config.
 - **Data (cached):** the data the locks protect. Written back when the global lock
   leaves a node, invalidated when it arrives. Two modes: conservative full
-  writeback/invalidate, and precise caller-supplied dirty-range hints (used by KV store).
+  writeback/invalidate, and precise caller-supplied ranges for both directions
+  (`cfg.precise_data`: read/write set at acquire, dirty hints at release; used by the KV store).
 - **Node-local (ordinary coherent memory):** submutexes, per-acquisition path info,
   local tail counters, handoff counts.
 

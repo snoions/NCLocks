@@ -163,6 +163,14 @@ struct ncl_sys_cfg {
                                queues) in a CACHED metadata region, batched reads;
                                single words stay uncached. uc and emu only. 0: all
                                metadata the backend's type (ncl/mem.h) */
+    int alg_per_lock;       /* 1: each lock's base algorithm is set with ncl_lock_set_alg
+                               (lamport or tournament; default cfg.alg, which must be
+                               one of them); the layout fits either */
+    int precise_data;       /* 1: precise data maintenance in both directions: acquire
+                               with ncl_acquire_ranges (only the named ranges are
+                               invalidated) and release with dirty hints (mandatory).
+                               0: ncl_acquire invalidates the lock's whole range when
+                               the lock arrives at the node. */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
@@ -183,6 +191,8 @@ struct ncl_sys_cfg {
     int check_announce;      /* handoff, gate algorithms: at each global acquisition,
                                 check that our announce word is 0 (counted in
                                 ncl_handoff_stats.stale_announce; ncl_stress sets it) */
+    int debug_precise;       /* PRECISE, DEBUG: 1 = no refresh on local handoffs, 2 = no
+                                writeback of dirty lines before invalidating them */
     int debug_no_grant_wait; /* handoff, --wait own: clear the announce without waiting
                                 for a grant still on its way (unsafe with full-line
                                 writeback of the announce line) */
@@ -260,6 +270,10 @@ void ncl_sys_destroy(void);
 
 /* Parent, before fork: associate [off, off+len) of the data region with lock. */
 int ncl_lock_set_data(int lock, ncl_off_t off, size_t len);
+/* Parent, before fork, cfg.alg_per_lock only: lock's base algorithm
+ * (NCL_ALG_LAMPORT or NCL_ALG_TOURNAMENT). Returns 0 or -1. */
+int ncl_lock_set_alg(int lock, ncl_alg_t alg);
+ncl_alg_t ncl_lock_alg(int lock);
 
 int ncl_node_attach(int node_id);
 /* Barrier across all nodes, then stop this node's server (if any). */
@@ -267,8 +281,18 @@ void ncl_node_detach(void);
 void ncl_thread_init(struct ncl_thread *t, int local_idx);
 
 void ncl_acquire(struct ncl_thread *t, int lock);
-/* hints == NULL: write back the lock's whole registered range. Otherwise write
- * back only the given ranges (caller promises nothing else was modified). */
+/* cfg.precise_data: acquire, promising to read or write only inside the given
+ * ranges (within the lock's registered range) until the release. On return they
+ * are current: invalidated when the lock arrives at the node, and on a local
+ * handoff unless already fetched in this node's current run of ownership
+ * (coherent within the node). A range the run dirtied is written back before
+ * it is invalidated (clflushopt does so in hardware; the emulator needs it).
+ * Writes must stay inside the acquired ranges too: a line written without
+ * being invalidated first would write stale neighbors back. */
+void ncl_acquire_ranges(struct ncl_thread *t, int lock, const struct ncl_range *r, int n);
+/* hints == NULL: write back the lock's whole registered range (not allowed with
+ * cfg.precise_data). Otherwise write back only the given ranges (caller
+ * promises nothing else was modified). */
 void ncl_release(int lock, const struct ncl_range *hints, int nhints);
 
 /* Static configuration (read-only after create). */

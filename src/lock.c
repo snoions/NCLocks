@@ -17,6 +17,8 @@ struct ncl_hdr {
     int32_t participants;
     uint64_t lines_per_lock;  /* meta-region lines per lock */
     uint64_t scan_per_lock;   /* scan-region lines per lock (b[], present[], announce[]) */
+    uint64_t base_lines;      /* ...of which the base algorithm's (meta) */
+    uint64_t base_scan;       /* ...of which the base algorithm's (scan) */
     ncl_off_t locks_off;  /* meta offset of first lock block */
     ncl_off_t slocks_off; /* scan offset of first lock's scan block */
     ncl_off_t user_off;   /* meta offset of user lines */
@@ -28,12 +30,15 @@ struct ncl_hdr {
 struct ncl_lock_desc {
     ncl_off_t data_off;
     uint64_t data_len;
+    int32_t alg;  /* base algorithm (cfg.alg unless set with ncl_lock_set_alg) */
+    int32_t pad;
 };
 
 /* Node-local per-lock state (ordinary coherent memory, design §2 table).
  * Fields other than `sub` are written only by the current holder, so the
  * state needed at release lives with the lock, not in the thread. */
 #define NCL_DIRTY_MAX 16
+#define NCL_FRESH_MAX 32
 
 struct ncl_local_lock {
     struct ncl_submutex sub;
@@ -56,6 +61,9 @@ struct ncl_local_lock {
     /* LOCAL/HANDOFF precise hints accumulated over a local run */
     int ndirty, dirty_full;
     struct ncl_range dirty[NCL_DIRTY_MAX];
+    /* PRECISE: line ranges invalidated (so current) in this ownership run */
+    int nfresh;
+    struct { uintptr_t lo, hi; } fresh[NCL_FRESH_MAX];
     struct ncl_node_stats st;
 } NCL_ALIGNED(NCL_CACHELINE);
 
@@ -221,6 +229,10 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
                         "race, docs/hybrid.md); it applies to ak only\n", ncl_alg_name(c->alg));
         return -1;
     }
+    if (c->alg_per_lock && c->alg != NCL_ALG_LAMPORT && c->alg != NCL_ALG_TOURNAMENT) {
+        fprintf(stderr, "ncl: per-lock algorithms: the default must be lamport or tournament\n");
+        return -1;
+    }
     if (c->nnodes < 1 || c->nnodes > NCL_MAX_NODES || c->nlocks < 1) {
         fprintf(stderr, "ncl: bad nnodes=%d / nlocks=%d\n", c->nnodes, c->nlocks);
         return -1;
@@ -252,8 +264,15 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         return -1;
     }
 
-    size_t lines_per_lock = ncl_base_nlines(c->alg, P) + handoff_lines(c, P);
-    size_t scan_per_lock = ncl_base_nscan(c->alg, P) + handoff_scan_lines(c, P);
+    size_t base_lines = ncl_base_nlines(c->alg, P), base_scan = ncl_base_nscan(c->alg, P);
+    if (c->alg_per_lock) { /* room for either algorithm */
+        size_t a = ncl_base_nlines(NCL_ALG_LAMPORT, P), b = ncl_base_nlines(NCL_ALG_TOURNAMENT, P);
+        size_t sa = ncl_base_nscan(NCL_ALG_LAMPORT, P), sb = ncl_base_nscan(NCL_ALG_TOURNAMENT, P);
+        base_lines = a > b ? a : b;
+        base_scan = sa > sb ? sa : sb;
+    }
+    size_t lines_per_lock = base_lines + handoff_lines(c, P);
+    size_t scan_per_lock = base_scan + handoff_scan_lines(c, P);
     size_t hdr_sz = round_line(sizeof(struct ncl_hdr));
     size_t descs_sz = round_line(sizeof(struct ncl_lock_desc) * (size_t)c->nlocks);
     size_t locks_sz = lines_per_lock * NCL_CACHELINE * (size_t)c->nlocks;
@@ -288,12 +307,19 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     hdr->participants = P;
     hdr->lines_per_lock = lines_per_lock;
     hdr->scan_per_lock = scan_per_lock;
+    hdr->base_lines = base_lines;
+    hdr->base_scan = base_scan;
     hdr->slocks_off = 0;
     hdr->descs_off = hdr_sz;
     hdr->locks_off = hdr_sz + descs_sz;
     hdr->user_off = hdr_sz + descs_sz + locks_sz;
     hdr->done_off = hdr->user_off + user_sz;
     hdr->srv = srv;
+    {
+        struct ncl_lock_desc *d = (struct ncl_lock_desc *)ncl_meta_ptr(hdr->descs_off);
+        for (int l = 0; l < c->nlocks; l++)
+            d[l].alg = c->alg;
+    }
     for (int l = 0; l < c->nlocks; l++)
         if (ncl_base_init_shared(c->alg, (ncl_line_t *)ncl_meta_ptr(hdr->locks_off) +
                                              (size_t)l * lines_per_lock) < 0)
@@ -335,6 +361,27 @@ int ncl_lock_set_data(int lock, ncl_off_t off, size_t len)
     return 0;
 }
 
+int ncl_lock_set_alg(int lock, ncl_alg_t alg)
+{
+    if (!hdr || lock < 0 || lock >= cfg.nlocks || !cfg.alg_per_lock ||
+        (alg != NCL_ALG_LAMPORT && alg != NCL_ALG_TOURNAMENT)) {
+        fprintf(stderr, "ncl: ncl_lock_set_alg(%d, %s): needs alg_per_lock and lamport or "
+                        "tournament\n", lock, ncl_alg_name(alg));
+        return -1;
+    }
+    /* Both start all-zero, so no ncl_base_init_shared. */
+    struct ncl_lock_desc *d = (struct ncl_lock_desc *)ncl_meta_ptr(hdr->descs_off);
+    d[lock].alg = (int32_t)alg;
+    ncl_fence();
+    return 0;
+}
+
+ncl_alg_t ncl_lock_alg(int lock)
+{
+    const struct ncl_lock_desc *d = (const struct ncl_lock_desc *)ncl_meta_ptr(hdr->descs_off);
+    return (ncl_alg_t)d[lock].alg;
+}
+
 int ncl_node_attach(int node_id)
 {
     hdr = (struct ncl_hdr *)ncl_meta_ptr(0);
@@ -363,10 +410,10 @@ int ncl_node_attach(int node_id)
         ncl_line_t *mb = blocks + (size_t)l * hdr->lines_per_lock;
         ncl_line_t *sb = sblocks + (size_t)l * hdr->scan_per_lock;
         ncl_sub_init(&local[l].sub);
-        ncl_base_bind(&local[l].base, cfg.alg, hdr->participants, mb, sb);
+        ncl_base_bind(&local[l].base, (ncl_alg_t)d[l].alg, hdr->participants, mb, sb);
         if (cfg.mode == NCL_MODE_HANDOFF && !is_server()) {
-            local[l].owner = mb + ncl_base_nlines(cfg.alg, hdr->participants);
-            local[l].announce = sb + ncl_base_nscan(cfg.alg, hdr->participants);
+            local[l].owner = mb + hdr->base_lines;
+            local[l].announce = sb + hdr->base_scan;
             local[l].pw_next = (node_id + 1) % hdr->participants;
         }
         local[l].data = d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL;
@@ -661,7 +708,73 @@ static void handoff_release(struct ncl_local_lock *L, int me)
     ncl_fence_ss(); /* handoff store before the submutex unlock */
 }
 
+static void line_bounds(const struct ncl_range *r, uintptr_t *lo, uintptr_t *hi)
+{
+    *lo = (uintptr_t)r->p & ~(uintptr_t)(NCL_CACHELINE - 1);
+    *hi = ((uintptr_t)r->p + r->len + NCL_CACHELINE - 1) & ~(uintptr_t)(NCL_CACHELINE - 1);
+}
+
+/* PRECISE: make the acquired ranges current (see ncl_acquire_ranges). */
+static void precise_refresh(struct ncl_local_lock *L, const struct ncl_range *r, int n,
+                            int arrival)
+{
+    const uintptr_t dlo = (uintptr_t)L->data, dhi = dlo + L->data_len;
+    if (arrival)
+        L->nfresh = 0;
+    for (int k = 0; k < n; k++) {
+        uintptr_t lo, hi;
+        line_bounds(&r[k], &lo, &hi);
+        if (r[k].len == 0)
+            continue;
+        if ((uintptr_t)r[k].p < dlo || (uintptr_t)r[k].p + r[k].len > dhi) {
+            fprintf(stderr, "ncl: acquire range outside the lock's data\n");
+            abort();
+        }
+        int fresh = !arrival && cfg.debug_precise == 1;
+        for (int f = 0; f < L->nfresh && !fresh; f++)
+            fresh = L->fresh[f].lo <= lo && hi <= L->fresh[f].hi;
+        if (fresh)
+            continue;
+        /* Dirty in this run: write that part back before dropping it. */
+        for (int d = 0; d < L->ndirty && cfg.debug_precise != 2; d++) {
+            uintptr_t a, b;
+            line_bounds(&L->dirty[d], &a, &b);
+            if (a < lo) a = lo;
+            if (b > hi) b = hi;
+            if (a < b)
+                ncl_data_writeback_nofence((const void *)a, b - a);
+        }
+        if (!cfg.debug_skip_data_inv)
+            ncl_data_invalidate((const void *)lo, hi - lo); /* fences before and after */
+        if (L->nfresh < NCL_FRESH_MAX) {
+            L->fresh[L->nfresh].lo = lo;
+            L->fresh[L->nfresh].hi = hi;
+            L->nfresh++;
+        }
+    }
+}
+
+static void acquire(struct ncl_thread *t, int lock, const struct ncl_range *r, int n);
+
 void ncl_acquire(struct ncl_thread *t, int lock)
+{
+    if (cfg.precise_data) {
+        fprintf(stderr, "ncl: precise_data: acquire with ncl_acquire_ranges\n");
+        abort();
+    }
+    acquire(t, lock, NULL, 0);
+}
+
+void ncl_acquire_ranges(struct ncl_thread *t, int lock, const struct ncl_range *r, int n)
+{
+    if (!cfg.precise_data) {
+        fprintf(stderr, "ncl: ncl_acquire_ranges needs cfg.precise_data\n");
+        abort();
+    }
+    acquire(t, lock, r, n);
+}
+
+static void acquire(struct ncl_thread *t, int lock, const struct ncl_range *r, int n)
 {
     struct ncl_local_lock *L = &local[lock];
     int part;
@@ -677,10 +790,13 @@ void ncl_acquire(struct ncl_thread *t, int lock)
     if (cohort() && L->global_held) {
         /* Local handoff: the previous local holder passed us the submutex
          * with the node still owning the global lock. Data is coherent
-         * within the node, so no invalidate. */
+         * within the node, so no invalidate (PRECISE: except ranges this
+         * run has not fetched yet). */
         ncl_fence();
         L->st.acquires++;
         NCL_STAT(L->st.path[NCL_PATH_LOCAL_HANDOFF]++);
+        if (cfg.precise_data)
+            precise_refresh(L, r, n, 0);
         return;
     }
 
@@ -717,7 +833,9 @@ void ncl_acquire(struct ncl_thread *t, int lock)
     NCL_STAT(ncl_base_stats_add(&L->st.base, &tmp));
 
     /* Global lock arrived at this node: drop stale cached data. */
-    if (L->data_len && !cfg.debug_skip_data_inv)
+    if (cfg.precise_data)
+        precise_refresh(L, r, n, 1);
+    else if (L->data_len && !cfg.debug_skip_data_inv)
         ncl_data_invalidate(L->data, L->data_len);
 }
 
@@ -739,6 +857,14 @@ static void accumulate_dirty(struct ncl_local_lock *L, const struct ncl_range *h
     }
     for (int k = 0; k < nhints && !L->dirty_full; k++) {
         check_hint(&hints[k]);
+        if (L->ndirty == NCL_DIRTY_MAX && cfg.precise_data) {
+            /* PRECISE never falls back to the whole range (lines this run
+             * never fetched may be stale): write the list back now. */
+            for (int d = 0; d < L->ndirty; d++)
+                ncl_data_writeback_nofence(L->dirty[d].p, L->dirty[d].len);
+            ncl_fence();
+            L->ndirty = 0;
+        }
         if (L->ndirty == NCL_DIRTY_MAX)
             L->dirty_full = 1;
         else
@@ -749,6 +875,10 @@ static void accumulate_dirty(struct ncl_local_lock *L, const struct ncl_range *h
 void ncl_release(int lock, const struct ncl_range *hints, int nhints)
 {
     struct ncl_local_lock *L = &local[lock];
+    if (cfg.precise_data && !hints) {
+        fprintf(stderr, "ncl: precise_data: release needs dirty hints (nhints may be 0)\n");
+        abort();
+    }
 
     if (cohort()) {
         accumulate_dirty(L, hints, nhints);

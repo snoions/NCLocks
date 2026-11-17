@@ -249,6 +249,7 @@ static void usage(const char *argv0)
             "  --debug-no-grant-wait  DEBUG: handoff --wait own without --ho grant: clear the\n"
             "                announce without waiting for a grant still on its way (must FAIL\n"
             "                on emu split with full-line writeback; see design.md §5)\n"
+            "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
             "  --debug-unsafe-reopen  DEBUG: (d)/(e) fast winner probes one present[] slot\n"
@@ -288,6 +289,7 @@ int main(int argc, char **argv)
         {"emu-word-wb", no_argument, 0, 8},
         {"debug-no-grant-wait", no_argument, 0, 9},
         {"grant-delay", required_argument, 0, 10},
+        {"mix-algs", no_argument, 0, 11},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -367,6 +369,7 @@ int main(int argc, char **argv)
         case 8: cfg.emu_word_wb = 1; break;
         case 9: cfg.debug_no_grant_wait = 1; break;
         case 10: grant_delay_ns = (unsigned)atoi(optarg); break;
+        case 11: cfg.alg_per_lock = 1; break;
         case 1001: cfg.mem_node = atoi(optarg) + 1; break;
         case 1002: if (ncl_cpus_set(optarg) < 0) return 2; break;
         case 1003:
@@ -427,6 +430,9 @@ int main(int argc, char **argv)
 
     for (int l = 0; l < nlocks; l++) {
         if (ncl_lock_set_data(l, (ncl_off_t)l * stride, stride) < 0)
+            return 2;
+        if (cfg.alg_per_lock &&
+            ncl_lock_set_alg(l, l % 2 ? NCL_ALG_TOURNAMENT : NCL_ALG_LAMPORT) < 0)
             return 2;
         struct lockdata *d = ld(l);
         d->checksum = checksum(d);
