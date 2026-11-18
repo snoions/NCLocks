@@ -24,7 +24,7 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(ncl STATIC src/mem.c src/base.c src/lock.c src/server.c src/cpus.c)
+add_library(ncl STATIC src/mem.c src/data.c src/base.c src/lock.c src/server.c src/cpus.c)
 target_include_directories(ncl PUBLIC include)
 target_compile_definitions(ncl PUBLIC
   NCL_MAX_NODES=${NCL_MAX_NODES} NCL_MAX_PARTICIPANTS=${NCL_MAX_PARTICIPANTS})

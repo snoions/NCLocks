@@ -37,8 +37,6 @@ struct ncl_lock_desc {
 /* Node-local per-lock state (ordinary coherent memory, design §2 table).
  * Fields other than `sub` are written only by the current holder, so the
  * state needed at release lives with the lock, not in the thread. */
-#define NCL_DIRTY_MAX 16
-#define NCL_FRESH_MAX 32
 
 struct ncl_local_lock {
     struct ncl_submutex sub;
@@ -47,8 +45,6 @@ struct ncl_local_lock {
     int holder;          /* participant index used for the global acquisition */
     int global_held;     /* LOCAL/HANDOFF: node owns the global lock (passed locally) */
     int handoffs;        /* consecutive local handoffs in the current run */
-    void *data;
-    size_t data_len;
     ncl_line_t *owner;    /* HANDOFF: uncached owner word (0 = FREE, node+1) */
     ncl_line_t *announce; /* HANDOFF: announce[P], one line per node (scan region) */
     int pw_next;          /* HANDOFF, pick_policy: next announce[] slot to probe */
@@ -58,12 +54,7 @@ struct ncl_local_lock {
     int ann_set;          /* HANDOFF_OPTS CLEAR: announce to clear at the global release */
     int need_grant;       /* HANDOFF_OPTS CLEAR: handoff seen via owner, grant not yet seen */
     uint64_t srv_grant;   /* SERVER in HANDOFF: grant word (seq + hint) for the release */
-    /* LOCAL/HANDOFF precise hints accumulated over a local run */
-    int ndirty, dirty_full;
-    struct ncl_range dirty[NCL_DIRTY_MAX];
-    /* PRECISE: line ranges invalidated (so current) in this ownership run */
-    int nfresh;
-    struct { uintptr_t lo, hi; } fresh[NCL_FRESH_MAX];
+    struct ncl_data_ctx dc; /* protected data (data layer, design §2.1) */
     struct ncl_node_stats st;
 } NCL_ALIGNED(NCL_CACHELINE);
 
@@ -396,6 +387,13 @@ int ncl_node_attach(int node_id)
     ncl_mem.debug_skip_meta_wb = cfg.debug_skip_meta_wb;
     ncl_mem.debug_skip_meta_inv = cfg.debug_skip_meta_inv;
     ncl_mem.emu_word_wb = cfg.emu_word_wb;
+    {
+        struct ncl_data_cfg dc = {.precise = cfg.precise_data,
+                                  .skip_wb = cfg.debug_skip_data_wb,
+                                  .skip_inv = cfg.debug_skip_data_inv,
+                                  .debug_precise = cfg.debug_precise};
+        ncl_data_configure(&dc);
+    }
     ncl_mem_node_attach();
 
     local = aligned_alloc(NCL_CACHELINE, sizeof(*local) * (size_t)cfg.nlocks);
@@ -416,8 +414,8 @@ int ncl_node_attach(int node_id)
             local[l].announce = sb + hdr->base_scan;
             local[l].pw_next = (node_id + 1) % hdr->participants;
         }
-        local[l].data = d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL;
-        local[l].data_len = d[l].data_len;
+        ncl_data_ctx_init(&local[l].dc, d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL,
+                          d[l].data_len);
     }
     if (is_server() && ncl_srv_node_start(&cfg, &hdr->srv, node_id, blocks, hdr->lines_per_lock,
                                           sblocks, hdr->scan_per_lock) < 0)
@@ -708,52 +706,6 @@ static void handoff_release(struct ncl_local_lock *L, int me)
     ncl_fence_ss(); /* handoff store before the submutex unlock */
 }
 
-static void line_bounds(const struct ncl_range *r, uintptr_t *lo, uintptr_t *hi)
-{
-    *lo = (uintptr_t)r->p & ~(uintptr_t)(NCL_CACHELINE - 1);
-    *hi = ((uintptr_t)r->p + r->len + NCL_CACHELINE - 1) & ~(uintptr_t)(NCL_CACHELINE - 1);
-}
-
-/* PRECISE: make the acquired ranges current (see ncl_acquire_ranges). */
-static void precise_refresh(struct ncl_local_lock *L, const struct ncl_range *r, int n,
-                            int arrival)
-{
-    const uintptr_t dlo = (uintptr_t)L->data, dhi = dlo + L->data_len;
-    if (arrival)
-        L->nfresh = 0;
-    for (int k = 0; k < n; k++) {
-        uintptr_t lo, hi;
-        line_bounds(&r[k], &lo, &hi);
-        if (r[k].len == 0)
-            continue;
-        if ((uintptr_t)r[k].p < dlo || (uintptr_t)r[k].p + r[k].len > dhi) {
-            fprintf(stderr, "ncl: acquire range outside the lock's data\n");
-            abort();
-        }
-        int fresh = !arrival && cfg.debug_precise == 1;
-        for (int f = 0; f < L->nfresh && !fresh; f++)
-            fresh = L->fresh[f].lo <= lo && hi <= L->fresh[f].hi;
-        if (fresh)
-            continue;
-        /* Dirty in this run: write that part back before dropping it. */
-        for (int d = 0; d < L->ndirty && cfg.debug_precise != 2; d++) {
-            uintptr_t a, b;
-            line_bounds(&L->dirty[d], &a, &b);
-            if (a < lo) a = lo;
-            if (b > hi) b = hi;
-            if (a < b)
-                ncl_data_writeback_nofence((const void *)a, b - a);
-        }
-        if (!cfg.debug_skip_data_inv)
-            ncl_data_invalidate((const void *)lo, hi - lo); /* fences before and after */
-        if (L->nfresh < NCL_FRESH_MAX) {
-            L->fresh[L->nfresh].lo = lo;
-            L->fresh[L->nfresh].hi = hi;
-            L->nfresh++;
-        }
-    }
-}
-
 static void acquire(struct ncl_thread *t, int lock, const struct ncl_range *r, int n);
 
 void ncl_acquire(struct ncl_thread *t, int lock)
@@ -795,8 +747,7 @@ static void acquire(struct ncl_thread *t, int lock, const struct ncl_range *r, i
         ncl_fence();
         L->st.acquires++;
         NCL_STAT(L->st.path[NCL_PATH_LOCAL_HANDOFF]++);
-        if (cfg.precise_data)
-            precise_refresh(L, r, n, 0);
+        ncl_data_acquired(&L->dc, 0, r, n);
         return;
     }
 
@@ -826,103 +777,49 @@ static void acquire(struct ncl_thread *t, int lock, const struct ncl_range *r, i
     L->holder = part;
     L->global_held = 1;
     L->handoffs = 0;
-    L->ndirty = 0;
-    L->dirty_full = 0;
     L->st.acquires++;
     NCL_STAT(L->st.path[path]++);
     NCL_STAT(ncl_base_stats_add(&L->st.base, &tmp));
 
-    /* Global lock arrived at this node: drop stale cached data. */
-    if (cfg.precise_data)
-        precise_refresh(L, r, n, 1);
-    else if (L->data_len && !cfg.debug_skip_data_inv)
-        ncl_data_invalidate(L->data, L->data_len);
-}
-
-static void check_hint(const struct ncl_range *h)
-{
-    const char *p = h->p;
-    if (p < ncl_mem.data || p + h->len > ncl_mem.data + ncl_mem.data_size) {
-        fprintf(stderr, "ncl: dirty hint outside data region\n");
-        abort();
-    }
-}
-
-/* Remember this release's dirty ranges for the eventual global release. */
-static void accumulate_dirty(struct ncl_local_lock *L, const struct ncl_range *hints, int nhints)
-{
-    if (!hints) {
-        L->dirty_full = 1;
-        return;
-    }
-    for (int k = 0; k < nhints && !L->dirty_full; k++) {
-        check_hint(&hints[k]);
-        if (L->ndirty == NCL_DIRTY_MAX && cfg.precise_data) {
-            /* PRECISE never falls back to the whole range (lines this run
-             * never fetched may be stale): write the list back now. */
-            for (int d = 0; d < L->ndirty; d++)
-                ncl_data_writeback_nofence(L->dirty[d].p, L->dirty[d].len);
-            ncl_fence();
-            L->ndirty = 0;
-        }
-        if (L->ndirty == NCL_DIRTY_MAX)
-            L->dirty_full = 1;
-        else
-            L->dirty[L->ndirty++] = hints[k];
-    }
+    /* Global lock arrived at this node: the data layer drops stale data. */
+    ncl_data_acquired(&L->dc, 1, r, n);
 }
 
 void ncl_release(int lock, const struct ncl_range *hints, int nhints)
 {
     struct ncl_local_lock *L = &local[lock];
-    if (cfg.precise_data && !hints) {
-        fprintf(stderr, "ncl: precise_data: release needs dirty hints (nhints may be 0)\n");
-        abort();
-    }
 
+    /* Departing = the lock leaves the node; else a cohort pass to a local
+     * waiter (under the cap) keeps global ownership here. */
+    int departing = 1;
     if (cohort()) {
-        accumulate_dirty(L, hints, nhints);
         int cap = cfg.local_cap > 0 ? cfg.local_cap : 64;
         if (ncl_sub_has_waiter(&L->sub)) {
-            if (L->handoffs < cap) {
-                /* Cohort pass: keep global ownership in the node. Fence so
-                 * this thread's uncached stores reach the device first. */
-                L->handoffs++;
-                ncl_fence();
-                ncl_sub_unlock(&L->sub);
-                return;
-            }
-            NCL_STAT(L->st.cap_releases++);
+            if (L->handoffs < cap)
+                departing = 0;
+            else
+                NCL_STAT(L->st.cap_releases++);
         }
     }
 
-    /* Global lock leaving this node: write back eagerly (design §2 rule 5).
-     * Overlap (ncl_wb_overlap, MODE_HANDOFF only): issue the flushes without
-     * the trailing fence, so the release path's leading loads (2b
-     * pick_waiter, the chain's succ[] load) run while they complete. Both
-     * paths ncl_fence() before the store that hands the lock (and so the
-     * data) to another node: handoff_release before the owner store,
-     * ncl_srv_chain_release before the grant store, send() before REL. */
-    int overlap = ncl_wb_overlap && cfg.mode == NCL_MODE_HANDOFF;
-    void (*wb)(const void *, size_t) = overlap ? ncl_data_writeback_nofence : ncl_data_writeback;
-    if (!cfg.debug_skip_data_wb) {
-        if (cohort()) {
-            if (L->dirty_full) {
-                if (L->data_len)
-                    wb(L->data, L->data_len);
-            } else {
-                for (int k = 0; k < L->ndirty; k++)
-                    wb(L->dirty[k].p, L->dirty[k].len);
-            }
-        } else if (!hints) {
-            if (L->data_len)
-                wb(L->data, L->data_len);
-        } else {
-            for (int k = 0; k < nhints; k++) {
-                check_hint(&hints[k]);
-                wb(hints[k].p, hints[k].len);
-            }
-        }
+    /* Data layer (design §2.1): remember the dirty ranges; on departure write
+     * them back eagerly (design §2 rule 5). Overlap (ncl_wb_overlap,
+     * MODE_HANDOFF only): issue the flushes without the trailing fence, so the
+     * release path's leading loads (2b pick_waiter, the chain's succ[] load)
+     * run while they complete. Both paths ncl_fence() before the store that
+     * hands the lock (and so the data) to another node: handoff_release
+     * before the owner store, ncl_srv_chain_release before the grant store,
+     * send() before REL. */
+    ncl_data_release(&L->dc, hints, nhints, departing,
+                     ncl_wb_overlap && cfg.mode == NCL_MODE_HANDOFF);
+
+    if (!departing) {
+        /* Cohort pass: keep global ownership in the node. Fence so this
+         * thread's uncached stores reach the device first. */
+        L->handoffs++;
+        ncl_fence();
+        ncl_sub_unlock(&L->sub);
+        return;
     }
 
     L->global_held = 0;

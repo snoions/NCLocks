@@ -79,6 +79,7 @@
 #define NCL_LOCK_H
 
 #include "ncl/base.h"
+#include "ncl/data.h"
 #include "ncl/submutex.h"
 
 typedef enum {
@@ -201,10 +202,6 @@ struct ncl_sys_cfg {
     int emu_word_wb;
 };
 
-struct ncl_range {
-    const void *p;
-    size_t len;
-};
 
 /* Per-thread handle. Lives on the thread's stack or heap. */
 struct ncl_thread {

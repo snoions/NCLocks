@@ -26,7 +26,7 @@ DIR kv`.
   any per-lock choice, including a reactive lock, can gain.
 - **Open or closed loop** (`-r RATE`: Poisson, latency from the scheduled time).
 
-## Precise data maintenance (`cfg.precise_data`)
+## Precise data maintenance (`cfg.precise_data`, data layer `include/ncl/data.h`)
 
 A stripe holds many records, so invalidating the whole stripe whenever the lock arrives
 at a node (the conservative mode, `--full`) costs thousands of lines per transfer.

@@ -107,6 +107,12 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
 - `bench/memconc.c` (`ncl_memconc`): aggregate throughput of T threads issuing one access
   pattern (uc/cf load, store, Dekker step, same-line load, full-line writeback, 8- vs
   64-byte movnti), to locate the uc ceiling on CXL; `docs/backends.md`, sweep phase `conc`.
+- `include/ncl/data.h`, `src/data.c`: data maintenance layer (design §2.1), separate from the
+  lock algorithms. A lock only reports "arrived" vs "local handoff" after acquiring and
+  "departing" (with its fence before the handoff store) at release; the layer holds each
+  lock's data context (registered range, run's dirty and fetched ranges) and the
+  conservative and precise policies. Tracking is per lock, so data must stay bound to one
+  lock; node-wide tracking for data moving between locks is future work.
 - `bench/kv.c` (`ncl_kv`, `docs/kv.md`): YCSB-style KV store. Records striped over L locks
   in the data region, static node-local key index, workloads A/B/C/F, uniform or scrambled
   Zipfian keys, key-to-node affinity (`-F`), per-lock algorithm map (`--algmap top:H`: H
