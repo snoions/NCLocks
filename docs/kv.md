@@ -105,3 +105,16 @@ After folding the tournament's `mode` read into the root's entry check (one batc
 trip with the root's flag and turn on cached-flush), same dev-box setup: pinned
 all-tournament 3-5% below the fixed one (was 8-9%), pinned to the 16-hottest map 0.5%
 below the fixed map (was 2-6%).
+
+## Coherent baselines (`kvbase`)
+
+`-b coherent` runs the same KV store with this host's own cache coherence on the CXL
+memory: no data writeback or invalidate, metadata as plain cached memory. It is the ideal
+case (a coherent CXL device used by one host), an upper bound, not what several hosts
+sharing a non-coherent device get. Variants: a `pthread` mutex per stripe without the
+node-local submutex (`-m`: every thread contends directly, what a program would do with
+coherent memory and atomics) and with it; the tournament and the reactive lock in 2a on
+coherent memory (isolates the cost of non-coherence for the same algorithms); and the
+non-coherent reactive lock and 16-hottest map on cf.
+
+Dev box (4x3, single short runs): coherent 21-43M ops/s, non-coherent cf 10-12M (2.2-3.6x).

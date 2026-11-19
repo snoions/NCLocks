@@ -282,6 +282,13 @@ endforeach()
 add_test(NAME kv_emu_server_handoff COMMAND ncl_kv -b emu -a server -M handoff ${KV_ARGS})
 add_test(NAME kv_emu_full_local COMMAND ncl_kv -b emu --full -M local -d uniform ${KV_ARGS})
 add_test(NAME kv_cf_local_uniform COMMAND ncl_kv -b cached-flush -M local -d uniform ${KV_ARGS})
+# Coherent baselines (sweep phase kvbase): pthread mutex per stripe with and without the
+# submutex; -m with a non-coherent algorithm (every thread a participant) on emu.
+add_test(NAME kv_coherent_pthread_nosub COMMAND ncl_kv -b coherent -a pthread -m ${KV_ARGS})
+add_test(NAME kv_coherent_pthread COMMAND ncl_kv -b coherent -a pthread ${KV_ARGS})
+add_test(NAME kv_emu_tournament_nosub COMMAND ncl_kv -b emu -a tournament -m ${KV_ARGS})
+add_test(NAME kv_rejects_nosub_local COMMAND ncl_kv -b emu -m -M local ${KV_ARGS})
+set_tests_properties(kv_rejects_nosub_local PROPERTIES WILL_FAIL TRUE)
 # The emulator must catch each missing piece of precise data maintenance:
 # invalidate, writeback, refresh on a local handoff, and writing back dirty
 # lines before invalidating them (reached only with long local runs: -K 256,

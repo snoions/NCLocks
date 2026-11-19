@@ -37,6 +37,10 @@
 #              (--algmap top:16 --react off) vs the fixed map and reactive 12:4:64; pinned
 #              all-tournament / all-Lamport vs the fixed ones (per-path overhead). KV, Zipf
 #              0.99 and uniform, L=1024 (+ L=64 Zipf), closed loop and open loop 1-6M
+#   kvbase     KV store: coherent baselines vs the non-coherent locks, all on MEMNODE.
+#              Coherent: pthread mutex per stripe (-m: no submutex; and with it), tournament
+#              and reactive (2a); cf: reactive 12:4:64 and the 16-hottest map (2a). Zipf 0.99
+#              L=1024 and 64, uniform L=1024; open loop up to KVBASE_RATES
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
 #              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
@@ -58,7 +62,7 @@
 #      HO_NT ("4x1 16x1 32x1 16x3"), HO_LOCKS ("1 256"), HO_OPTS ("none grant,clear all"), RUN_TIMEOUT (120 s per run), WB (clwb),
 #      MT_MAIN ("16x3"), MT_CAPS ("8 16 64 256"), MT_LOCKS ("1 4 16 64 256"), MT_NT ("4x3 16x2 16x3 16x4 32x2"),
 #      MT_RATES1 / MT_RATES256 (mt open loop at L=1 / 256),
-#      REACT_THR ("12:4 6:4:256 4:4:256 4:2:1024"), KV (build/ncl_kv), KV_NT ("16x3"), KV_RATES ("1000k 2000k 4000k 6000k 8000k"),
+#      KVBASE_RATES ("2000k 6000k 10000k 15000k 20000k"), REACT_THR ("12:4 6:4:256 4:4:256 4:2:1024"), KV (build/ncl_kv), KV_NT ("16x3"), KV_RATES ("1000k 2000k 4000k 6000k 8000k"),
 #      CONC_T ("1 2 4 8 16 24 32 48 60"), CONC_SECS (1), MEMCONC (build/ncl_memconc),
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16)
 set -uo pipefail
@@ -94,6 +98,7 @@ KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
 # U:D[:W]: up when >= U of the last 16 contended; down when <= D of the last 64, after
 # >= W acquisitions on the tournament (default 64)
+KVBASE_RATES=${KVBASE_RATES:-"2000k 6000k 10000k 15000k 20000k"}
 REACT_THR=${REACT_THR:-"12:4 6:4:256 4:4:256 4:2:1024"}
 KV_RATES=${KV_RATES:-"1000k 2000k 4000k 6000k 8000k"}
 MT_MAIN=${MT_MAIN:-16x3} # mt parts cap, locks, open
@@ -409,6 +414,28 @@ kviso() {
   done; done
 }
 
+kvbase() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/kvbase.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T r v k
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C)
+  local COH="-b coherent --mem-node $MEMNODE"
+  local CF="${CFG[cf_clwb]}"
+  local -a V=("$COH -a pthread -m" "$COH -a pthread" "$COH -a tournament -M local"
+              "$COH -a reactive --react 12:4:64 -M local"
+              "$CF -a reactive --react 12:4:64 -M local" "$CF --algmap top:16 -M local")
+  for rep in $(seq "$REPS"); do
+    for k in "-z 0.99 -l 1024" "-z 0.99 -l 64" "-d uniform -l 1024"; do for v in "${V[@]}"; do
+      run "$csv" "$rep" closed $k $v "${KC[@]}"
+    done; done
+    for r in $KVBASE_RATES; do for v in "${V[@]}"; do
+      run "$csv" "$rep" open -z 0.99 -l 1024 -r "$r" $v "${KC[@]}"
+    done; done
+  done
+}
+
 conc() {
   # Device concurrency: does the aggregate of uncached 8-byte accesses flatten
   # with T while full-line writes scale (partial-write hypothesis)?
@@ -477,6 +504,7 @@ for ph in $PHASES; do
     kv) kv ;;
     kvreact) kvreact ;;
     kviso) kviso ;;
+    kvbase) kvbase ;;
     *) die "unknown phase $ph" ;;
   esac
 done

@@ -407,6 +407,8 @@ static void usage(const char *a0)
             "  --full        conservative data maintenance (whole stripe) instead of precise\n"
             "  -c NS         extra critical-section time    -s SECS -W SECS (2, 0.2)\n"
             "  -r RATE       open loop, Poisson, aggregate req/s (k/M ok); default closed loop\n"
+            "  -m            no node-local submutex: every thread is a global participant\n"
+            "                (Phase 1 only; with -b coherent -a pthread: one plain mutex per stripe)\n"
             "  -P            don't pin    -C one CSV row    -H CSV header\n"
             "  --debug skip-inv|skip-wb|no-local-refresh|no-dirty-wb: DEBUG, must FAIL on emu\n",
             a0);
@@ -416,7 +418,8 @@ static void usage(const char *a0)
     "workload,dist,theta,affinity,keys,value_bytes,locks,alg,algmap_top,tournament_locks,"     \
     "backend,mode,local_cap,meta_layout,data,nodes,threads_per_node,target_rps,achieved_rps,"  \
     "unserved_frac,lock_p50,lock_p99,lock_p999,op_p50,op_p99,op_p999,node_min_max_ratio,"      \
-    "local_handoff_frac,hot_stripe_share,errors,tournament_acq_frac,mode_switches,react"
+    "local_handoff_frac,hot_stripe_share,errors,tournament_acq_frac,mode_switches,react,"   \
+    "no_submutex"
 
 int main(int argc, char **argv)
 {
@@ -435,7 +438,7 @@ int main(int argc, char **argv)
                                  {"react", required_argument, 0, 1007},
                                  {0, 0, 0, 0}};
     int c;
-    while ((c = getopt_long(argc, argv, "n:t:l:k:V:w:d:z:F:a:M:K:b:U:c:s:W:r:PCHh", lo, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "n:t:l:k:V:w:d:z:F:a:M:K:b:U:c:s:W:r:mPCHh", lo, NULL)) != -1) {
         switch (c) {
         case 'n': nnodes = atoi(optarg); break;
         case 't': nthreads = atoi(optarg); break;
@@ -467,6 +470,7 @@ int main(int argc, char **argv)
             if (*e == 'm' || *e == 'M') rate *= 1e6;
             break;
         }
+        case 'm': cfg.no_submutex = 1; break;
         case 'P': pin = 0; break;
         case 'C': csv = 1; break;
         case 'H': puts(CSV_HEADER); return 0;
@@ -679,7 +683,7 @@ int main(int argc, char **argv)
     snprintf(modebuf, sizeof modebuf, "%s", ncl_mode_name(cfg.mode));
     if (csv) {
         printf("%c,%s,%.2f,%.2f,%ld,%zu,%d,%s,%d,%d,%s,%s,%d,%s,%s,%d,%d,%.0f,%.0f,%.5f,%lu,%lu,"
-               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s\n",
+               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s,%d\n",
                workload, zipf ? "zipf" : "uniform", zipf ? theta : 0.0, affinity, nkeys, vbytes,
                nlocks, algmap_top >= 0 && !react_map ? "map" : ncl_alg_name(cfg.alg), algmap_top, ntour,
                ncl_backend_name(cfg.backend), modebuf,
@@ -689,7 +693,7 @@ int main(int argc, char **argv)
                (unsigned long)hist_pct(hl, 0.99), (unsigned long)hist_pct(hl, 0.999),
                (unsigned long)hist_pct(ho, 0.5), (unsigned long)hist_pct(ho, 0.99),
                (unsigned long)hist_pct(ho, 0.999), fair, lh, hot_share, (unsigned long)errors, tf,
-               (unsigned long)tot->switches, react);
+               (unsigned long)tot->switches, react, cfg.no_submutex);
     } else {
         printf("kv: workload %c, %s, affinity %.2f, %ld keys x %zu B, %d locks, alg %s "
                "(%d tournament), %s, mode %s, data %s, %dx%d\n",

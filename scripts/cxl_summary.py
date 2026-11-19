@@ -3,7 +3,7 @@
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
 Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt kv kvreact kviso
-(default: those whose CSV exists).
+kvbase (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -108,6 +108,42 @@ def mt(d):
         r["p50"] = (r.p50 / 1e3).round(2)
         r["p99"] = (r.p99 / 1e3).round(1)
         out.append("open loop (MT_MAIN, Poisson): k/s achieved, lock p50 / p99 us\n" + r.round(3).to_string())
+    return "\n\n".join(out)
+
+
+def kvbase(d):
+    """Phase kvbase: coherent baselines vs the non-coherent locks."""
+    d = d.copy()
+    def lab(r):
+        if r.backend == "coherent":
+            if r.alg == "pthread":
+                return "coh pthread" + (" no-submutex" if r.no_submutex else " +submutex")
+            return "coh %s 2a" % r.alg
+        if r.alg == "reactive":
+            return "cf reactive " + str(r.react)
+        return "cf top%d map" % r.tournament_locks
+    d["variant"] = d.apply(lab, axis=1)
+    d["keys"] = d.apply(lambda r: "uniform" if r.dist == "uniform" else "zipf%.2f" % r.theta, axis=1)
+    out = []
+    p = d[d.config == "closed"]
+    if len(p):
+        r = p.groupby(["keys", "locks", "variant"]).agg(
+            thr=("achieved_rps", "median"), p50=("lock_p50", "median"), p99=("lock_p99", "median"),
+            fair=("node_min_max_ratio", "median"), err=("errors", "max"))
+        r["thr"] = (r.thr / 1e3).round(0)
+        r["p99"] = (r.p99 / 1e3).round(1)
+        out.append("closed loop: k ops/s, lock p50 ns, p99 us\n" + r.to_string())
+    p = d[d.config == "open"]
+    if len(p):
+        r = p.groupby(["target_rps", "variant"]).agg(
+            ach=("achieved_rps", "median"), unserved=("unserved_frac", "median"),
+            p50=("lock_p50", "median"), p99=("lock_p99", "median"))
+        r["ach"] = (r.ach / 1e3).round(0)
+        r["p50"] = (r.p50 / 1e3).round(2)
+        r["p99"] = (r.p99 / 1e3).round(1)
+        out.append("open loop (Zipf 0.99, L=1024): k/s, lock latency us\n" + r.to_string())
+    if d.errors.max() > 0:
+        out.append("!!! %d runs with KV check errors" % (d.errors > 0).sum())
     return "\n\n".join(out)
 
 
@@ -243,7 +279,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b", "mt", "kv", "kvreact", "kviso"]
+                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -268,6 +304,8 @@ def main():
             print(kvreact(d))
         elif ph == "kviso":
             print(kviso(d))
+        elif ph == "kvbase":
+            print(kvbase(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()
