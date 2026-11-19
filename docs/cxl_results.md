@@ -781,3 +781,40 @@ Open loop, Zipf 0.99, L=1024 (lock p50 / p99 / p99.9 us):
 - **p99.9 at light load is 2x the map's** (41-47 vs 17-25 us at 1-2M): at low load few
   locks show enough contention to be promoted (5-10% of global acquisitions on the
   tournament vs 29%), so occasional bursts on a hot lock meet Lamport's slow path.
+
+## KV store: coherent baselines (`kvbase`, 16x3, all on the CXL node)
+
+`results/cxl_20261119_2143/kvbase.csv`: after `cf34f59`; 3 reps, 144 runs, no errors, KV
+checks clean, spread median 0.5% (max 3.2%). "Coherent" = this host's own cache coherence
+on the CXL memory (no writeback or invalidate; `pthread` = futex, coherent atomics): an
+upper bound, what a coherent device used by one host would give, not several hosts sharing
+a non-coherent one. k ops/s; lock p50.
+
+| | uniform L=1024 | Zipf 0.99 L=1024 | Zipf 0.99 L=64 |
+|---|---|---|---|
+| coherent pthread, no submutex | **97244** (p50 0.29 us) | 16140 | 14111 |
+| coherent pthread + submutex | 94148 | **16557** | **14409** |
+| coherent reactive 2a | 66597 (0.54 us) | 15748 | 13434 |
+| coherent tournament 2a | 44669 (0.86 us) | **16609** | 13856 |
+| non-coherent reactive 12:4:64 (cf) | 10380 (2.69 us) | 6888 | 5237 |
+| non-coherent 16-hottest map (cf) | 10862 | 6852 | 5413 |
+
+Open loop, Zipf 0.99, L=1024 (lock p50 / p99 us): coherent pthread 0.35 / 0.9 at 2M,
+0.35 / 1.3 at 6M, 0.37 / 22 at 15M, saturates at ~16M; non-coherent reactive 2.7 / 18 at
+2M, 18 / 164 at 6M, saturates at ~6.9M (37% unserved at 10M).
+
+- **The non-coherent locks reach 1/9 of coherent locking on uncontended locks and 0.37-0.42
+  of it on contended ones** (uniform: 10.4M vs 97M; Zipf: 6.9M vs 16.6M at L=1024, 5.2-5.4M
+  vs 14.4M at L=64). Under contention all locks are bound by the hot keys' serialization,
+  so the gap narrows.
+- **Most of the gap is non-coherence, not the algorithm.** The same reactive lock on
+  coherent memory gives 66.6M (uniform) and 15.7M (Zipf): non-coherence costs 6.4x and
+  2.3x. The rest is algorithm: the futex mutex beats the reactive lock by 1.46x uncontended
+  (one atomic vs Lamport's store-fence-load round trips) and only 5% under Zipf.
+  Non-coherence costs twice over: every metadata access goes to the device, and each
+  arriving acquisition invalidates its record and fetches it from CXL, where coherent
+  caches keep hot records.
+- **Latency:** at 2-6M the coherent mutex's median is 8-50x lower (0.35 vs 2.7-18 us), and
+  its capacity 2.4x higher (~16M vs ~6.9M).
+- The non-coherent reactive lock again matches the oracle map (6888 vs 6852 at Zipf
+  L=1024).
