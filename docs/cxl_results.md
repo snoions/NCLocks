@@ -567,3 +567,60 @@ locks, the local-handoff cap as the latency/throughput knob. The wrong choice co
 1.66x on cold locks (tournament) and up to 4.9x plus unfairness on hot ones (Lamport).
 That gap is what a per-lock reactive Lamport/tournament lock would recover on mixed
 workloads (Zipfian KV). Gate-based 2b is dominated in every regime measured with T>1.
+
+## KV store (`kv` phase, 16x3, cf, 2a, precise data)
+
+`results/cxl_20261118_2256/kv.csv`: 3 reps, 222 runs, no errors, KV checks clean in every
+run, rep spread median 1.3% (max 8.3%). 100k keys x 100 B. Algorithm map `top:H`: the H
+stripes with the highest expected load on the tournament, the rest Lamport (`docs/kv.md`).
+k ops/s, lock p99 in us, fairness.
+
+**Per-lock map, Zipf 0.99:**
+
+| | A, L=64 | A, L=1024 | B, L=64 | B, L=1024 |
+|---|---|---|---|---|
+| all Lamport (H=0) | 1349, 852 us, 0.84 | 1485, 819, 0.87 | 1331, 852, 0.84 | 1505, 819, 0.86 |
+| H=1 | 2180, 590 | 2601, 492 | 2172, 590 | 2759, 475 |
+| H=4 | 3532, 262 | 5624, 55 | 3536, 279 | 5518, 82 |
+| **H=16** | **5316**, 41, 0.95 | **6894**, 39, 0.94 | **5605**, 37, 0.96 | **7492**, 32, 0.97 |
+| H=64 | (= all) | 6566, 37 | (= all) | 7030, 30 |
+| all tournament (H=L) | 4903, 30, 0.94 | 5249, 27, 0.94 | 5067, 27, 0.95 | 5498, 23, 0.95 |
+| server chain | 4957, 41 | 5481, 43 | 5242, 35 | 5973, 37 |
+
+**Key skew x node affinity** (A, L=1024):
+
+| | all Lamport | H=16 | all tournament | server chain |
+|---|---|---|---|---|
+| uniform | **11158** | 10901 | 5804 | 6925 |
+| uniform, affinity 0.9 | **11674** | 11324 | 5870 | 6938 |
+| Zipf 0.9 | 2428 (p99 557 us) | **8570** | 5587 | 6467 |
+| Zipf 0.9, affinity 0.9 | **11588** | 10820 | 5912 | 7023 |
+| Zipf 0.99 | 1494 (p99 786 us) | **6964** | 5240 | 5521 |
+| Zipf 0.99, affinity 0.9 | **11282** | 10595 | 5994 | 7130 |
+
+**Data maintenance** (all tournament, A, Zipf 0.99): precise 4944 / 5283 vs `--full` 136
+(p99 2.4 ms) / 1980 at L=64 / 1024: **36x** / 2.7x.
+
+**Open loop** (A, L=1024, Zipf 0.99; lock p50 / p99 in us):
+
+| offered | 1M | 2M | 4M | 6M | 8M |
+|---|---|---|---|---|---|
+| H=16 | **2.7 / 12.3** | **2.8 / 18.4** | 5.9 / 74 | 17% unserved | 43% |
+| server chain | 4.6 / 20.5 | 4.6 / 20.5 | **7.4 / 47** | **10%** (5.5M served) | 39% |
+| all tournament | 5.9 / 17.4 | 6.1 / 26.6 | 18.4 / 156 | 27% | 51% |
+| all Lamport | saturated at ~0.53M | | | | |
+
+- **A per-lock choice pays a lot on skewed, shared data.** With Zipf keys and no
+  affinity, H=16 beats all-tournament by 8-11% at L=64 and **31-36% at L=1024**, and
+  all-Lamport by 4-5x. The hot stripes need the tournament (all-Lamport: p99 0.8 ms,
+  fairness 0.84); the cold tail is faster on Lamport.
+- **Too few tournament locks is worse than none of the per-lock benefit**: H=1-4 at L=64
+  leaves hot stripes on Lamport (2.2-3.5M).
+- **Without shared hot locks, Lamport wins** (uniform keys, or affinity 0.9 so hot locks
+  are owned by one node and stay there through cohort passing): all-Lamport 11.2-11.7M,
+  ~2x all-tournament. H=16 stays within 2-7% of it, so a map that only moves truly
+  shared hot locks to the tournament is near-best in every row.
+- The server chain is between all-tournament and H=16 in closed loop, but has the highest
+  open-loop capacity (5.5M served at 6M offered) and the best tail at 4M.
+- The oracle map uses the known key distribution; a reactive lock would have to find the
+  hot, shared set online. Its upper bound here is the H=16 row.
