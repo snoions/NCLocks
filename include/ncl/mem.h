@@ -197,6 +197,21 @@ static inline void ncl_fence_ss(void)
     atomic_thread_fence(memory_order_release);
 }
 
+/* Load-load fence: a later load returns a value at least as new as an earlier
+ * one saw. x86 never reorders loads with older loads (SDM 8.2.2, for WB and
+ * UC alike), so there it is only a compiler barrier; other architectures need
+ * a real acquire fence. Used where a protocol relies on load order instead of
+ * a full fence (the reactive lock's mode read in the tournament's root check,
+ * src/base.c). */
+static inline void ncl_fence_ll(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    atomic_signal_fence(memory_order_seq_cst);
+#else
+    atomic_thread_fence(memory_order_acquire);
+#endif
+}
+
 /* ---- hot metadata (uncached) ------------------------------------------- */
 
 #if defined(__x86_64__)
@@ -372,6 +387,29 @@ static inline void ncl_uc_load_many(ncl_line_t *const *ls, int n, uint64_t *out)
     } else {
         for (int k = 0; k < n; k++)
             out[k] = ncl_uc_load(ls[k]);
+    }
+}
+
+/* As ncl_uc_load_many, but the loads are ordered: out[k+1] is at least as new
+ * as the state out[k] observed (ncl_fence_ll between them; free on x86). */
+static inline void ncl_uc_load_many_ordered(ncl_line_t *const *ls, int n, uint64_t *out)
+{
+    if (n > 0 && ncl_meta_batching_for(ls[0])) {
+        ncl_dev_delay();
+        for (int k = 0; k < n; k++)
+            ncl__meta_inv(ls[k]);
+        ncl__meta_inv_fence();
+        for (int k = 0; k < n; k++) {
+            if (k)
+                ncl_fence_ll();
+            out[k] = atomic_load_explicit(&ls[k]->v, memory_order_relaxed);
+        }
+    } else {
+        for (int k = 0; k < n; k++) {
+            if (k)
+                ncl_fence_ll();
+            out[k] = ncl_uc_load(ls[k]);
+        }
     }
 }
 

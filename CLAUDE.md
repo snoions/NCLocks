@@ -112,7 +112,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   last 16 global acquisitions met another node, down when <= D of the last 64, after >= W
   acquisitions in tournament mode). Lamport's `y`
   holds INVALID while the tournament is active, so a Lamport fast-path acquisition needs no
-  `mode` read; slow-path successes and tournament acquisitions re-read `mode`. Phase 1, 2a
+  `mode` read; a slow-path success re-reads `mode`, and a tournament acquisition reads it
+  in the root's entry check, ordered after the root's flag and turn (`ncl_fence_ll`;
+  one batched round trip on cached-flush). Phase 1, 2a
   and 2b. Not model-checked. Sweep phase `kvreact`.
 - `include/ncl/data.h`, `src/data.c`: data maintenance layer (design §2.1), separate from the
   lock algorithms. A lock only reports "arrived" vs "local handoff" after acquiring and
@@ -175,7 +177,10 @@ them silently reintroduces the bugs the design exists to avoid:
 - **Explicit fences** wherever uncached and cached accesses mix, and between a store
   and a later load whose order matters (Dekker/Peterson/Lamport patterns). Do not
   rely on memory-type ordering alone — keep fences even where x86 makes them
-  redundant, for portability and model checking.
+  redundant, for portability and model checking. Exception (user-approved
+  2026-11-19): x86's load-load ordering may be relied on, through `ncl_fence_ll()`
+  (`include/ncl/mem.h`), which is only a compiler barrier on x86 and an acquire fence
+  elsewhere; always write it where the order matters.
 - **Cached multi-writer variables each get their own cache line** (a writeback
   writes the whole line and can clobber a neighbor). Applies to read-mostly metadata
   like the lock-to-home map.

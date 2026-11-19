@@ -714,6 +714,67 @@ void ncl_aksrv_server_reset(struct ncl_base *b, struct ncl_base_stats *st)
  * Liveness: a stale node gives up the wrong lock without waiting while
  * holding it. NOT model-checked. */
 
+/* Tournament acquisition that also reads `mode` in the root's entry check,
+ * after the root's flag and turn loads in load order (ncl_fence_ll: free on
+ * x86, an acquire fence elsewhere), instead of a separate round trip after
+ * the closing fence. On the batched backend (cached-flush) the three loads
+ * share one round trip. Why the value is fresh enough: a switcher stores
+ * `mode` before releasing the tournament (its release starts with a fence
+ * and clears the root flag first). We enter the root either on seeing that
+ * release (flag clear: the later load sees the earlier mode store) or on
+ * turn, written by a process of the other side that announced after
+ * acquiring its lower levels, i.e. after observing the release that followed
+ * any earlier mode store (x86 is multi-copy atomic; elsewhere the fences on
+ * that path). A holder on our own side released our lower levels after its
+ * mode store, and we acquired them before this check. Returns the mode. */
+static uint64_t tournament_lock_mode(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    uint64_t mode = 0;
+    int got = 0;
+    for (int pos = b->leaves + i; pos > 1; pos >>= 1) {
+        int k = pos >> 1, s = pos & 1;
+        if (k != 1) {
+            if (peterson_lock(T_FLAG(b, k, s), T_FLAG(b, k, 1 - s), T_TURN(b, k), (uint64_t)s))
+                st->contended++;
+            continue;
+        }
+        peterson_announce(T_FLAG(b, 1, s), T_TURN(b, 1), (uint64_t)s);
+        if (NCL_UNLIKELY(ncl_debug_mode_delay))
+            ncl_lat_spin_cycles(ncl_debug_mode_delay); /* widen the window before the check */
+        struct ncl_backoff bo;
+        ncl_backoff_init(&bo);
+        int waited = 0;
+        for (;;) {
+            ncl_line_t *ls[3] = {T_FLAG(b, 1, 1 - s), T_TURN(b, 1), b->mode};
+            uint64_t v[3];
+            if (NCL_UNLIKELY(ncl_debug_react & 32)) {
+                /* UNSAFE: mode loaded first, so it can predate the release
+                 * the flag/turn loads observe; ncl_debug_mode_delay widens
+                 * the gap (in the real order the loads are adjacent). */
+                v[2] = ncl_uc_load(b->mode);
+                if (ncl_debug_mode_delay)
+                    ncl_lat_spin_cycles(ncl_debug_mode_delay);
+                ncl_uc_load_many_ordered(ls, 2, v);
+            } else {
+                ncl_uc_load_many_ordered(ls, 3, v);
+            }
+            if (!(v[0] && v[1] == (uint64_t)s)) {
+                mode = v[2];
+                got = 1;
+                break;
+            }
+            waited = 1;
+            ncl_backoff(&bo);
+        }
+        if (waited)
+            st->contended++;
+    }
+    ncl_fence(); /* lock acquired before critical-section accesses */
+    if (!got) /* one participant: no levels */
+        mode = ncl_uc_load(b->mode);
+    return mode;
+}
+
 unsigned ncl_react_up = 8, ncl_react_down = 4, ncl_react_dwell = 64;
 int ncl_react_off = 0;
 
@@ -747,12 +808,9 @@ static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
                 break; /* acquirable => mode == 0 (I): no mode load */
             b->rx_guess = 1;
         } else {
-            tournament_lock(b, i, st);
             path = NCL_PATH_TOURNAMENT;
-            if (NCL_UNLIKELY(ncl_debug_mode_delay))
-                ncl_lat_spin_cycles(ncl_debug_mode_delay); /* widen the mode-check window */
-            if (ncl_uc_load(b->mode) == 1 || (ncl_debug_react & 2))
-                break; /* after the lock's closing fence */
+            if (tournament_lock_mode(b, i, st) == 1 || (ncl_debug_react & 2))
+                break; /* mode read in the root's entry check */
             ncl_fence();
             tournament_unlock_nofence(b, i);
             b->rx_guess = 0;

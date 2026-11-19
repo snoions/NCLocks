@@ -333,8 +333,22 @@ add_test(NAME reactive_emu_detects_no_invalid
   COMMAND ncl_stress -a reactive -b emu -n 8 -t 2 -l 2 -i 50000 -d 2000 --debug-react 12 --timeout 20)
 add_test(NAME reactive_emu_detects_no_slow_recheck
   COMMAND ncl_stress -a reactive -b emu -n 8 -t 2 -l 2 -i 50000 -d 2000 --debug-react 24 --lamport-delay 3000 --timeout 20)
+# The tournament path reads `mode` in the root's entry check, ordered after the root's
+# flag and turn loads (batched on cached-flush). Safe variants on cached-flush; loading
+# `mode` first, with a gap before the flag/turn loads, must FAIL.
+foreach(m phase1 local handoff)
+  add_test(NAME stress_reactive_cf_${m}_toggle
+    COMMAND ncl_stress -a reactive -b cached-flush -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} --debug-react 8 --timeout 90)
+  add_test(NAME stress_reactive_cf_${m}_fast_mode
+    COMMAND ncl_stress -a reactive -b cached-flush -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} --react 0:64 --mode-delay 3000 --timeout 90)
+endforeach()
+add_test(NAME reactive_emu_detects_mode_before_flag
+  COMMAND ncl_stress -a reactive -b emu -n 8 -t 2 -l 1 -i 50000 -d 2000 --react 0:64 --debug-react 32 --mode-delay 5000 --timeout 20)
+add_test(NAME reactive_cf_detects_mode_before_flag
+  COMMAND ncl_stress -a reactive -b cached-flush -n 8 -t 2 -l 1 -i 50000 -d 2000 --react 0:64 --debug-react 32 --mode-delay 5000 --timeout 20)
 set_tests_properties(reactive_emu_detects_no_new_lock reactive_emu_detects_no_mode_check
-  reactive_emu_detects_no_invalid reactive_emu_detects_no_slow_recheck PROPERTIES WILL_FAIL TRUE)
+  reactive_emu_detects_no_invalid reactive_emu_detects_no_slow_recheck
+  reactive_emu_detects_mode_before_flag reactive_cf_detects_mode_before_flag PROPERTIES WILL_FAIL TRUE)
 add_test(NAME kv_emu_reactive_local COMMAND ncl_kv -b emu -a reactive -M local ${KV_ARGS})
 add_test(NAME kv_emu_reactive_local_0_64 COMMAND ncl_kv -b emu -a reactive -M local --react 0:64 ${KV_ARGS})
 add_test(NAME kv_emu_reactive_local_dwell COMMAND ncl_kv -b emu -a reactive -M local --react 4:2:1024 ${KV_ARGS})

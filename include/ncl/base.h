@@ -238,7 +238,8 @@ int ncl_react_parse(const char *s);
  * the Lamport lock normally (not INVALID) on a switch to the tournament: each
  * UNSAFE (must FAIL with 8); 8 = switch on every global acquisition (safe,
  * maximal switching for stress tests); 16 = no mode re-check after a Lamport
- * slow-path success (UNSAFE with 8 and ncl_debug_lamport_delay). */
+ * slow-path success (UNSAFE with 8 and ncl_debug_lamport_delay); 32 = load
+ * `mode` before (not after) the root's flag and turn (UNSAFE with 8). */
 extern int ncl_debug_react;
 /* DEBUG (ncl_stress --lamport-delay): cycles Lamport spins between reading
  * y == 0 and storing y (widens the late-y-store window, src/base.c).

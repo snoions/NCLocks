@@ -100,3 +100,8 @@ Dev box (4x3, cf, L=1024): Lamport path -1.5% (uniform keys; the fast path has n
 read), tournament path -8 to -9% (the `mode` read after every tournament acquisition);
 pinned to the 16-hottest map under Zipf keys -2 to -6% against the fixed map at the same
 tournament share.
+
+After folding the tournament's `mode` read into the root's entry check (one batched round
+trip with the root's flag and turn on cached-flush), same dev-box setup: pinned
+all-tournament 3-5% below the fixed one (was 8-9%), pinned to the 16-hottest map 0.5%
+below the fixed map (was 2-6%).
