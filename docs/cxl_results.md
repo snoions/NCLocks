@@ -690,3 +690,29 @@ Open loop (Zipf 0.99, L=1024; lock p50 / p99 us): 12:4 2.6 / 11.8 at 1M, 2.7 / 1
 - **Remaining gaps:** at L=64 with uniform keys all locks are warm and the lock promotes
   nearly all of them (0.95), like all-tournament minus 6%; the server chain is best there.
   At Zipf L=64 it is 8% below the top-16 map at a similar tournament share (0.55 vs 0.44).
+
+### Reactive lock: demotion dwell (`kvreact`, 2026-11-19 05:47)
+
+`results/cxl_20261119_0547/kvreact.csv`: after `7e545d0` (`--react U:D:W`, history reset on a
+mode change); 3 reps, 216 runs, no errors, spread median 1.1% (max 5.5%). Eager promotion
+with a long dwell (6:4:256, 4:4:256, 4:2:1024) against 12:4:64. (A run at 05:23,
+`results/cxl_20261119_0523`, used the previous build by mistake and repeated the 04:59 run
+within ~10%.)
+
+| | 16-hottest map | 12:4:64 | 6:4:256 | 4:4:256 | 4:2:1024 |
+|---|---|---|---|---|---|
+| open 6M: p50 / p99 (us) | 20 / 172 | 53 / 442 | 115 / 1901 | 2.9% unserved | 6.3% unserved |
+| open 6M: tournament share | 0.27 | 0.19 | 0.31 | 0.45 | 0.52 |
+| closed Zipf L=1024 (k/s) | 6874 | **6434** | 6176 | 5863 | 5699 |
+| closed uniform L=1024 | 10917 | **10337** | 10132 | 7755 | 6611 (share 0.62) |
+| closed Zipf L=64 | 5270 | **4881** | 4482 | 4427 | 4546 |
+| closed affinity L=64 | 9008 | **9395** | 8255 | 7567 | 6967 |
+
+- **Promoting more locks made it worse everywhere.** 6:4:256 matches the map's tournament
+  share (0.31 vs 0.27) yet is slower, so the gap is not the number of promoted locks. With
+  three threads on 16 nodes many warm locks meet another node now and then; the binary
+  contended/uncontended signal cannot tell them from hot ones, and they are slower on the
+  tournament.
+- 12:4:64 remains the best setting; whether the rest of the gap at 6M is the policy (which
+  locks) or the mechanism (e.g. the `mode` read on every tournament acquisition) is the
+  question of the isolation experiment (`kviso`).
