@@ -108,8 +108,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   pattern (uc/cf load, store, Dekker step, same-line load, full-line writeback, 8- vs
   64-byte movnti), to locate the uc ceiling on CXL; `docs/backends.md`, sweep phase `conc`.
 - `-a reactive` (design §4f): per-lock switch between Lamport and the tournament on the
-  rate of cross-node contention (`--react U:D`, default 8:4: up when >= U of the node's last
-  16 global acquisitions met another node, down when <= D of the last 64). Lamport's `y`
+  rate of cross-node contention (`--react U:D[:W]`, default 8:4:64: up when >= U of the node's
+  last 16 global acquisitions met another node, down when <= D of the last 64, after >= W
+  acquisitions in tournament mode). Lamport's `y`
   holds INVALID while the tournament is active, so a Lamport fast-path acquisition needs no
   `mode` read; slow-path successes and tournament acquisitions re-read `mode`. Phase 1, 2a
   and 2b. Not model-checked. Sweep phase `kvreact`.

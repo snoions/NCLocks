@@ -101,7 +101,8 @@ struct ncl_base {
     int rx_guess;      /* REACTIVE, node-local: mode last seen */
     int rx_held;       /* REACTIVE, holder: bit 0 = Lamport held, bit 1 = tournament */
     uint64_t rx_hist;  /* REACTIVE, holder: contended? per global acquisition (bit 0 = last) */
-    unsigned rx_n;     /* REACTIVE, holder: global acquisitions since the last switch */
+    unsigned rx_n;     /* REACTIVE, holder: global acquisitions in the current mode */
+    int rx_lastm;      /* REACTIVE, holder: mode at this node's previous global acquisition */
     int rx_inval;      /* REACTIVE, holder: switched to the tournament, so release the
                           Lamport lock as INVALID */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
@@ -222,10 +223,10 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out);
 /* REACTIVE switch thresholds (set before nodes fork), per lock and node, over
  * this node's global acquisitions of the lock: to the tournament when at least
  * ncl_react_up of the last 16 met another node (<= 16); back to Lamport when
- * at most ncl_react_down of the last 64 did (<= 64), after at least 64
- * acquisitions in tournament mode. Default 8:4. */
-extern unsigned ncl_react_up, ncl_react_down;
-/* "U:D" -> ncl_react_up/down; 0 or -1 (bad). */
+ * at most ncl_react_down of the last 64 did (<= 64), after at least
+ * ncl_react_dwell acquisitions in tournament mode (>= 64). Default 8:4:64. */
+extern unsigned ncl_react_up, ncl_react_down, ncl_react_dwell;
+/* "U:D[:W]" -> ncl_react_up/down/dwell (W default 64); 0 or -1 (bad). */
 int ncl_react_parse(const char *s);
 /* DEBUG bits (ncl_stress --debug-react): 1 = switch to the tournament without
  * taking it, 2 = no `mode` re-read after a tournament acquisition, 4 = release

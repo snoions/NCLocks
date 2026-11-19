@@ -337,6 +337,9 @@ set_tests_properties(reactive_emu_detects_no_new_lock reactive_emu_detects_no_mo
   reactive_emu_detects_no_invalid reactive_emu_detects_no_slow_recheck PROPERTIES WILL_FAIL TRUE)
 add_test(NAME kv_emu_reactive_local COMMAND ncl_kv -b emu -a reactive -M local ${KV_ARGS})
 add_test(NAME kv_emu_reactive_local_0_64 COMMAND ncl_kv -b emu -a reactive -M local --react 0:64 ${KV_ARGS})
+add_test(NAME kv_emu_reactive_local_dwell COMMAND ncl_kv -b emu -a reactive -M local --react 4:2:1024 ${KV_ARGS})
+add_test(NAME reactive_rejects_short_dwell COMMAND ncl_kv -b emu -a reactive --react 4:4:10 ${KV_ARGS})
+set_tests_properties(reactive_rejects_short_dwell PROPERTIES WILL_FAIL TRUE)
 # Per-lock algorithms (cfg.alg_per_lock, used by ncl_kv): even locks Lamport, odd
 # locks tournament, in each mode and layout.
 foreach(m phase1 local handoff)

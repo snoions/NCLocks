@@ -712,15 +712,17 @@ void ncl_aksrv_server_reset(struct ncl_base *b, struct ncl_base_stats *st)
  * Liveness: a stale node gives up the wrong lock without waiting while
  * holding it. NOT model-checked. */
 
-unsigned ncl_react_up = 8, ncl_react_down = 4;
+unsigned ncl_react_up = 8, ncl_react_down = 4, ncl_react_dwell = 64;
 
 int ncl_react_parse(const char *s)
 {
-    unsigned u, d;
-    if (sscanf(s, "%u:%u", &u, &d) != 2 || u > 16 || d > 64)
+    unsigned u, d, w = 64;
+    int k = sscanf(s, "%u:%u:%u", &u, &d, &w);
+    if (k < 2 || u > 16 || d > 64 || w < 64 || w > 1000000)
         return -1;
     ncl_react_up = u;
     ncl_react_down = d;
+    ncl_react_dwell = w;
     return 0;
 }
 
@@ -751,6 +753,13 @@ static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     }
     b->rx_held = 1 << m;
     b->rx_inval = 0;
+    if (m != b->rx_lastm) {
+        /* Another node switched since our last acquisition: our history and
+         * dwell count describe the other mode. */
+        b->rx_hist = 0;
+        b->rx_n = 0;
+        b->rx_lastm = m;
+    }
     b->rx_hist = (b->rx_hist << 1) | (st->contended != c0);
     if (b->rx_n < 1000000)
         b->rx_n++;
@@ -759,7 +768,8 @@ static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
         to = 1 - m;
     else if (m == 0 && __builtin_popcountll(b->rx_hist & 0xffff) >= (int)ncl_react_up)
         to = 1;
-    else if (m == 1 && b->rx_n >= 64 && __builtin_popcountll(b->rx_hist) <= (int)ncl_react_down)
+    else if (m == 1 && b->rx_n >= ncl_react_dwell &&
+             __builtin_popcountll(b->rx_hist) <= (int)ncl_react_down)
         to = 0;
     if (to != m) {
         struct ncl_base_stats ign = {0};
@@ -785,6 +795,7 @@ static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
             NCL_STAT(st->react_down++);
         }
         b->rx_guess = to;
+        b->rx_lastm = to;
         b->rx_hist = 0;
         b->rx_n = 0;
     }

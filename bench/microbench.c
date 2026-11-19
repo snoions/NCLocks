@@ -383,8 +383,9 @@ static void usage(const char *argv0)
             "  --cpus LIST   CPUs for pinned threads, e.g. 0-59,120-179 (default: this\n"
             "                process's affinity, e.g. from numactl --cpunodebind)\n"
             "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n"
-            "  --react U:D   -a reactive: to the tournament when >= U of the last 16 global\n"
-            "                acquisitions met another node, back when <= D of the last 64 (8:4)\n",
+            "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
+            "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
+            "                acquisitions on the tournament (8:4:64)\n",
             argv0);
 }
 
