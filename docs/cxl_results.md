@@ -624,3 +624,35 @@ k ops/s, lock p99 in us, fairness.
   open-loop capacity (5.5M served at 6M offered) and the best tail at 4M.
 - The oracle map uses the known key distribution; a reactive lock would have to find the
   hot, shared set online. Its upper bound here is the H=16 row.
+
+## Reactive lock in the KV store (`kvreact` phase, 16x3, cf, 2a)
+
+`results/cxl_20261119_0332/kvreact.csv`: 3 reps, 156 runs, no errors, KV checks clean,
+rep spread median 1.1% (max 8.3%). k ops/s (fairness where below 0.85); "tour" = share of
+global acquisitions on the tournament.
+
+| keys, L | all Lamport | top-16 (oracle) | all tournament | server chain | reactive 2:64 | reactive 4:512 |
+|---|---|---|---|---|---|---|
+| Zipf 0.99, 64 | 1292 (0.82) | **5342** | 4880 | 4888 | 4609 (tour 1.00) | 4486 (1.00) |
+| Zipf 0.99, 1024 | 1476 (0.83) | **6917** | 5232 | 5584 | 5882 (0.38) | 5940 (0.34) |
+| uniform, 64 | 5212 | 5248 | 5394 | **5699** | 5014 (1.00) | 5089 (1.00) |
+| uniform, 1024 | **11144** | 10899 | 5774 | 6839 | 8514 (0.14, 55k switches) | 9150 (0.04) |
+| Zipf + affinity 0.9, 64 | **9094 (0.48)** | 9012 (0.78) | 6758 | 7864 | 6783 (0.77, 80k sw.) | 6376 (1.00) |
+| Zipf + affinity 0.9, 1024 | **11325** | 10552 | 5958 | 7120 | 9435 (0.05) | 9529 (0.05) |
+
+Open loop (Zipf 0.99, L=1024; lock p50 / p99 us): reactive 4:512 3.1 / 12.3 at 1M, 3.2 /
+18.4 at 2M, 6.7 / 53 at 4M, 1.1% unserved at 6M; top-16 2.6 / 11.8, 2.8 / 16.4, 5.6 / 37,
+and serves 6M (p99 156 us); server chain 4.6 / 21.5, 4.6 / 21.5, 8.2 / 53, 12% unserved at 6M.
+
+- **Reactive is the most robust online choice but leaves 14-30% to the oracle.** Its worst
+  case against the best fixed choice is -18% (uniform, 1024) to -30% (affinity, 64), against
+  -48% for all-tournament (uniform, 1024) and -79% for all-Lamport (Zipf, 1024). On Zipf
+  keys at L=1024 it beats all-tournament by 12-14% and all-Lamport by 4x, but trails the
+  oracle by 14%.
+- **The extra `mode` load is the main cost on cold locks:** at uniform L=1024 with 4:512
+  only 4% of global acquisitions use the tournament, yet reactive is 18% below all-Lamport.
+  That is one more CXL round trip on a ~2-round-trip Lamport acquisition.
+- **The "any cross-node contention" trigger over-promotes:** at L=64 every lock ends on the
+  tournament (tour 1.00), while the oracle keeps the 48 coldest on Lamport (+16%). Warm locks
+  meet occasional contention but are still faster on Lamport. 2:64 also thrashes (55-80k
+  switches per run); 4:512 mostly stops it without closing the gap.
