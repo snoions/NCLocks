@@ -656,3 +656,37 @@ and serves 6M (p99 156 us); server chain 4.6 / 21.5, 4.6 / 21.5, 8.2 / 53, 12% u
   tournament (tour 1.00), while the oracle keeps the 48 coldest on Lamport (+16%). Warm locks
   meet occasional contention but are still faster on Lamport. 2:64 also thrashes (55-80k
   switches per run); 4:512 mostly stops it without closing the gap.
+
+### Reactive lock, second version (`kvreact`, 2026-11-19 04:59)
+
+`results/cxl_20261119_0459/kvreact.csv`: same setup, after `9ddd81f` (INVALID marker in
+Lamport's `y`, so no `mode` read on a Lamport fast-path acquisition; rate trigger). 3 reps,
+156 runs, no errors, KV checks clean, rep spread median 1.0% (max 5.0%). k ops/s; in
+brackets the change against the best fixed lock choice in the same run (all Lamport, top-16
+map, all tournament); the server chain is listed separately.
+
+| keys, L | best fixed lock | server chain | first version (best of 2:64, 4:512) | **12:4** | 8:4 |
+|---|---|---|---|---|---|
+| Zipf 0.99, 64 | 5291 (top-16) | 4880 | 4609 (-13%) | **4884 (-8%)** | 4661 (-12%) |
+| Zipf 0.99, 1024 | 6890 (top-16) | 5478 | 5940 (-14%) | **6456 (-6%)** | 6347 (-8%) |
+| uniform, 64 | 5373 (all tournament) | **5660** | 5089 (-5%) | 5045 (-6%) | 5119 (-5%) |
+| uniform, 1024 | 11068 (all Lamport) | 6848 | 9150 (-18%) | **10398 (-6%)** | 10283 (-7%) |
+| Zipf + affinity, 64 | 9190 (all Lamport, fairness 0.52) | 7820 | 6783 (-25%) | **9367 (+2%, fairness 0.81)** | 8746 (-5%) |
+| Zipf + affinity, 1024 | 11279 (all Lamport) | 7029 | 9529 (-16%) | **10758 (-5%)** | 10639 (-6%) |
+
+Open loop (Zipf 0.99, L=1024; lock p50 / p99 us): 12:4 2.6 / 11.8 at 1M, 2.7 / 18.4 at 2M,
+5.1 / 49 at 4M, and it serves 6M (p50 51, p99 410); top-16 2.6 / 11.8, 2.8 / 16.4, 5.6 / 37,
+19 / 156 at 6M; server chain 12% unserved at 6M. The first version dropped 1% at 6M.
+
+- **The gap to the best fixed choice fell from 5-25% to 2-8%** (12:4); in the affinity case
+  at L=64 it now beats every fixed choice, with fairness 0.81 against all-Lamport's 0.52.
+  Against the best uniform choice it gains 24% (Zipf L=1024 vs all-tournament) and 4.3x
+  (vs all-Lamport), while losing at most 6-8% where one uniform choice is right.
+- **Uniform keys no longer promote at L=1024** (tournament share 0.000 vs 0.04-0.14), so the
+  INVALID marker shows its effect directly: 10398 vs all-Lamport's 11068 (-6%), against -18%
+  for the first version.
+- **12:4 beats 8:4 in five of six cases**; 8:4 still thrashes where contention hovers near
+  the threshold (141k switches at L=64 with affinity, against 35k for 12:4).
+- **Remaining gaps:** at L=64 with uniform keys all locks are warm and the lock promotes
+  nearly all of them (0.95), like all-tournament minus 6%; the server chain is best there.
+  At Zipf L=64 it is 8% below the top-16 map at a similar tournament share (0.55 vs 0.44).
