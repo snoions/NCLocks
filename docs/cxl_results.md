@@ -716,3 +716,32 @@ within ~10%.)
 - 12:4:64 remains the best setting; whether the rest of the gap at 6M is the policy (which
   locks) or the mechanism (e.g. the `mode` read on every tournament acquisition) is the
   question of the isolation experiment (`kviso`).
+
+### Reactive lock: mechanism vs policy (`kviso`, 2026-11-19 06:13)
+
+`results/cxl_20261119_0613/kviso.csv`: after `e80ca43`; 3 reps, 72 runs, no errors, spread
+median 0.2% (max 3.6%). "Pinned" = the reactive lock started in the fixed map's assignment
+with switching off (`--react off`), so it differs from the fixed map only by the reactive
+mechanism. k ops/s; lock p50 ns.
+
+| | fixed | reactive pinned | diff | reactive 12:4:64 |
+|---|---|---|---|---|
+| Zipf 0.99, L=1024, 16-hottest map | 6943 | 6295 | **-9.3%** | 6412 |
+| Zipf 0.99, L=64, 16-hottest map | 5464 | 4923 | **-9.9%** | 4877 |
+| Zipf 0.99, L=1024, all tournament | 5204 | 4827 | -7.2% | |
+| uniform, L=1024, all tournament | 5810 | 5411 (p50 6.4 vs 5.9 us) | -6.9% | |
+| uniform, L=1024, all Lamport | 11085 | 10388 (p50 2.69 vs 2.56 us) | **-6.3%** | |
+
+Open loop, Zipf 0.99, L=1024 (lock p50 / p99 us): at 6M fixed map 20 / 172, reactive pinned
+**70 / 590**, reactive 12:4:64 45 / 377; at 4M 5.6 / 37, 6.1 / 49, 5.1 / 49; at 1-2M all
+within ~10%.
+
+- **The gap is the mechanism, not the policy.** With exactly the map's assignment and no
+  switching, the reactive lock is 9-10% below the fixed map in closed loop and worse than
+  reactive 12:4:64 at 6M; the online policy is as good as the oracle within the mechanism.
+- **Both paths cost ~6-7%.** The tournament path: the `mode` read after each acquisition.
+  The Lamport path is unexpected: its fast path has no extra metadata access (dev box:
+  -1.5%), yet on CXL it is 6.3% slower (+130 ns p50, about a quarter of a round trip).
+  Candidates: the layout (the reactive block is [mode][x][y][tree], 48 lines; the fixed
+  per-lock layout puts x, y in lines 0-1 of a 45-line block) and slow-path `mode` reads.
+- Near saturation the ~9% capacity loss becomes 3.5x the p50 at 6M.
