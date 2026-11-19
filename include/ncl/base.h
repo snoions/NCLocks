@@ -148,6 +148,10 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines,
  * initial state that is not all-zero (PTHREAD: pthread_mutex_init with
  * PTHREAD_PROCESS_SHARED). Returns 0 or -1. */
 int ncl_base_init_shared(ncl_alg_t alg, ncl_line_t *lines);
+/* REACTIVE, creator only, before any node attaches: start the lock in mode
+ * (0 = Lamport, 1 = tournament: mode word 1 and Lamport's y = INVALID, the
+ * state a switch leaves). */
+void ncl_base_reactive_set_mode(ncl_line_t *lines, int P, int mode);
 
 /* LAMPORT/TOURNAMENT/HYBRID/AK/PTHREAD only. Acquire as participant i; returns the
  * NCL_PATH_* taken. Release with the value ncl_base_lock returned. */
@@ -226,7 +230,8 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out);
  * at most ncl_react_down of the last 64 did (<= 64), after at least
  * ncl_react_dwell acquisitions in tournament mode (>= 64). Default 8:4:64. */
 extern unsigned ncl_react_up, ncl_react_down, ncl_react_dwell;
-/* "U:D[:W]" -> ncl_react_up/down/dwell (W default 64); 0 or -1 (bad). */
+extern int ncl_react_off; /* 1: never switch (modes stay as initialized) */
+/* "U:D[:W]" -> ncl_react_up/down/dwell (W default 64), or "off"; 0 or -1 (bad). */
 int ncl_react_parse(const char *s);
 /* DEBUG bits (ncl_stress --debug-react): 1 = switch to the tournament without
  * taking it, 2 = no `mode` re-read after a tournament acquisition, 4 = release

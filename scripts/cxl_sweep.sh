@@ -33,6 +33,10 @@
 #   kvreact    KV store with the reactive lock (-a reactive, --react REACT_THR) against the
 #              fixed maps (all Lamport, 16 hottest on the tournament, all tournament) and the
 #              server chain: Zipf 0.99, uniform, Zipf 0.99 + affinity 0.9; L=64, 1024; open loop
+#   kviso      reactive lock: mechanism vs policy. The reactive lock pinned to the oracle map
+#              (--algmap top:16 --react off) vs the fixed map and reactive 12:4:64; pinned
+#              all-tournament / all-Lamport vs the fixed ones (per-path overhead). KV, Zipf
+#              0.99 and uniform, L=1024 (+ L=64 Zipf), closed loop and open loop 1-6M
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
 #              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
@@ -378,6 +382,33 @@ kvreact() {
   done; done
 }
 
+kviso() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/kviso.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T c r v
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local)
+  local PIN="-a reactive --react off"
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for v in "--algmap top:16" "$PIN --algmap top:16" "-a reactive --react 12:4:64" \
+             "--algmap top:1024" "$PIN --algmap top:1024"; do
+      run "$csv" "$rep" "$c:closed" -z 0.99 -l 1024 $v ${CFG[$c]} "${KC[@]}"
+    done
+    for v in "--algmap top:16" "$PIN --algmap top:16" "-a reactive --react 12:4:64"; do
+      run "$csv" "$rep" "$c:closed" -z 0.99 -l 64 $v ${CFG[$c]} "${KC[@]}"
+    done
+    for v in "--algmap top:0" "$PIN --algmap top:0" "--algmap top:1024" "$PIN --algmap top:1024"; do
+      run "$csv" "$rep" "$c:closed" -d uniform -l 1024 $v ${CFG[$c]} "${KC[@]}"
+    done
+    for r in 1000k 2000k 4000k 6000k; do
+      for v in "--algmap top:16" "$PIN --algmap top:16" "-a reactive --react 12:4:64"; do
+        run "$csv" "$rep" "$c:open" -z 0.99 -l 1024 $v -r "$r" ${CFG[$c]} "${KC[@]}"
+      done
+    done
+  done; done
+}
+
 conc() {
   # Device concurrency: does the aggregate of uncached 8-byte accesses flatten
   # with T while full-line writes scale (partial-write hypothesis)?
@@ -445,6 +476,7 @@ for ph in $PHASES; do
     mt) mt ;;
     kv) kv ;;
     kvreact) kvreact ;;
+    kviso) kviso ;;
     *) die "unknown phase $ph" ;;
   esac
 done

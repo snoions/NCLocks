@@ -271,6 +271,9 @@ int ncl_lock_set_data(int lock, ncl_off_t off, size_t len);
  * (NCL_ALG_LAMPORT or NCL_ALG_TOURNAMENT). Returns 0 or -1. */
 int ncl_lock_set_alg(int lock, ncl_alg_t alg);
 ncl_alg_t ncl_lock_alg(int lock);
+/* Parent, before fork, -a reactive only: start lock in mode (0 Lamport, 1
+ * tournament). Returns 0 or -1. */
+int ncl_lock_set_reactive_mode(int lock, int mode);
 
 int ncl_node_attach(int node_id);
 /* Barrier across all nodes, then stop this node's server (if any). */

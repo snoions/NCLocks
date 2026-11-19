@@ -338,6 +338,10 @@ set_tests_properties(reactive_emu_detects_no_new_lock reactive_emu_detects_no_mo
 add_test(NAME kv_emu_reactive_local COMMAND ncl_kv -b emu -a reactive -M local ${KV_ARGS})
 add_test(NAME kv_emu_reactive_local_0_64 COMMAND ncl_kv -b emu -a reactive -M local --react 0:64 ${KV_ARGS})
 add_test(NAME kv_emu_reactive_local_dwell COMMAND ncl_kv -b emu -a reactive -M local --react 4:2:1024 ${KV_ARGS})
+# Reactive lock pinned to an initial per-lock mode (isolation runs): the
+# tournament-mode locks start with Lamport's y = INVALID and never switch.
+add_test(NAME kv_emu_reactive_pinned COMMAND ncl_kv -b emu -a reactive -M local --algmap top:4 --react off ${KV_ARGS})
+add_test(NAME kv_emu_reactive_pinned_then_switch COMMAND ncl_kv -b emu -a reactive -M local --algmap top:8 --react 0:64 ${KV_ARGS})
 add_test(NAME reactive_rejects_short_dwell COMMAND ncl_kv -b emu -a reactive --react 4:4:10 ${KV_ARGS})
 set_tests_properties(reactive_rejects_short_dwell PROPERTIES WILL_FAIL TRUE)
 # Per-lock algorithms (cfg.alg_per_lock, used by ncl_kv): even locks Lamport, odd

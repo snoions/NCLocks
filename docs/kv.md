@@ -89,3 +89,14 @@ setup: 3-7% below the best fixed choice (uniform L=1024: 11.6M vs 12.0M; affinit
 10.9M vs 11.2M; Zipf L=1024: 10.6M vs 11.0M; Zipf L=64: 9.9M vs 10.7M); uniform keys never
 promote; 12:4 switches ~100 times per run, 8:4 up to a few thousand, 4:4 thrashes
 (50-150k). On Zipf keys it promotes 10-14% of global acquisitions vs the oracle's 28%.
+
+### Isolation: mechanism vs policy (`kviso`)
+
+`-a reactive --algmap top:H --react off` starts the H hottest stripes' locks in tournament
+mode (mode word 1, Lamport's `y` = INVALID; `ncl_lock_set_reactive_mode`) and never switches,
+so it has exactly the fixed map's assignment and differs from it only by the reactive
+mechanism. Pinned all-Lamport (`top:0`) and all-tournament (`top:L`) give the per-path cost.
+Dev box (4x3, cf, L=1024): Lamport path -1.5% (uniform keys; the fast path has no `mode`
+read), tournament path -8 to -9% (the `mode` read after every tournament acquisition);
+pinned to the 16-hottest map under Zipf keys -2 to -6% against the fixed map at the same
+tournament share.

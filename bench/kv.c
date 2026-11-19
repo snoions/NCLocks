@@ -399,10 +399,11 @@ static void usage(const char *a0)
             "  -z THETA      Zipfian skew (0.99)        -F FRAC key-to-node affinity (0)\n"
             "  -a ALG        lock algorithm (tournament); --algmap top:H: the H stripes with\n"
             "                the highest expected load use the tournament, the rest Lamport\n"
+            "                (-a reactive: they start in tournament mode; --react off pins them)\n"
             "  -M MODE -K CAP -b BACKEND -U LAYOUT --wb clwb --mem-node N --cpus LIST: as ncl_bench\n"
             "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
             "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
-            "                acquisitions on the tournament (8:4:64)\n"
+            "                acquisitions on the tournament (8:4:64); off: never switch\n"
             "  --full        conservative data maintenance (whole stripe) instead of precise\n"
             "  -c NS         extra critical-section time    -s SECS -W SECS (2, 0.2)\n"
             "  -r RATE       open loop, Poisson, aggregate req/s (k/M ok); default closed loop\n"
@@ -499,7 +500,10 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
-    if (algmap_top >= 0) {
+    /* --algmap with -a reactive: the H hottest stripes start in tournament mode
+     * (the rest Lamport); with --react off they stay there (isolation runs). */
+    int react_map = algmap_top >= 0 && cfg.alg == NCL_ALG_REACTIVE;
+    if (algmap_top >= 0 && !react_map) {
         cfg.alg_per_lock = 1;
         cfg.alg = NCL_ALG_LAMPORT;
     }
@@ -573,7 +577,8 @@ int main(int argc, char **argv)
     if (algmap_top >= 0) {
         ntour = algmap_top;
         for (int i = 0; i < algmap_top; i++)
-            if (ncl_lock_set_alg(order[i], NCL_ALG_TOURNAMENT) < 0)
+            if ((react_map ? ncl_lock_set_reactive_mode(order[i], 1)
+                           : ncl_lock_set_alg(order[i], NCL_ALG_TOURNAMENT)) < 0)
                 return 2;
     }
     /* Load phase: version 0, written back to the device. */
@@ -665,7 +670,9 @@ int main(int argc, char **argv)
     double lh = tot->acquires ? (double)tot->local_handoffs / (double)tot->acquires : 0;
     double tf = tot->global_acq ? (double)tot->tour_acq / (double)tot->global_acq : 0;
     char react[24] = "-";
-    if (cfg.alg == NCL_ALG_REACTIVE)
+    if (cfg.alg == NCL_ALG_REACTIVE && ncl_react_off)
+        snprintf(react, sizeof react, "off");
+    else if (cfg.alg == NCL_ALG_REACTIVE)
         snprintf(react, sizeof react, "%u:%u:%u", ncl_react_up, ncl_react_down, ncl_react_dwell);
     const struct hist *hl = &tot->h[H_LOCK], *ho = &tot->h[H_OP];
     char modebuf[32];
@@ -674,7 +681,7 @@ int main(int argc, char **argv)
         printf("%c,%s,%.2f,%.2f,%ld,%zu,%d,%s,%d,%d,%s,%s,%d,%s,%s,%d,%d,%.0f,%.0f,%.5f,%lu,%lu,"
                "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s\n",
                workload, zipf ? "zipf" : "uniform", zipf ? theta : 0.0, affinity, nkeys, vbytes,
-               nlocks, algmap_top >= 0 ? "map" : ncl_alg_name(cfg.alg), algmap_top, ntour,
+               nlocks, algmap_top >= 0 && !react_map ? "map" : ncl_alg_name(cfg.alg), algmap_top, ntour,
                ncl_backend_name(cfg.backend), modebuf,
                cfg.mode == NCL_MODE_PHASE1 ? 0 : (cfg.local_cap ? cfg.local_cap : 64),
                cfg.meta_split ? "split" : "uniform", full ? "full" : "precise", nnodes, nthreads,
@@ -687,7 +694,7 @@ int main(int argc, char **argv)
         printf("kv: workload %c, %s, affinity %.2f, %ld keys x %zu B, %d locks, alg %s "
                "(%d tournament), %s, mode %s, data %s, %dx%d\n",
                workload, zipf ? "zipf" : "uniform", affinity, nkeys, vbytes,
-               nlocks, algmap_top >= 0 ? "map" : ncl_alg_name(cfg.alg), ntour,
+               nlocks, algmap_top >= 0 && !react_map ? "map" : ncl_alg_name(cfg.alg), ntour,
                ncl_backend_name(cfg.backend), modebuf, full ? "full" : "precise", nnodes, nthreads);
         printf("mem: %s\n", ncl_mem_describe());
         printf("throughput %.0f ops/s (read %lu, update %lu, rmw %lu), unserved %.4f, fairness "

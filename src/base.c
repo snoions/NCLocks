@@ -115,6 +115,8 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
         b->lam = lines + 1;
         b->lam_b = scan;
         b->tree = lines + 1 + lam_lines(P);
+        /* Start from the current mode (set by the creator, or 0). */
+        b->rx_guess = b->rx_lastm = ncl_uc_load(b->mode) == 1;
         break;
     }
 }
@@ -713,9 +715,14 @@ void ncl_aksrv_server_reset(struct ncl_base *b, struct ncl_base_stats *st)
  * holding it. NOT model-checked. */
 
 unsigned ncl_react_up = 8, ncl_react_down = 4, ncl_react_dwell = 64;
+int ncl_react_off = 0;
 
 int ncl_react_parse(const char *s)
 {
+    if (!strcmp(s, "off")) {
+        ncl_react_off = 1;
+        return 0;
+    }
     unsigned u, d, w = 64;
     int k = sscanf(s, "%u:%u:%u", &u, &d, &w);
     if (k < 2 || u > 16 || d > 64 || w < 64 || w > 1000000)
@@ -723,6 +730,7 @@ int ncl_react_parse(const char *s)
     ncl_react_up = u;
     ncl_react_down = d;
     ncl_react_dwell = w;
+    ncl_react_off = 0;
     return 0;
 }
 
@@ -764,7 +772,9 @@ static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     if (b->rx_n < 1000000)
         b->rx_n++;
     int to = m;
-    if (ncl_debug_react & 8)
+    if (ncl_react_off)
+        ;
+    else if (ncl_debug_react & 8)
         to = 1 - m;
     else if (m == 0 && __builtin_popcountll(b->rx_hist & 0xffff) >= (int)ncl_react_up)
         to = 1;
@@ -821,6 +831,14 @@ static void reactive_unlock(struct ncl_base *b, int i)
     }
     b->rx_held = 0;
     b->rx_inval = 0;
+}
+
+void ncl_base_reactive_set_mode(ncl_line_t *lines, int P, int mode)
+{
+    (void)P;
+    ncl_uc_store(&lines[0], mode ? 1 : 0);    /* mode */
+    ncl_uc_store(&lines[2], mode ? RX_INVALID : 0); /* Lamport's y: [mode][x][y] */
+    ncl_fence();
 }
 
 /* ---- dispatch ----------------------------------------------------------- */

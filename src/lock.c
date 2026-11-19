@@ -367,6 +367,17 @@ int ncl_lock_set_alg(int lock, ncl_alg_t alg)
     return 0;
 }
 
+int ncl_lock_set_reactive_mode(int lock, int mode)
+{
+    if (!hdr || lock < 0 || lock >= cfg.nlocks || cfg.alg != NCL_ALG_REACTIVE) {
+        fprintf(stderr, "ncl: ncl_lock_set_reactive_mode: needs -a reactive\n");
+        return -1;
+    }
+    ncl_line_t *mb = (ncl_line_t *)ncl_meta_ptr(hdr->locks_off) + (size_t)lock * hdr->lines_per_lock;
+    ncl_base_reactive_set_mode(mb, hdr->participants, mode);
+    return 0;
+}
+
 ncl_alg_t ncl_lock_alg(int lock)
 {
     const struct ncl_lock_desc *d = (const struct ncl_lock_desc *)ncl_meta_ptr(hdr->descs_off);
