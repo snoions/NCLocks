@@ -745,3 +745,39 @@ within ~10%.
   Candidates: the layout (the reactive block is [mode][x][y][tree], 48 lines; the fixed
   per-lock layout puts x, y in lines 0-1 of a 45-line block) and slow-path `mode` reads.
 - Near saturation the ~9% capacity loss becomes 3.5x the p50 at 6M.
+
+### Reactive lock after folding the tournament's `mode` read (`kviso`, 2026-11-19 20:28)
+
+`results/cxl_20261119_2028/kviso.csv`: after `c181d9b` (`mode` read in the root's entry
+check, one batched round trip with the root's flag and turn); 3 reps, 72 runs, no errors,
+spread median 0.0% (max 3.5%). k ops/s; in brackets the change against the fixed lock, and
+the 06:13 run (separate `mode` read) for comparison.
+
+| | fixed | reactive pinned | 06:13 pinned | reactive 12:4:64 | 06:13 12:4:64 |
+|---|---|---|---|---|---|
+| Zipf, L=1024, 16-hottest map | 6876 | 6842 (-0.5%) | -9.3% | **6928 (+0.8%)** | 6412 |
+| Zipf, L=64, 16-hottest map | 5380 | 5275 (-2.0%) | -9.9% | **5343 (-0.7%)** | 4877 |
+| Zipf, L=1024, all tournament | 5216 | 5138 (-1.5%) | -7.2% | | |
+| uniform, L=1024, all tournament | 5807 | 5754 (-0.9%) | -6.9% | | |
+| uniform, L=1024, all Lamport | 11055 | 10321 (**-6.6%**) | -6.3% | | |
+
+Open loop, Zipf 0.99, L=1024 (lock p50 / p99 / p99.9 us):
+
+| offered | fixed 16-hottest map | reactive 12:4:64 | 06:13 reactive 12:4:64 |
+|---|---|---|---|
+| 1M | 2.6 / 11.8 / 17.4 | 2.6 / 11.8 / 41.0 | 2.6 / 11.8 / 28.7 |
+| 2M | 2.8 / 16.4 / 24.6 | 2.7 / 17.4 / 47.1 | 2.6 / 18.4 / 43.0 |
+| 4M | 5.6 / 38.9 / 59.4 | **4.4 / 36.9** / 69.6 | 5.1 / 49.2 / 81.9 |
+| 6M | 18.4 / 156 / 246 | **19.5 / 172** / 279 | 45.1 / 377 / 623 |
+
+- **The open-loop gap is closed:** at 6M the reactive lock is within 6% of the oracle map
+  at p50 and 10% at p99 (it was 2.4x / 2.2x), and at 4M it is ahead at p50 and p99.
+- **The tournament path now costs 1-2%** against the fixed tournament (was 7%), and with
+  Zipf keys the reactive lock matches the oracle map in closed loop (+0.8% at L=1024,
+  -0.7% at L=64).
+- **The Lamport path still costs 6.6% on CXL** (uniform keys, all Lamport; dev box 1.5%).
+  Its fast path has no extra metadata access, so the cause is still open (layout and
+  slow-path `mode` reads are the candidates).
+- **p99.9 at light load is 2x the map's** (41-47 vs 17-25 us at 1-2M): at low load few
+  locks show enough contention to be promoted (5-10% of global acquisitions on the
+  tournament vs 29%), so occasional bursts on a hot lock meet Lamport's slow path.
