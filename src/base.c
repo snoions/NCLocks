@@ -150,8 +150,40 @@ static void await_eq(ncl_line_t *l, uint64_t v)
 #define LAM_X(b) (&(b)->lam[0])
 #define LAM_Y(b) (&(b)->lam[1])
 #define LAM_B(b, i) (&(b)->lam_b[(i)])
+/* REACTIVE: y while the tournament is active (never a participant + 1). */
+#define RX_INVALID (~(uint64_t)0)
 
-static int lamport_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+/* Wait until y == 0 (returns 0) or y == RX_INVALID (returns 1). */
+static int await_y_free(struct ncl_base *b)
+{
+    struct ncl_backoff bo;
+    ncl_backoff_init(&bo);
+    for (;;) {
+        uint64_t v = ncl_uc_load(LAM_Y(b));
+        if (v == 0)
+            return 0;
+        if (v == RX_INVALID)
+            return 1;
+        ncl_backoff(&bo);
+    }
+}
+
+uint64_t ncl_debug_lamport_delay = 0, ncl_debug_mode_delay = 0;
+int ncl_debug_react = 0;
+
+/* Returns the path, or -1 if the Lamport lock is RX_INVALID (REACTIVE: the
+ * tournament is active; we hold nothing and b[i] is 0). Plain Lamport never
+ * sees it. takeover (REACTIVE, a tournament holder switching back): treat
+ * RX_INVALID as free.
+ * A late y store can overwrite RX_INVALID: a node reads y == 0, stalls, and
+ * stores y = me after another node acquired, switched to the tournament and
+ * released y = RX_INVALID. That node wrote x after ours, so the late node
+ * always takes the slow path; a slow-path success therefore re-reads `mode`
+ * and, if the tournament is active, restores RX_INVALID (it holds the Lamport
+ * lock by Lamport's rules, so nobody else writes y meanwhile) and gives up. A
+ * fast-path success needs x unchanged since our store, so no switch can have
+ * happened in between. */
+static int lamport_lock_x(struct ncl_base *b, int i, struct ncl_base_stats *st, int takeover)
 {
     const uint64_t me = (uint64_t)i + 1; /* 0 means empty */
     int slow = 0;
@@ -160,13 +192,17 @@ start:
     ncl_fence_ss();
     ncl_uc_store(LAM_X(b), me);
     ncl_fence(); /* (1) x = me before reading y */
-    if (ncl_uc_load(LAM_Y(b)) != 0) {
+    uint64_t y = ncl_uc_load(LAM_Y(b));
+    if (y != 0 && !(takeover && y == RX_INVALID)) {
         ncl_uc_store(LAM_B(b, i), 0);
-        await_eq(LAM_Y(b), 0);
+        if ((y == RX_INVALID || await_y_free(b)) && !takeover)
+            return -1;
         NCL_STAT(st->lamport_retries++);
         st->contended++;
         goto start;
     }
+    if (NCL_UNLIKELY(ncl_debug_lamport_delay))
+        ncl_lat_spin_cycles(ncl_debug_lamport_delay); /* widen the late-y-store window */
     ncl_uc_store(LAM_Y(b), me);
     ncl_fence(); /* (2) y = me before reading x */
     if (ncl_uc_load(LAM_X(b)) != me) {
@@ -180,13 +216,27 @@ start:
         for (int j = 0; (j = ncl_uc_scan_first(LAM_B(b, 0), b->P, j, b->P - j, -1, &nl)) >= 0; j++)
             await_eq(LAM_B(b, j), 0);
         if (ncl_uc_load(LAM_Y(b)) != me) {
-            await_eq(LAM_Y(b), 0);
+            if (await_y_free(b) && !takeover)
+                return -1;
             NCL_STAT(st->lamport_retries++);
             goto start;
+        }
+        if (b->alg == NCL_ALG_REACTIVE && !takeover && !(ncl_debug_react & 16) &&
+            ncl_uc_load(b->mode) == 1) {
+            /* Our y overwrote RX_INVALID: restore it and go to the tournament. */
+            ncl_fence();
+            ncl_uc_store(LAM_Y(b), RX_INVALID);
+            ncl_fence();
+            return -1;
         }
     }
     ncl_fence(); /* lock acquired before critical-section accesses */
     return slow ? NCL_PATH_LAMPORT_SLOW : NCL_PATH_LAMPORT_FAST;
+}
+
+static int lamport_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    return lamport_lock_x(b, i, st, 0);
 }
 
 static void lamport_unlock(struct ncl_base *b, int i)
@@ -642,77 +692,101 @@ void ncl_aksrv_server_reset(struct ncl_base *b, struct ncl_base_stats *st)
 }
 
 /* ---- REACTIVE: Lamport <-> tournament per lock (design §4f) ---------------
- * Safety: a node is in its critical section only while holding the lock of
- * mode m, having read mode == m after acquiring it. `mode` changes only by a
- * node holding the current mode's lock, which first also takes the new mode's
- * lock and keeps both until its release. Suppose P (mode a) and Q (mode b != a)
- * were both inside: some switch away from a happened between P's check and
- * Q's; the first one needed a's lock, which P held throughout, so P made it,
- * and P then held b's lock until its release, before which Q could not have
- * acquired it. Contradiction. The fences: each base lock ends with a fence
- * before the mode load; unlocks start with one, after the mode store.
- * Liveness: a stale node releases the wrong lock without waiting for anything
- * while holding it, so a switcher acquiring it is never blocked for long. */
+ * mode: 0 = Lamport active, 1 = tournament active. While the tournament is
+ * active, Lamport's y holds RX_INVALID, so the Lamport lock cannot be
+ * acquired (lamport_lock returns -1 on seeing it). Hence
+ *   (I) the Lamport lock is acquirable only while mode == 0:
+ *       0 -> 1 is done by a Lamport holder, which stores mode = 1 while still
+ *       holding it and releases it with y = RX_INVALID; 1 -> 0 by a tournament
+ *       holder, which first takes over the INVALID Lamport lock (y = itself)
+ *       and releases it normally later.
+ * Safety: a node is inside either holding Lamport (so mode == 0 then, by I) or
+ * holding the tournament having read mode == 1 after acquiring it. A switch
+ * needs the current mode's lock and keeps the new one until the switcher's
+ * release. If P (Lamport) and Q (tournament) were inside at once, the switch
+ * between P's acquisition and Q's check (mode 0 -> 1), or between Q's check
+ * and P's acquisition (1 -> 0), was made by P, resp. Q, which held the other's
+ * lock until its release: contradiction. Two Lamport or two tournament holders
+ * are excluded by those locks. Fences: each lock ends with one before the
+ * mode load; switches fence after storing mode; unlocks start with one.
+ * Liveness: a stale node gives up the wrong lock without waiting while
+ * holding it. NOT model-checked. */
 
-unsigned ncl_react_up = 2, ncl_react_down = 64;
-int ncl_debug_react = 0;
+unsigned ncl_react_up = 8, ncl_react_down = 4;
+
+int ncl_react_parse(const char *s)
+{
+    unsigned u, d;
+    if (sscanf(s, "%u:%u", &u, &d) != 2 || u > 16 || d > 64)
+        return -1;
+    ncl_react_up = u;
+    ncl_react_down = d;
+    return 0;
+}
 
 static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
-    const uint64_t c0 = st->contended;
     int m, path;
+    uint64_t c0;
     for (;;) {
         m = b->rx_guess;
+        c0 = st->contended;
         if (m == 0) {
             path = lamport_lock(b, i, st);
+            if (path >= 0)
+                break; /* acquirable => mode == 0 (I): no mode load */
+            b->rx_guess = 1;
         } else {
             tournament_lock(b, i, st);
             path = NCL_PATH_TOURNAMENT;
-        }
-        uint64_t cur = ncl_uc_load(b->mode); /* after the lock's closing fence */
-        if (cur == (uint64_t)m || ncl_debug_react == 2)
-            break;
-        if (m == 0) {
-            lamport_unlock(b, i);
-        } else {
+            if (NCL_UNLIKELY(ncl_debug_mode_delay))
+                ncl_lat_spin_cycles(ncl_debug_mode_delay); /* widen the mode-check window */
+            if (ncl_uc_load(b->mode) == 1 || (ncl_debug_react & 2))
+                break; /* after the lock's closing fence */
             ncl_fence();
             tournament_unlock_nofence(b, i);
+            b->rx_guess = 0;
         }
-        b->rx_guess = cur ? 1 : 0;
         NCL_STAT(st->react_stale++);
     }
     b->rx_held = 1 << m;
-    if (st->contended != c0) {
-        b->rx_cont++;
-        b->rx_quiet = 0;
-    } else {
-        b->rx_quiet++;
-        b->rx_cont = 0;
-    }
+    b->rx_inval = 0;
+    b->rx_hist = (b->rx_hist << 1) | (st->contended != c0);
+    if (b->rx_n < 1000000)
+        b->rx_n++;
     int to = m;
-    if (m == 0 && b->rx_cont >= ncl_react_up)
+    if (ncl_debug_react & 8)
+        to = 1 - m;
+    else if (m == 0 && __builtin_popcountll(b->rx_hist & 0xffff) >= (int)ncl_react_up)
         to = 1;
-    else if (m == 1 && b->rx_quiet >= ncl_react_down)
+    else if (m == 1 && b->rx_n >= 64 && __builtin_popcountll(b->rx_hist) <= (int)ncl_react_down)
         to = 0;
     if (to != m) {
-        /* Holding the current mode's lock: take the other one too, then
-         * switch. Kept until the release (reactive_unlock). */
         struct ncl_base_stats ign = {0};
-        if (ncl_debug_react != 1) {
-            if (to == 1)
+        if (to == 1) {
+            /* Holding Lamport: take the tournament too, switch, and release
+             * Lamport as INVALID (reactive_unlock). */
+            if (!(ncl_debug_react & 1)) {
                 tournament_lock(b, i, &ign);
-            else
-                lamport_lock(b, i, &ign);
-            b->rx_held |= 1 << to;
-        }
-        ncl_uc_store(b->mode, (uint64_t)to);
-        ncl_fence();
-        b->rx_guess = to;
-        b->rx_cont = b->rx_quiet = 0;
-        if (to)
+                b->rx_held |= 2;
+            }
+            ncl_uc_store(b->mode, 1);
+            ncl_fence();
+            b->rx_inval = !(ncl_debug_react & 4);
             NCL_STAT(st->react_up++);
-        else
+        } else {
+            /* Holding the tournament: acquire the INVALID Lamport lock
+             * (treating RX_INVALID as free: a late y store may be in flight,
+             * see lamport_lock_x), then switch. Released normally. */
+            lamport_lock_x(b, i, &ign, 1);
+            ncl_uc_store(b->mode, 0);
+            ncl_fence();
+            b->rx_held |= 1;
             NCL_STAT(st->react_down++);
+        }
+        b->rx_guess = to;
+        b->rx_hist = 0;
+        b->rx_n = 0;
     }
     return path;
 }
@@ -720,12 +794,22 @@ static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 static void reactive_unlock(struct ncl_base *b, int i)
 {
     if (b->rx_held & 2) {
-        ncl_fence(); /* critical section (and the mode store) first */
+        ncl_fence(); /* critical section (and a mode store) first */
         tournament_unlock_nofence(b, i);
     }
-    if (b->rx_held & 1)
-        lamport_unlock(b, i); /* fences first */
+    if (b->rx_held & 1) {
+        if (b->rx_inval) {
+            /* Switched to the tournament: leave the Lamport lock unacquirable. */
+            ncl_fence();
+            ncl_uc_store(LAM_Y(b), RX_INVALID);
+            ncl_fence_ss();
+            ncl_uc_store(LAM_B(b, i), 0);
+        } else {
+            lamport_unlock(b, i);
+        }
+    }
     b->rx_held = 0;
+    b->rx_inval = 0;
 }
 
 /* ---- dispatch ----------------------------------------------------------- */

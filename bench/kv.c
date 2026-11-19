@@ -400,8 +400,8 @@ static void usage(const char *a0)
             "  -a ALG        lock algorithm (tournament); --algmap top:H: the H stripes with\n"
             "                the highest expected load use the tournament, the rest Lamport\n"
             "  -M MODE -K CAP -b BACKEND -U LAYOUT --wb clwb --mem-node N --cpus LIST: as ncl_bench\n"
-            "  --react U:D   -a reactive: to the tournament after U contended, back after D\n"
-            "                uncontended global acquisitions (2:64)\n"
+            "  --react U:D   -a reactive: to the tournament when >= U of the last 16 global\n"
+            "                acquisitions met another node, back when <= D of the last 64 (8:4)\n"
             "  --full        conservative data maintenance (whole stripe) instead of precise\n"
             "  -c NS         extra critical-section time    -s SECS -W SECS (2, 0.2)\n"
             "  -r RATE       open loop, Poisson, aggregate req/s (k/M ok); default closed loop\n"
@@ -474,8 +474,7 @@ int main(int argc, char **argv)
             break;
         case 1002: full = 1; break;
         case 1007:
-            if (sscanf(optarg, "%u:%u", &ncl_react_up, &ncl_react_down) != 2 || !ncl_react_up ||
-                !ncl_react_down) { usage(argv[0]); return 2; }
+            if (ncl_react_parse(optarg) < 0) { usage(argv[0]); return 2; }
             break;
         case 1006: /* emulator self-checks: each must FAIL on -b emu */
             if (!strcmp(optarg, "skip-inv")) cfg.debug_skip_data_inv = 1;

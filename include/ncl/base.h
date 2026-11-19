@@ -24,10 +24,13 @@
  *                   grantees clear their own Obstacle (32). NOT model-checked.
  *   REACTIVE        Per-lock switch between LAMPORT and TOURNAMENT (design
  *                   §4f): both locks plus a `mode` word written only by a
- *                   holder; acquire the guessed mode's lock, re-read `mode`,
- *                   retry on a mismatch; a holder switches by also taking the
- *                   other lock and writing `mode`. Switches on cross-node
- *                   contention (ncl_base_stats.contended). NOT model-checked.
+ *                   holder. While the tournament is active, Lamport's y holds
+ *                   INVALID, so a Lamport acquisition that succeeds needs no
+ *                   `mode` check; a tournament acquisition re-reads `mode`.
+ *                   A holder switches by also taking the other lock (or taking
+ *                   over the INVALID Lamport lock) and writing `mode`. Switches
+ *                   on the rate of cross-node contention
+ *                   (ncl_base_stats.contended). NOT model-checked.
  *   PTHREAD         Reference baseline, NOT a non-coherent algorithm: a
  *                   process-shared pthread_mutex_t (futex, i.e. coherent
  *                   cross-node atomics) in the lock's first metadata line.
@@ -97,8 +100,10 @@ struct ncl_base {
     ncl_line_t *mode;  /* REACTIVE: 0 = LAMPORT, 1 = TOURNAMENT (written by a holder) */
     int rx_guess;      /* REACTIVE, node-local: mode last seen */
     int rx_held;       /* REACTIVE, holder: bit 0 = Lamport held, bit 1 = tournament */
-    unsigned rx_cont;  /* REACTIVE, holder: consecutive contended global acquisitions */
-    unsigned rx_quiet; /* REACTIVE, holder: consecutive uncontended ones */
+    uint64_t rx_hist;  /* REACTIVE, holder: contended? per global acquisition (bit 0 = last) */
+    unsigned rx_n;     /* REACTIVE, holder: global acquisitions since the last switch */
+    int rx_inval;      /* REACTIVE, holder: switched to the tournament, so release the
+                          Lamport lock as INVALID */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -214,13 +219,27 @@ int ncl_top_other_flag(struct ncl_base *b, int side); /* flag[1-side] (one load)
 const char *ncl_alg_name(ncl_alg_t a);
 int ncl_alg_parse(const char *s, ncl_alg_t *out);
 
-/* REACTIVE switch thresholds (set before nodes fork): switch to the tournament
- * after ncl_react_up consecutive contended global acquisitions by a node,
- * back to Lamport after ncl_react_down consecutive uncontended ones. */
+/* REACTIVE switch thresholds (set before nodes fork), per lock and node, over
+ * this node's global acquisitions of the lock: to the tournament when at least
+ * ncl_react_up of the last 16 met another node (<= 16); back to Lamport when
+ * at most ncl_react_down of the last 64 did (<= 64), after at least 64
+ * acquisitions in tournament mode. Default 8:4. */
 extern unsigned ncl_react_up, ncl_react_down;
-/* DEBUG (ncl_stress --debug-react): 1 = switch without taking the new mode's
- * lock, 2 = no re-read of `mode` after acquiring. Both UNSAFE (must FAIL). */
+/* "U:D" -> ncl_react_up/down; 0 or -1 (bad). */
+int ncl_react_parse(const char *s);
+/* DEBUG bits (ncl_stress --debug-react): 1 = switch to the tournament without
+ * taking it, 2 = no `mode` re-read after a tournament acquisition, 4 = release
+ * the Lamport lock normally (not INVALID) on a switch to the tournament: each
+ * UNSAFE (must FAIL with 8); 8 = switch on every global acquisition (safe,
+ * maximal switching for stress tests); 16 = no mode re-check after a Lamport
+ * slow-path success (UNSAFE with 8 and ncl_debug_lamport_delay). */
 extern int ncl_debug_react;
+/* DEBUG (ncl_stress --lamport-delay): cycles Lamport spins between reading
+ * y == 0 and storing y (widens the late-y-store window, src/base.c).
+ * ncl_debug_mode_delay (--mode-delay): cycles a REACTIVE tournament acquirer
+ * spins between acquiring and reading `mode`. Bit 16 of
+ * ncl_debug_react skips the slow-path mode re-check that handles it (UNSAFE). */
+extern uint64_t ncl_debug_lamport_delay, ncl_debug_mode_delay;
 
 /* Exponential backoff for spin loops (pause iterations, capped). */
 extern unsigned ncl_backoff_cap;

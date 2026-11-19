@@ -107,10 +107,12 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
 - `bench/memconc.c` (`ncl_memconc`): aggregate throughput of T threads issuing one access
   pattern (uc/cf load, store, Dekker step, same-line load, full-line writeback, 8- vs
   64-byte movnti), to locate the uc ceiling on CXL; `docs/backends.md`, sweep phase `conc`.
-- `-a reactive` (design §4f): per-lock switch between Lamport and the tournament on
-  cross-node contention (holder-written `mode` word; acquire, re-read `mode`, retry;
-  `--react U:D`, default 2:64). Phase 1, 2a and 2b. Not model-checked. Sweep phase
-  `kvreact`.
+- `-a reactive` (design §4f): per-lock switch between Lamport and the tournament on the
+  rate of cross-node contention (`--react U:D`, default 8:4: up when >= U of the node's last
+  16 global acquisitions met another node, down when <= D of the last 64). Lamport's `y`
+  holds INVALID while the tournament is active, so a Lamport fast-path acquisition needs no
+  `mode` read; slow-path successes and tournament acquisitions re-read `mode`. Phase 1, 2a
+  and 2b. Not model-checked. Sweep phase `kvreact`.
 - `include/ncl/data.h`, `src/data.c`: data maintenance layer (design §2.1), separate from the
   lock algorithms. A lock only reports "arrived" vs "local handoff" after acquiring and
   "departing" (with its fence before the handoff store) at release; the layer holds each

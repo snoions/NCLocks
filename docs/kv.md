@@ -71,14 +71,21 @@ real test. Uniform keys: all variants within 2% except the server.
 ## Reactive lock (`-a reactive`, design §4f)
 
 `ncl_kv -a reactive [--react U:D]`: each stripe's lock starts on Lamport and switches to
-the tournament after U consecutive global acquisitions by a node that met another node,
-back after D uncontended ones. CSV columns `tournament_acq_frac` (share of global
+the tournament when at least U of a node's last 16 global acquisitions met another node,
+back when at most D of the last 64 did (default 8:4). CSV columns `tournament_acq_frac` (share of global
 acquisitions on the tournament) and `mode_switches`.
 
-Dev box (4x3, cf, 2a, 1.5 s): the mode choice follows the oracle (Zipf 0.99, L=1024: 26%
+First version (consecutive-event trigger, `mode` read on every acquisition, 2:64). Dev box
+(4x3, cf, 2a, 1.5 s): the mode choice follows the oracle (Zipf 0.99, L=1024: 26%
 of global acquisitions on the tournament vs 28% for the 16 hottest; uniform 0.3%;
 affinity 0.9: 1%), but throughput is 6-14% below the best fixed choice everywhere: the
 extra `mode` load per global acquisition and, near the threshold, thrashing (up to 43k
 switches in 1.5 s at L=64 with affinity; 4:512 cuts that). On the dev box the fixed
 choices differ by only a few percent, so this overhead dominates; on CXL they differ by
 31% to 5x. Sweep phase `kvreact`.
+
+Current version (INVALID marker in Lamport's `y`, rate trigger, 8:4 / 12:4), same dev-box
+setup: 3-7% below the best fixed choice (uniform L=1024: 11.6M vs 12.0M; affinity:
+10.9M vs 11.2M; Zipf L=1024: 10.6M vs 11.0M; Zipf L=64: 9.9M vs 10.7M); uniform keys never
+promote; 12:4 switches ~100 times per run, 8:4 up to a few thousand, 4:4 thrashes
+(50-150k). On Zipf keys it promotes 10-14% of global acquisitions vs the oracle's 28%.

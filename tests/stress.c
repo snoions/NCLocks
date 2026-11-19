@@ -41,6 +41,7 @@ static long iters = 100000;
 static int timeout_s = 0;
 static unsigned reset_delay_ns = 0;
 static unsigned grant_delay_ns = 0;
+static unsigned lamport_delay_ns = 0, mode_delay_ns = 0;
 static unsigned max_delay_ns = 200;
 static size_t stride;
 static uint64_t delay_cycles;
@@ -197,6 +198,9 @@ static int node_main(int node)
     if (sb.split_resets || sb.split_reset_skips)
         printf(" door_resets=%lu reset_skips=%lu", (unsigned long)sb.split_resets,
                (unsigned long)sb.split_reset_skips);
+    if (sb.react_up || sb.react_down || sb.react_stale)
+        printf(" react_up=%lu react_down=%lu react_stale=%lu", (unsigned long)sb.react_up,
+               (unsigned long)sb.react_down, (unsigned long)sb.react_stale);
     if (st.ho.stale_announce)
         printf(" STALE_ANNOUNCE=%lu", (unsigned long)st.ho.stale_announce);
     if (st.global_releases != st.acquires)
@@ -249,10 +253,13 @@ static void usage(const char *argv0)
             "  --debug-no-grant-wait  DEBUG: handoff --wait own without --ho grant: clear the\n"
             "                announce without waiting for a grant still on its way (must FAIL\n"
             "                on emu split with full-line writeback; see design.md §5)\n"
-            "  --react U:D   -a reactive: switch to the tournament after U contended, back after D\n"
-            "                uncontended global acquisitions (default 2:64)\n"
-            "  --debug-react 1|2  DEBUG: reactive switch without the new lock (1) or no mode\n"
-            "                re-check (2): UNSAFE, must FAIL with --react 1:1\n"
+            "  --react U:D   -a reactive: to the tournament when >= U of the last 16 global\n"
+            "                acquisitions met another node, back when <= D of the last 64 (8:4)\n"
+            "  --debug-react BITS  reactive: 8 = switch on every acquisition (safe); with 8, UNSAFE\n"
+            "                (must FAIL): 1 no new lock, 2 no mode re-check, 4 no INVALID release,\n"
+            "                16 no slow-path re-check (with --lamport-delay)\n"
+            "  --lamport-delay NS  DEBUG: Lamport spins between reading y == 0 and storing y\n"
+            "  --mode-delay NS  DEBUG: reactive tournament acquirer spins before reading mode\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
@@ -296,6 +303,8 @@ int main(int argc, char **argv)
         {"mix-algs", no_argument, 0, 11},
         {"react", required_argument, 0, 12},
         {"debug-react", required_argument, 0, 13},
+        {"lamport-delay", required_argument, 0, 14},
+        {"mode-delay", required_argument, 0, 15},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -377,9 +386,10 @@ int main(int argc, char **argv)
         case 10: grant_delay_ns = (unsigned)atoi(optarg); break;
         case 11: cfg.alg_per_lock = 1; break;
         case 13: ncl_debug_react = atoi(optarg); break;
+        case 14: lamport_delay_ns = (unsigned)atoi(optarg); break;
+        case 15: mode_delay_ns = (unsigned)atoi(optarg); break;
         case 12:
-            if (sscanf(optarg, "%u:%u", &ncl_react_up, &ncl_react_down) != 2 || !ncl_react_up ||
-                !ncl_react_down) {
+            if (ncl_react_parse(optarg) < 0) {
                 usage(argv[0]);
                 return 2;
             }
@@ -441,6 +451,8 @@ int main(int argc, char **argv)
     delay_cycles = ncl_ns_to_cycles(max_delay_ns);
     ncl_debug_reset_delay = ncl_ns_to_cycles(reset_delay_ns);
     ncl_debug_grant_delay = ncl_ns_to_cycles(grant_delay_ns);
+    ncl_debug_lamport_delay = ncl_ns_to_cycles(lamport_delay_ns);
+    ncl_debug_mode_delay = ncl_ns_to_cycles(mode_delay_ns);
 
     for (int l = 0; l < nlocks; l++) {
         if (ncl_lock_set_data(l, (ncl_off_t)l * stride, stride) < 0)

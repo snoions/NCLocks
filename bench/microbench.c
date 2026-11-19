@@ -383,8 +383,8 @@ static void usage(const char *argv0)
             "  --cpus LIST   CPUs for pinned threads, e.g. 0-59,120-179 (default: this\n"
             "                process's affinity, e.g. from numactl --cpunodebind)\n"
             "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n"
-            "  --react U:D   -a reactive: to the tournament after U contended, back to Lamport\n"
-            "                after D uncontended global acquisitions (default 2:64)\n",
+            "  --react U:D   -a reactive: to the tournament when >= U of the last 16 global\n"
+            "                acquisitions met another node, back when <= D of the last 64 (8:4)\n",
             argv0);
 }
 
@@ -500,8 +500,7 @@ int main(int argc, char **argv)
             else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
             break;
         case 1006:
-            if (sscanf(optarg, "%u:%u", &ncl_react_up, &ncl_react_down) != 2 || !ncl_react_up ||
-                !ncl_react_down) { usage(argv[0]); return 2; }
+            if (ncl_react_parse(optarg) < 0) { usage(argv[0]); return 2; }
             break;
         case 1004:
             if (!strcmp(optarg, "own")) cfg.handoff_wait = NCL_WAIT_OWN;

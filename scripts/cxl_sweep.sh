@@ -54,7 +54,7 @@
 #      HO_NT ("4x1 16x1 32x1 16x3"), HO_LOCKS ("1 256"), HO_OPTS ("none grant,clear all"), RUN_TIMEOUT (120 s per run), WB (clwb),
 #      MT_MAIN ("16x3"), MT_CAPS ("8 16 64 256"), MT_LOCKS ("1 4 16 64 256"), MT_NT ("4x3 16x2 16x3 16x4 32x2"),
 #      MT_RATES1 / MT_RATES256 (mt open loop at L=1 / 256),
-#      REACT_THR ("2:64 4:512"), KV (build/ncl_kv), KV_NT ("16x3"), KV_RATES ("1000k 2000k 4000k 6000k 8000k"),
+#      REACT_THR ("8:4 12:4"), KV (build/ncl_kv), KV_NT ("16x3"), KV_RATES ("1000k 2000k 4000k 6000k 8000k"),
 #      CONC_T ("1 2 4 8 16 24 32 48 60"), CONC_SECS (1), MEMCONC (build/ncl_memconc),
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16)
 set -uo pipefail
@@ -88,7 +88,7 @@ OPEN2B_N=${OPEN2B_N:-16} # open2b is the T=1 (worst-case) study; mt covers T>1
 OPEN_T=${OPEN_T:-3}       # phase open: threads per node
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
-REACT_THR=${REACT_THR:-"2:64 4:512"}
+REACT_THR=${REACT_THR:-"8:4 12:4"} # >= U of the last 16 contended: up; <= D of the last 64: down
 KV_RATES=${KV_RATES:-"1000k 2000k 4000k 6000k 8000k"}
 MT_MAIN=${MT_MAIN:-16x3} # mt parts cap, locks, open
 MT_CAPS=${MT_CAPS:-"8 16 64 256"}
