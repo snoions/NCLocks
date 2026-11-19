@@ -47,6 +47,7 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
     case NCL_ALG_AK: return ak_lines(P) + tree_lines(P) + top_lines();
     case NCL_ALG_AKSRV: return ak_lines(P) + top_lines();
     case NCL_ALG_PTHREAD: return 1;
+    case NCL_ALG_REACTIVE: return 1 + lam_lines(P) + (tree_lines(P) ? tree_lines(P) : 1);
     }
     return 0;
 }
@@ -55,6 +56,7 @@ size_t ncl_base_nscan(ncl_alg_t alg, int P)
 {
     switch (alg) {
     case NCL_ALG_LAMPORT:            /* b[] */
+    case NCL_ALG_REACTIVE:           /* Lamport's b[] */
     case NCL_ALG_HYBRID: return (size_t)P; /* present[] */
     case NCL_ALG_FASTSRV: return (size_t)P + 1; /* present[] + server reset marker */
     case NCL_ALG_TOURNAMENT:
@@ -108,6 +110,12 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
     case NCL_ALG_PTHREAD:
         b->mtx = (pthread_mutex_t *)(void *)lines;
         break;
+    case NCL_ALG_REACTIVE: /* [mode][x, y][tree]; b[] in scan */
+        b->mode = lines;
+        b->lam = lines + 1;
+        b->lam_b = scan;
+        b->tree = lines + 1 + lam_lines(P);
+        break;
     }
 }
 
@@ -156,12 +164,14 @@ start:
         ncl_uc_store(LAM_B(b, i), 0);
         await_eq(LAM_Y(b), 0);
         NCL_STAT(st->lamport_retries++);
+        st->contended++;
         goto start;
     }
     ncl_uc_store(LAM_Y(b), me);
     ncl_fence(); /* (2) y = me before reading x */
     if (ncl_uc_load(LAM_X(b)) != me) {
         slow = 1;
+        st->contended++;
         ncl_uc_store(LAM_B(b, i), 0);
         ncl_fence(); /* b[i] = 0 before scanning b[] */
         /* Wait for every b[j] == 0, in index order. A batched first pass
@@ -212,21 +222,27 @@ static int peterson_may_enter(ncl_line_t *flag_other, ncl_line_t *turn, uint64_t
     return !(ncl_uc_load(flag_other) && ncl_uc_load(turn) == side);
 }
 
-static void peterson_lock(ncl_line_t *flag_me, ncl_line_t *flag_other, ncl_line_t *turn,
-                          uint64_t side)
+/* Returns 1 if it had to wait (the other side was competing). */
+static int peterson_lock(ncl_line_t *flag_me, ncl_line_t *flag_other, ncl_line_t *turn,
+                         uint64_t side)
 {
     peterson_announce(flag_me, turn, side);
     struct ncl_backoff bo;
     ncl_backoff_init(&bo);
-    while (!peterson_may_enter(flag_other, turn, side))
+    int waited = 0;
+    while (!peterson_may_enter(flag_other, turn, side)) {
+        waited = 1;
         ncl_backoff(&bo);
+    }
+    return waited;
 }
 
-static void tournament_lock(struct ncl_base *b, int i)
+static void tournament_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
     for (int pos = b->leaves + i; pos > 1; pos >>= 1) {
         int k = pos >> 1, s = pos & 1;
-        peterson_lock(T_FLAG(b, k, s), T_FLAG(b, k, 1 - s), T_TURN(b, k), (uint64_t)s);
+        if (peterson_lock(T_FLAG(b, k, s), T_FLAG(b, k, 1 - s), T_TURN(b, k), (uint64_t)s) && st)
+            st->contended++;
     }
     ncl_fence();
 }
@@ -394,7 +410,7 @@ static int hybrid_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
         ncl_top_lock(b, NCL_SIDE_FAST);
         return NCL_PATH_HYBRID_FAST;
     }
-    tournament_lock(b, i);
+    tournament_lock(b, i, st);
     ncl_top_lock(b, NCL_SIDE_SLOW);
     return NCL_PATH_HYBRID_SLOW;
 }
@@ -500,7 +516,7 @@ static int ak_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
         b->ak_k = k;                               /* holder-only from here */
         return NCL_PATH_HYBRID_FAST;
     }
-    tournament_lock(b, i);                         /* 21/26: ENTRY N(p) */
+    tournament_lock(b, i, st);                     /* 21/26: ENTRY N(p) */
     ncl_top_lock(b, NCL_SIDE_SLOW);                /* 22/27: ENTRY 2(1) */
     b->ak_slow2 = slow2;
     return NCL_PATH_HYBRID_SLOW;
@@ -625,13 +641,101 @@ void ncl_aksrv_server_reset(struct ncl_base *b, struct ncl_base_stats *st)
     ak_slow_reset(b, (uint64_t)b->P + 1, -1, st);
 }
 
+/* ---- REACTIVE: Lamport <-> tournament per lock (design §4f) ---------------
+ * Safety: a node is in its critical section only while holding the lock of
+ * mode m, having read mode == m after acquiring it. `mode` changes only by a
+ * node holding the current mode's lock, which first also takes the new mode's
+ * lock and keeps both until its release. Suppose P (mode a) and Q (mode b != a)
+ * were both inside: some switch away from a happened between P's check and
+ * Q's; the first one needed a's lock, which P held throughout, so P made it,
+ * and P then held b's lock until its release, before which Q could not have
+ * acquired it. Contradiction. The fences: each base lock ends with a fence
+ * before the mode load; unlocks start with one, after the mode store.
+ * Liveness: a stale node releases the wrong lock without waiting for anything
+ * while holding it, so a switcher acquiring it is never blocked for long. */
+
+unsigned ncl_react_up = 2, ncl_react_down = 64;
+int ncl_debug_react = 0;
+
+static int reactive_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    const uint64_t c0 = st->contended;
+    int m, path;
+    for (;;) {
+        m = b->rx_guess;
+        if (m == 0) {
+            path = lamport_lock(b, i, st);
+        } else {
+            tournament_lock(b, i, st);
+            path = NCL_PATH_TOURNAMENT;
+        }
+        uint64_t cur = ncl_uc_load(b->mode); /* after the lock's closing fence */
+        if (cur == (uint64_t)m || ncl_debug_react == 2)
+            break;
+        if (m == 0) {
+            lamport_unlock(b, i);
+        } else {
+            ncl_fence();
+            tournament_unlock_nofence(b, i);
+        }
+        b->rx_guess = cur ? 1 : 0;
+        NCL_STAT(st->react_stale++);
+    }
+    b->rx_held = 1 << m;
+    if (st->contended != c0) {
+        b->rx_cont++;
+        b->rx_quiet = 0;
+    } else {
+        b->rx_quiet++;
+        b->rx_cont = 0;
+    }
+    int to = m;
+    if (m == 0 && b->rx_cont >= ncl_react_up)
+        to = 1;
+    else if (m == 1 && b->rx_quiet >= ncl_react_down)
+        to = 0;
+    if (to != m) {
+        /* Holding the current mode's lock: take the other one too, then
+         * switch. Kept until the release (reactive_unlock). */
+        struct ncl_base_stats ign = {0};
+        if (ncl_debug_react != 1) {
+            if (to == 1)
+                tournament_lock(b, i, &ign);
+            else
+                lamport_lock(b, i, &ign);
+            b->rx_held |= 1 << to;
+        }
+        ncl_uc_store(b->mode, (uint64_t)to);
+        ncl_fence();
+        b->rx_guess = to;
+        b->rx_cont = b->rx_quiet = 0;
+        if (to)
+            NCL_STAT(st->react_up++);
+        else
+            NCL_STAT(st->react_down++);
+    }
+    return path;
+}
+
+static void reactive_unlock(struct ncl_base *b, int i)
+{
+    if (b->rx_held & 2) {
+        ncl_fence(); /* critical section (and the mode store) first */
+        tournament_unlock_nofence(b, i);
+    }
+    if (b->rx_held & 1)
+        lamport_unlock(b, i); /* fences first */
+    b->rx_held = 0;
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
 int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
     switch (b->alg) {
     case NCL_ALG_LAMPORT: return lamport_lock(b, i, st);
-    case NCL_ALG_TOURNAMENT: tournament_lock(b, i); return NCL_PATH_TOURNAMENT;
+    case NCL_ALG_TOURNAMENT: tournament_lock(b, i, st); return NCL_PATH_TOURNAMENT;
+    case NCL_ALG_REACTIVE: return reactive_lock(b, i, st);
     case NCL_ALG_HYBRID: return hybrid_lock(b, i, st);
     case NCL_ALG_AK: return ak_lock(b, i, st);
     case NCL_ALG_PTHREAD:
@@ -650,6 +754,7 @@ void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats 
     switch (b->alg) {
     case NCL_ALG_LAMPORT: lamport_unlock(b, i); break;
     case NCL_ALG_TOURNAMENT: ncl_fence(); tournament_unlock_nofence(b, i); break;
+    case NCL_ALG_REACTIVE: reactive_unlock(b, i); break;
     case NCL_ALG_HYBRID: hybrid_unlock(b, i, path, st); break;
     case NCL_ALG_AK: ak_unlock(b, i, path, st); break;
     case NCL_ALG_PTHREAD:
@@ -673,6 +778,7 @@ const char *ncl_alg_name(ncl_alg_t a)
     case NCL_ALG_PTHREAD: return "pthread";
     case NCL_ALG_SERVER: return "server";
     case NCL_ALG_FASTSRV: return "fastsrv";
+    case NCL_ALG_REACTIVE: return "reactive";
     }
     return "?";
 }
@@ -687,6 +793,7 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out)
     else if (!strcmp(s, "pthread")) *out = NCL_ALG_PTHREAD;
     else if (!strcmp(s, "server") || !strcmp(s, "c")) *out = NCL_ALG_SERVER;
     else if (!strcmp(s, "fastsrv") || !strcmp(s, "e")) *out = NCL_ALG_FASTSRV;
+    else if (!strcmp(s, "reactive") || !strcmp(s, "f")) *out = NCL_ALG_REACTIVE;
     else return -1;
     return 0;
 }

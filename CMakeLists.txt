@@ -295,6 +295,31 @@ add_test(NAME kv_emu_detects_no-dirty-wb
 add_test(NAME kv_emu_dirty_wb_long_runs
   COMMAND ncl_kv -b emu -n 2 -t 4 -l 2 -k 2000 -M local -K 256 -s 1 -W 0.1 -P)
 set_tests_properties(kv_emu_detects_no-dirty-wb PROPERTIES WILL_FAIL TRUE)
+# Reactive lock (-a reactive, design §4f): default thresholds and --react 1:1
+# (switches on almost every acquisition), every mode and layout; -d 2000
+# stretches the windows. The two unsafe variants must FAIL.
+foreach(m phase1 local handoff)
+  foreach(be emu uc)
+    foreach(r 2:64 1:1)
+      string(REPLACE ":" "_" rn ${r})
+      add_test(NAME stress_reactive_${be}_${m}_${rn}
+        COMMAND ncl_stress -a reactive -b ${be} -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} --react ${r} --timeout 60)
+      add_test(NAME stress_reactive_${be}_split_${m}_${rn}
+        COMMAND ncl_stress -a reactive -b ${be} -U split -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} --react ${r} --timeout 60)
+      if(be STREQUAL "uc")
+        set_tests_properties(stress_reactive_uc_${m}_${rn} stress_reactive_uc_split_${m}_${rn}
+          PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+      endif()
+    endforeach()
+  endforeach()
+endforeach()
+foreach(d 1 2)
+  add_test(NAME reactive_emu_detects_unsafe_${d}
+    COMMAND ncl_stress -a reactive -b emu -n 8 -t 2 -l 2 -i 50000 -d 2000 --react 1:1 --debug-react ${d} --timeout 20)
+  set_tests_properties(reactive_emu_detects_unsafe_${d} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+add_test(NAME kv_emu_reactive_local COMMAND ncl_kv -b emu -a reactive -M local ${KV_ARGS})
+add_test(NAME kv_emu_reactive_local_1_1 COMMAND ncl_kv -b emu -a reactive -M local --react 1:1 ${KV_ARGS})
 # Per-lock algorithms (cfg.alg_per_lock, used by ncl_kv): even locks Lamport, odd
 # locks tournament, in each mode and layout.
 foreach(m phase1 local handoff)

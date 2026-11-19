@@ -22,6 +22,12 @@
  *                   home server runs AK's reset (statements 29-37) when its
  *                   queue drains, while still holding the top SLOW side;
  *                   grantees clear their own Obstacle (32). NOT model-checked.
+ *   REACTIVE        Per-lock switch between LAMPORT and TOURNAMENT (design
+ *                   §4f): both locks plus a `mode` word written only by a
+ *                   holder; acquire the guessed mode's lock, re-read `mode`,
+ *                   retry on a mismatch; a holder switches by also taking the
+ *                   other lock and writing `mode`. Switches on cross-node
+ *                   contention (ncl_base_stats.contended). NOT model-checked.
  *   PTHREAD         Reference baseline, NOT a non-coherent algorithm: a
  *                   process-shared pthread_mutex_t (futex, i.e. coherent
  *                   cross-node atomics) in the lock's first metadata line.
@@ -48,6 +54,7 @@ typedef enum {
     NCL_ALG_AK = 5,
     NCL_ALG_AKSRV = 6,
     NCL_ALG_PTHREAD = 7,
+    NCL_ALG_REACTIVE = 8,
 } ncl_alg_t;
 
 /* (e)-style: fast path + lock-server slow path holding the top SLOW side. */
@@ -87,6 +94,11 @@ struct ncl_base {
     int ak_k;          /* AK, node-local, holder only: fast path's y.indx */
     int ak_slow2;      /* AK, node-local, holder only: slow path is SLOW 2 */
     pthread_mutex_t *mtx; /* PTHREAD: process-shared mutex in the lock's meta line */
+    ncl_line_t *mode;  /* REACTIVE: 0 = LAMPORT, 1 = TOURNAMENT (written by a holder) */
+    int rx_guess;      /* REACTIVE, node-local: mode last seen */
+    int rx_held;       /* REACTIVE, holder: bit 0 = Lamport held, bit 1 = tournament */
+    unsigned rx_cont;  /* REACTIVE, holder: consecutive contended global acquisitions */
+    unsigned rx_quiet; /* REACTIVE, holder: consecutive uncontended ones */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -106,6 +118,11 @@ struct ncl_base_stats {
     uint64_t split_scan_loads;    /* present[] loads in reset checks (after the fence) */
     uint64_t split_precheck_skips; /* reset checks skipped by the unfenced pre-check */
     uint64_t split_fast_keep_closed; /* fast winner left door CLOSED: others present */
+    uint64_t contended;   /* Lamport slow path or retry, tournament level waited on:
+                             another node competed (always counted: REACTIVE uses it) */
+    uint64_t react_up;    /* REACTIVE: switched Lamport -> tournament */
+    uint64_t react_down;  /* REACTIVE: switched tournament -> Lamport */
+    uint64_t react_stale; /* REACTIVE: acquired the wrong mode's lock, retried */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -196,6 +213,14 @@ int ncl_top_other_flag(struct ncl_base *b, int side); /* flag[1-side] (one load)
 
 const char *ncl_alg_name(ncl_alg_t a);
 int ncl_alg_parse(const char *s, ncl_alg_t *out);
+
+/* REACTIVE switch thresholds (set before nodes fork): switch to the tournament
+ * after ncl_react_up consecutive contended global acquisitions by a node,
+ * back to Lamport after ncl_react_down consecutive uncontended ones. */
+extern unsigned ncl_react_up, ncl_react_down;
+/* DEBUG (ncl_stress --debug-react): 1 = switch without taking the new mode's
+ * lock, 2 = no re-read of `mode` after acquiring. Both UNSAFE (must FAIL). */
+extern int ncl_debug_react;
 
 /* Exponential backoff for spin loops (pause iterations, capped). */
 extern unsigned ncl_backoff_cap;

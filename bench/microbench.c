@@ -382,7 +382,9 @@ static void usage(const char *argv0)
             "                and verify every page (uc: driver must be loaded with nid=N)\n"
             "  --cpus LIST   CPUs for pinned threads, e.g. 0-59,120-179 (default: this\n"
             "                process's affinity, e.g. from numactl --cpunodebind)\n"
-            "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n",
+            "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n"
+            "  --react U:D   -a reactive: to the tournament after U contended, back to Lamport\n"
+            "                after D uncontended global acquisitions (default 2:64)\n",
             argv0);
 }
 
@@ -406,6 +408,7 @@ int main(int argc, char **argv)
         {"mem-node", required_argument, 0, 1001},
         {"cpus", required_argument, 0, 1002},
         {"wb", required_argument, 0, 1003},
+        {"react", required_argument, 0, 1006},
         {"wait", required_argument, 0, 1004},
         {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
@@ -495,6 +498,10 @@ int main(int argc, char **argv)
         case 1003:
             if (!strcmp(optarg, "clwb")) { if (ncl_wb_mode_set(NCL_WB_CLWB) < 0) return 2; }
             else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
+            break;
+        case 1006:
+            if (sscanf(optarg, "%u:%u", &ncl_react_up, &ncl_react_down) != 2 || !ncl_react_up ||
+                !ncl_react_down) { usage(argv[0]); return 2; }
             break;
         case 1004:
             if (!strcmp(optarg, "own")) cfg.handoff_wait = NCL_WAIT_OWN;

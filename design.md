@@ -338,6 +338,18 @@ on release:
   - NACK and home migration while the server holds the `SLOW` side (the side must move with, or be released before, a home change);
   - interaction with local handoff (a node keeping a grant across its local waiters keeps the server's queue non-empty from the server's point of view).
 
+### (f) Reactive Lamport/tournament lock (sixth variant, measured, not model-checked)
+
+Motivation (`docs/cxl_results.md`, "KV store"): with several threads per node, cold locks are fastest on Lamport and locks hot across nodes need the tournament; a per-lock oracle beat the best uniform choice by 31-36% on Zipfian keys. The reactive lock finds the per-lock choice online, after Lim and Agarwal's reactive locks (ASPLOS 1994): only a holder may change the protocol.
+
+- **State per lock:** a Lamport lock, a tournament, and an uncached `mode` word (0 = Lamport, initial; 1 = tournament) written only by a holder. Node-local, per lock: the mode last seen, and counters of consecutive contended and uncontended global acquisitions.
+- **Acquire:** take the lock of the mode last seen, fence, read `mode`; on a mismatch release it, adopt the new mode and retry.
+- **Switch** (by the global holder, right after acquiring): to the tournament after U consecutive contended global acquisitions by this node, back to Lamport after D consecutive uncontended ones (`--react U:D`, default 2:64). The switcher also takes the new mode's lock, writes `mode`, fences, and releases both at its global release.
+- **Contention signal** = another node competed: Lamport's slow path or a retry, or a tournament level whose opposite side made us wait. Contention among a node's own threads (the submutex) does not count, so a lock hot within one node stays on Lamport.
+- **Safety:** a node is in its critical section only while holding the lock of mode m, having read `mode == m` after acquiring it. `mode` changes only by a node holding the current mode's lock, which first takes the new mode's lock and keeps both until its release. If P (mode a) and Q (mode b != a) were both inside, the first switch away from a after P's check needed a's lock, which P held, so P made it, and P then held b's lock until its release, before which Q could not have acquired it. **Liveness:** a stale node releases the wrong lock without waiting while holding it.
+- **Cost:** one extra `mode` load per global acquisition (a round trip on CXL), plus the switch itself.
+- Tested: stress in every mode and layout at 2:64 and 1:1 (switching on almost every acquisition); switching without taking the new lock gives mutex violations, and skipping the `mode` re-read hangs (ctests `stress_reactive_*`, `reactive_emu_detects_unsafe_*`). **Not model-checked.**
+
 ## 5. Correctness verification
 
 - **Model checking** (e.g. GenMC, or TLA+ with an explicit model of writeback and invalidation): base algorithms under the memory rules; gate + owner field + announcements; hybrid (splitter + tournament + top Peterson, including the splitter-reset rule and its ordering); lock-server queues, grant slots, NACK/migration; (e) server ownership of the top lock's slow side and its splitter reset.

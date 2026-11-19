@@ -80,6 +80,7 @@ static size_t vwords;
 struct result {
     uint64_t ops[OP__N], completed, offered, unserved, errors, updates;
     uint64_t local_handoffs, acquires;
+    uint64_t global_acq, tour_acq, switches; /* REACTIVE: mode mix and switches */
     struct hist h[H__N];
 };
 
@@ -343,6 +344,10 @@ static int node_main(int node, int wfd)
     ncl_node_stats(&st);
     tot->acquires = st.acquires;
     tot->local_handoffs = st.path[NCL_PATH_LOCAL_HANDOFF];
+    tot->tour_acq = st.path[NCL_PATH_TOURNAMENT];
+    tot->global_acq = st.path[NCL_PATH_TOURNAMENT] + st.path[NCL_PATH_LAMPORT_FAST] +
+                      st.path[NCL_PATH_LAMPORT_SLOW];
+    tot->switches = st.base.react_up + st.base.react_down;
     int rc = write_full(wfd, tot, sizeof *tot) < 0 ? 3 : 0;
     close(wfd);
     return rc;
@@ -395,6 +400,8 @@ static void usage(const char *a0)
             "  -a ALG        lock algorithm (tournament); --algmap top:H: the H stripes with\n"
             "                the highest expected load use the tournament, the rest Lamport\n"
             "  -M MODE -K CAP -b BACKEND -U LAYOUT --wb clwb --mem-node N --cpus LIST: as ncl_bench\n"
+            "  --react U:D   -a reactive: to the tournament after U contended, back after D\n"
+            "                uncontended global acquisitions (2:64)\n"
             "  --full        conservative data maintenance (whole stripe) instead of precise\n"
             "  -c NS         extra critical-section time    -s SECS -W SECS (2, 0.2)\n"
             "  -r RATE       open loop, Poisson, aggregate req/s (k/M ok); default closed loop\n"
@@ -407,7 +414,7 @@ static void usage(const char *a0)
     "workload,dist,theta,affinity,keys,value_bytes,locks,alg,algmap_top,tournament_locks,"     \
     "backend,mode,local_cap,meta_layout,data,nodes,threads_per_node,target_rps,achieved_rps,"  \
     "unserved_frac,lock_p50,lock_p99,lock_p999,op_p50,op_p99,op_p999,node_min_max_ratio,"      \
-    "local_handoff_frac,hot_stripe_share,errors"
+    "local_handoff_frac,hot_stripe_share,errors,tournament_acq_frac,mode_switches,react"
 
 int main(int argc, char **argv)
 {
@@ -423,6 +430,7 @@ int main(int argc, char **argv)
                                  {"cpus", required_argument, 0, 1004},
                                  {"wb", required_argument, 0, 1005},
                                  {"debug", required_argument, 0, 1006},
+                                 {"react", required_argument, 0, 1007},
                                  {0, 0, 0, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "n:t:l:k:V:w:d:z:F:a:M:K:b:U:c:s:W:r:PCHh", lo, NULL)) != -1) {
@@ -465,6 +473,10 @@ int main(int argc, char **argv)
             algmap_top = atoi(optarg + 4);
             break;
         case 1002: full = 1; break;
+        case 1007:
+            if (sscanf(optarg, "%u:%u", &ncl_react_up, &ncl_react_down) != 2 || !ncl_react_up ||
+                !ncl_react_down) { usage(argv[0]); return 2; }
+            break;
         case 1006: /* emulator self-checks: each must FAIL on -b emu */
             if (!strcmp(optarg, "skip-inv")) cfg.debug_skip_data_inv = 1;
             else if (!strcmp(optarg, "skip-wb")) cfg.debug_skip_data_wb = 1;
@@ -613,6 +625,9 @@ int main(int argc, char **argv)
         tot->updates += nr->updates;
         tot->acquires += nr->acquires;
         tot->local_handoffs += nr->local_handoffs;
+        tot->global_acq += nr->global_acq;
+        tot->tour_acq += nr->tour_acq;
+        tot->switches += nr->switches;
         for (int h = 0; h < H__N; h++)
             hist_merge(&tot->h[h], &nr->h[h]);
         close(rfd[n]);
@@ -648,12 +663,16 @@ int main(int argc, char **argv)
     }
     double fair = nmax ? (double)nmin / (double)nmax : 1.0;
     double lh = tot->acquires ? (double)tot->local_handoffs / (double)tot->acquires : 0;
+    double tf = tot->global_acq ? (double)tot->tour_acq / (double)tot->global_acq : 0;
+    char react[24] = "-";
+    if (cfg.alg == NCL_ALG_REACTIVE)
+        snprintf(react, sizeof react, "%u:%u", ncl_react_up, ncl_react_down);
     const struct hist *hl = &tot->h[H_LOCK], *ho = &tot->h[H_OP];
     char modebuf[32];
     snprintf(modebuf, sizeof modebuf, "%s", ncl_mode_name(cfg.mode));
     if (csv) {
         printf("%c,%s,%.2f,%.2f,%ld,%zu,%d,%s,%d,%d,%s,%s,%d,%s,%s,%d,%d,%.0f,%.0f,%.5f,%lu,%lu,"
-               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu\n",
+               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s\n",
                workload, zipf ? "zipf" : "uniform", zipf ? theta : 0.0, affinity, nkeys, vbytes,
                nlocks, algmap_top >= 0 ? "map" : ncl_alg_name(cfg.alg), algmap_top, ntour,
                ncl_backend_name(cfg.backend), modebuf,
@@ -662,7 +681,8 @@ int main(int argc, char **argv)
                rate, achieved, unserved, (unsigned long)hist_pct(hl, 0.5),
                (unsigned long)hist_pct(hl, 0.99), (unsigned long)hist_pct(hl, 0.999),
                (unsigned long)hist_pct(ho, 0.5), (unsigned long)hist_pct(ho, 0.99),
-               (unsigned long)hist_pct(ho, 0.999), fair, lh, hot_share, (unsigned long)errors);
+               (unsigned long)hist_pct(ho, 0.999), fair, lh, hot_share, (unsigned long)errors, tf,
+               (unsigned long)tot->switches, react);
     } else {
         printf("kv: workload %c, %s, affinity %.2f, %ld keys x %zu B, %d locks, alg %s "
                "(%d tournament), %s, mode %s, data %s, %dx%d\n",
@@ -674,6 +694,9 @@ int main(int argc, char **argv)
                "%.3f, local handoffs %.3f, hottest stripe %.4f of requests\n",
                achieved, (unsigned long)tot->ops[OP_READ], (unsigned long)tot->ops[OP_UPDATE],
                (unsigned long)tot->ops[OP_RMW], unserved, fair, lh, hot_share);
+        if (cfg.alg == NCL_ALG_REACTIVE)
+            printf("reactive %s: %.3f of global acquisitions on the tournament, %lu mode switches\n",
+                   react, tf, (unsigned long)tot->switches);
         printf("latency ns   p50 / p99 / p99.9: lock %lu / %lu / %lu, op %lu / %lu / %lu\n",
                (unsigned long)hist_pct(hl, 0.5), (unsigned long)hist_pct(hl, 0.99),
                (unsigned long)hist_pct(hl, 0.999), (unsigned long)hist_pct(ho, 0.5),

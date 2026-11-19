@@ -67,3 +67,18 @@ few records per stripe) the emulator must FAIL, and does (`kv_emu_detects_*`).
 
 The dev box's memory is fast, which compresses the differences; the CXL run is the
 real test. Uniform keys: all variants within 2% except the server.
+
+## Reactive lock (`-a reactive`, design §4f)
+
+`ncl_kv -a reactive [--react U:D]`: each stripe's lock starts on Lamport and switches to
+the tournament after U consecutive global acquisitions by a node that met another node,
+back after D uncontended ones. CSV columns `tournament_acq_frac` (share of global
+acquisitions on the tournament) and `mode_switches`.
+
+Dev box (4x3, cf, 2a, 1.5 s): the mode choice follows the oracle (Zipf 0.99, L=1024: 26%
+of global acquisitions on the tournament vs 28% for the 16 hottest; uniform 0.3%;
+affinity 0.9: 1%), but throughput is 6-14% below the best fixed choice everywhere: the
+extra `mode` load per global acquisition and, near the threshold, thrashing (up to 43k
+switches in 1.5 s at L=64 with affinity; 4:512 cuts that). On the dev box the fixed
+choices differ by only a few percent, so this overhead dominates; on CXL they differ by
+31% to 5x. Sweep phase `kvreact`.

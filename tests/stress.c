@@ -249,6 +249,10 @@ static void usage(const char *argv0)
             "  --debug-no-grant-wait  DEBUG: handoff --wait own without --ho grant: clear the\n"
             "                announce without waiting for a grant still on its way (must FAIL\n"
             "                on emu split with full-line writeback; see design.md §5)\n"
+            "  --react U:D   -a reactive: switch to the tournament after U contended, back after D\n"
+            "                uncontended global acquisitions (default 2:64)\n"
+            "  --debug-react 1|2  DEBUG: reactive switch without the new lock (1) or no mode\n"
+            "                re-check (2): UNSAFE, must FAIL with --react 1:1\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
@@ -290,6 +294,8 @@ int main(int argc, char **argv)
         {"debug-no-grant-wait", no_argument, 0, 9},
         {"grant-delay", required_argument, 0, 10},
         {"mix-algs", no_argument, 0, 11},
+        {"react", required_argument, 0, 12},
+        {"debug-react", required_argument, 0, 13},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -370,6 +376,14 @@ int main(int argc, char **argv)
         case 9: cfg.debug_no_grant_wait = 1; break;
         case 10: grant_delay_ns = (unsigned)atoi(optarg); break;
         case 11: cfg.alg_per_lock = 1; break;
+        case 13: ncl_debug_react = atoi(optarg); break;
+        case 12:
+            if (sscanf(optarg, "%u:%u", &ncl_react_up, &ncl_react_down) != 2 || !ncl_react_up ||
+                !ncl_react_down) {
+                usage(argv[0]);
+                return 2;
+            }
+            break;
         case 1001: cfg.mem_node = atoi(optarg) + 1; break;
         case 1002: if (ncl_cpus_set(optarg) < 0) return 2; break;
         case 1003:
