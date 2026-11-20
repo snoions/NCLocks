@@ -849,3 +849,32 @@ block).
 - Slow-path `mode` reads stay negligible (1.6% of global acquisitions).
 - With Zipf keys the reordered reactive lock now slightly beats the oracle map, also in open
   loop at 6M (p50 17.4 vs 20.5 us).
+
+## Lock-block stride (`kstride`, 2026-11-20 03:07)
+
+`results/cxl_20261120_0307/kstride.csv`: after `56d822a`; 3 reps, 69 runs, no errors.
+Uniform keys, L=1024, 16x3, cf, 2a. k ops/s (median) by meta lines per lock (stride = 64 B
+x lines), via `--pad-lines`:
+
+| stride | multiple of 512 B? | fixed layout | reactive (xy-first) | plain Lamport |
+|---|---|---|---|---|
+| 128 B, 192 B | no | | | 11142, 11136 |
+| 512 B | **yes** | | | **10457** |
+| 1024 B, 1088 B | yes, no | | | **10636**, 11054 |
+| 2048 B | **yes** | | | **10634** |
+| 2880-3008 B (45-47 lines) | no | 11131, 11106, 11053 | | |
+| **3072 B (48 lines)** | **yes** | **10418** | **10466** | **10412** |
+| 3136-3264 B (49-51 lines) | no | 11027, 11104, 11065 | 11066, 10996, 10988 | 11053 (3136) |
+| 3584 B (56 lines) | **yes** | **10453** | | |
+| 4096 B (64 lines) | **yes** | **10405** | **10428** | **10438** |
+
+- **Every stride that is a multiple of 512 B costs 4-6%; every other stride is within ~1% of
+  the best**, for all three lock types and the same code. So with such a stride every lock's
+  hot metadata lines fall on the same offsets modulo 512 B, which on this device (or its
+  interleaving) costs throughput. Pair alignment does not matter here (odd and even line
+  counts are equal), unlike on the dev box.
+- **The reactive lock's remaining Lamport-path cost was this:** at 49 lines it gets 11066,
+  0.6% below the best fixed layout (11131), against 10466 at its natural 48.
+- The scan region (Lamport's `b[]`, announce lines) has P = 16 lines per lock, a 1 KB
+  stride, in every configuration measured so far; it may carry the same penalty for all of
+  them.
