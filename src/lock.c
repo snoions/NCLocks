@@ -268,6 +268,14 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     }
     size_t lines_per_lock = base_lines + handoff_lines(c, P) + (size_t)c->pad_lines;
     size_t scan_per_lock = base_scan + handoff_scan_lines(c, P);
+    if (!c->raw_layout) {
+        /* Stride rule: avoid per-lock strides that are multiples of 512 B (8 lines),
+         * keeping even counts even. */
+        if (lines_per_lock % 8 == 0)
+            lines_per_lock += 2;
+        if (scan_per_lock && scan_per_lock % 8 == 0)
+            scan_per_lock += 2;
+    }
     size_t hdr_sz = round_line(sizeof(struct ncl_hdr));
     size_t descs_sz = round_line(sizeof(struct ncl_lock_desc) * (size_t)c->nlocks);
     size_t locks_sz = lines_per_lock * NCL_CACHELINE * (size_t)c->nlocks;

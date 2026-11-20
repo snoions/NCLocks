@@ -783,7 +783,7 @@ static uint64_t tournament_lock_mode(struct ncl_base *b, int i, struct ncl_base_
 }
 
 unsigned ncl_react_up = 8, ncl_react_down = 4, ncl_react_dwell = 64;
-int ncl_react_layout = 0;
+int ncl_react_layout = 1; /* [x][y][mode]: measured faster (docs/cxl_results.md) */
 int ncl_react_off = 0;
 
 int ncl_react_parse(const char *s)

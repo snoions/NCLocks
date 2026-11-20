@@ -232,8 +232,9 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out);
  * ncl_react_dwell acquisitions in tournament mode (>= 64). Default 8:4:64. */
 extern unsigned ncl_react_up, ncl_react_down, ncl_react_dwell;
 extern int ncl_react_off; /* 1: never switch (modes stay as initialized) */
-/* REACTIVE metadata block layout (set before ncl_sys_create): 0 = [mode][x][y][tree],
- * 1 = [x][y][mode][tree] (Lamport's x, y at the offsets of a plain Lamport block). */
+/* REACTIVE metadata block layout (set before ncl_sys_create): 1 (default) =
+ * [x][y][mode][tree] (Lamport's x, y at the offsets of a plain Lamport block),
+ * 0 = [mode][x][y][tree]. */
 extern int ncl_react_layout;
 /* "U:D[:W]" -> ncl_react_up/down/dwell (W default 64), or "off"; 0 or -1 (bad). */
 int ncl_react_parse(const char *s);

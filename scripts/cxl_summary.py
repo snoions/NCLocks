@@ -3,7 +3,7 @@
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
 Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt kv kvreact kviso
-kvbase klayout kstride (default: those whose CSV exists).
+kvbase klayout kstride kfix (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -109,6 +109,30 @@ def mt(d):
         r["p99"] = (r.p99 / 1e3).round(1)
         out.append("open loop (MT_MAIN, Poisson): k/s achieved, lock p50 / p99 us\n" + r.round(3).to_string())
     return "\n\n".join(out)
+
+
+def kfix(d):
+    """Phase kfix: the stride rule (default) vs --raw-layout."""
+    d = d.copy()
+    def lab(r):
+        if r.alg == "reactive":
+            return "reactive " + str(r.react)
+        if r.alg == "lamport":
+            return "plain lamport"
+        return "fixed top%d" % r.tournament_locks
+    d["variant"] = d.apply(lab, axis=1)
+    d["layout"] = d.raw_layout.map({0: "rule", 1: "raw"})
+    r = d.groupby(["config", "variant", "layout"]).agg(
+        lines=("lines_per_lock", "first"), thr=("achieved_rps", "median"),
+        lo=("achieved_rps", "min"), hi=("achieved_rps", "max"),
+        p50=("lock_p50", "median"), p99=("lock_p99", "median"), err=("errors", "max"))
+    for k in ("thr", "lo", "hi"):
+        r[k] = (r[k] / 1e3).round(0)
+    r["p99"] = (r.p99 / 1e3).round(1)
+    out = "k ops/s (median, min, max), lock p50 ns / p99 us; lines = meta lines per lock\n" + r.to_string()
+    if d.errors.max() > 0:
+        out += "\n!!! %d runs with KV check errors" % (d.errors > 0).sum()
+    return out
 
 
 def kstride(d):
@@ -319,7 +343,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride"]
+                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -350,6 +374,8 @@ def main():
             print(klayout(d))
         elif ph == "kstride":
             print(kstride(d))
+        elif ph == "kfix":
+            print(kfix(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()

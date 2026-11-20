@@ -49,6 +49,10 @@
 #              metadata blocks (lines per lock x 64 B), via --pad-lines: fixed per-lock layout
 #              (45 lines +0..6, 56, 64), reactive pinned to Lamport xy-first (48 +0..3, 64),
 #              plain Lamport (2 lines padded to 3, 8, 16, 17, 32, 48, 49, 64)
+#   kfix       KV, L=1024, 16x3 cf 2a: the stride rule (default) vs --raw-layout. Uniform:
+#              fixed Lamport (45 meta lines: only the scan stride changes, 16 -> 18 lines),
+#              plain Lamport, reactive pinned to Lamport (48 -> 50); Zipf: 16-hottest map,
+#              reactive 12:4:64; open loop 6M for the map and the reactive lock
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
 #              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
@@ -422,13 +426,33 @@ kviso() {
   done; done
 }
 
+kfix() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/kfix.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T v raw
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local -l 1024 ${CFG[cf_clwb]})
+  for rep in $(seq "$REPS"); do for raw in "" --raw-layout; do
+    for v in "--algmap top:0" "-a lamport" "-a reactive --react off --algmap top:0"; do
+      run "$csv" "$rep" uniform -d uniform $v $raw "${KC[@]}"
+    done
+    for v in "--algmap top:16" "-a reactive --react 12:4:64"; do
+      run "$csv" "$rep" zipf -z 0.99 $v $raw "${KC[@]}"
+    done
+  done
+  for v in "--algmap top:16" "-a reactive --react 12:4:64"; do
+    run "$csv" "$rep" open6M -z 0.99 -r 6000k $v "${KC[@]}"
+  done; done
+}
+
 kstride() {
   [ -x "$KV" ] || die "$KV not built"
   local csv=$OUT/kstride.csv
   [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
   local RUNBIN=$KV N T p
   N=${KV_NT%x*}; T=${KV_NT#*x}
-  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local -d uniform -l 1024 ${CFG[cf_clwb]})
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local -d uniform -l 1024 --raw-layout ${CFG[cf_clwb]})
   for rep in $(seq "$REPS"); do
     for p in 0 1 2 3 4 5 6 11 19; do   # 45..51, 56, 64 lines
       run "$csv" "$rep" fixed --algmap top:0 --pad-lines "$p" "${KC[@]}"
@@ -449,7 +473,7 @@ klayout() {
   [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
   local RUNBIN=$KV N T v
   N=${KV_NT%x*}; T=${KV_NT#*x}
-  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local ${CFG[cf_clwb]})
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local --raw-layout ${CFG[cf_clwb]})
   local PIN="-a reactive --react off --algmap top:0"
   for rep in $(seq "$REPS"); do
     for v in "--algmap top:0" "--algmap top:0 --pad-lines 1" "--algmap top:0 --pad-lines 3" "-a lamport" \
@@ -559,6 +583,7 @@ for ph in $PHASES; do
     kvbase) kvbase ;;
     klayout) klayout ;;
     kstride) kstride ;;
+    kfix) kfix ;;
     *) die "unknown phase $ph" ;;
   esac
 done

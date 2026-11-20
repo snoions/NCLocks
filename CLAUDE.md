@@ -116,6 +116,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   in the root's entry check, ordered after the root's flag and turn (`ncl_fence_ll`;
   one batched round trip on cached-flush). Phase 1, 2a
   and 2b. Not model-checked. Sweep phase `kvreact`.
+- Lock metadata stride rule (`src/lock.c`, design §2.1): a per-lock line count (meta or scan
+  region) that is a multiple of 8 gets 2 more lines; strides that are multiples of 512 B cost
+  4-6% on the CXL host. `cfg.raw_layout` / `ncl_kv --raw-layout` turns it off.
 - `include/ncl/data.h`, `src/data.c`: data maintenance layer (design §2.1), separate from the
   lock algorithms. A lock only reports "arrived" vs "local handoff" after acquiring and
   "departing" (with its fence before the handoff store) at release; the layer holds each

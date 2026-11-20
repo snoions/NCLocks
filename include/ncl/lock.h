@@ -173,6 +173,11 @@ struct ncl_sys_cfg {
                                0: ncl_acquire invalidates the lock's whole range when
                                the lock arrives at the node. */
     int pad_lines;          /* extra meta-region lines per lock (layout experiments) */
+    int raw_layout;         /* 1: no stride rule (layout experiments). Default: a per-lock
+                               line count (meta or scan region) that is a multiple of 8
+                               (a stride that is a multiple of 512 B, which costs 4-6% on
+                               the CXL host, docs/cxl_results.md "Lock-block stride") gets
+                               2 more lines */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;
