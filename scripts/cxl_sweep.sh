@@ -45,6 +45,10 @@
 #              L=1024: fixed Lamport (45-line blocks, padded to 46 and 48, plain 2-line), reactive
 #              pinned to Lamport with [mode][x][y] vs [x][y][mode] blocks; Zipf L=1024:
 #              16-hottest map vs reactive 12:4:64 in both layouts (closed, open 6M)
+#   kstride    KV, uniform keys, L=1024, 16x3 cf 2a: throughput vs the stride between lock
+#              metadata blocks (lines per lock x 64 B), via --pad-lines: fixed per-lock layout
+#              (45 lines +0..6, 56, 64), reactive pinned to Lamport xy-first (48 +0..3, 64),
+#              plain Lamport (2 lines padded to 3, 8, 16, 17, 32, 48, 49, 64)
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
 #              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
@@ -418,6 +422,27 @@ kviso() {
   done; done
 }
 
+kstride() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/kstride.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T p
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local -d uniform -l 1024 ${CFG[cf_clwb]})
+  for rep in $(seq "$REPS"); do
+    for p in 0 1 2 3 4 5 6 11 19; do   # 45..51, 56, 64 lines
+      run "$csv" "$rep" fixed --algmap top:0 --pad-lines "$p" "${KC[@]}"
+    done
+    for p in 0 1 2 3 16; do            # 48..51, 64 lines
+      run "$csv" "$rep" reactive -a reactive --react off --algmap top:0 --react-layout xy-first \
+        --pad-lines "$p" "${KC[@]}"
+    done
+    for p in 0 1 6 14 15 30 46 47 62; do # 2, 3, 8, 16, 17, 32, 48, 49, 64 lines
+      run "$csv" "$rep" lamport -a lamport --pad-lines "$p" "${KC[@]}"
+    done
+  done
+}
+
 klayout() {
   [ -x "$KV" ] || die "$KV not built"
   local csv=$OUT/klayout.csv
@@ -533,6 +558,7 @@ for ph in $PHASES; do
     kviso) kviso ;;
     kvbase) kvbase ;;
     klayout) klayout ;;
+    kstride) kstride ;;
     *) die "unknown phase $ph" ;;
   esac
 done

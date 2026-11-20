@@ -424,7 +424,8 @@ static void usage(const char *a0)
     "backend,mode,local_cap,meta_layout,data,nodes,threads_per_node,target_rps,achieved_rps,"  \
     "unserved_frac,lock_p50,lock_p99,lock_p999,op_p50,op_p99,op_p999,node_min_max_ratio,"      \
     "local_handoff_frac,hot_stripe_share,errors,tournament_acq_frac,mode_switches,react,"   \
-    "no_submutex,react_layout,pad_lines,lamport_slow_frac,slow_mode_reads_per_acq"
+    "no_submutex,react_layout,pad_lines,lamport_slow_frac,slow_mode_reads_per_acq,"          \
+    "lines_per_lock"
 
 int main(int argc, char **argv)
 {
@@ -582,6 +583,7 @@ int main(int argc, char **argv)
     }
     if (ncl_sys_create(&cfg) < 0)
         return 2;
+    const size_t lines_per_lock = ncl_lines_per_lock();
     if (pin) {
         int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
         ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
@@ -698,7 +700,7 @@ int main(int argc, char **argv)
     snprintf(modebuf, sizeof modebuf, "%s", ncl_mode_name(cfg.mode));
     if (csv) {
         printf("%c,%s,%.2f,%.2f,%ld,%zu,%d,%s,%d,%d,%s,%s,%d,%s,%s,%d,%d,%.0f,%.0f,%.5f,%lu,%lu,"
-               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s,%d,%s,%d,%.4f,%.4f\n",
+               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s,%d,%s,%d,%.4f,%.4f,%zu\n",
                workload, zipf ? "zipf" : "uniform", zipf ? theta : 0.0, affinity, nkeys, vbytes,
                nlocks, algmap_top >= 0 && !react_map ? "map" : ncl_alg_name(cfg.alg), algmap_top, ntour,
                ncl_backend_name(cfg.backend), modebuf,
@@ -711,7 +713,8 @@ int main(int argc, char **argv)
                (unsigned long)tot->switches, react, cfg.no_submutex,
                ncl_react_layout ? "xy-first" : "mode-first", cfg.pad_lines,
                tot->global_acq ? (double)tot->lamport_slow / (double)tot->global_acq : 0.0,
-               tot->global_acq ? (double)tot->slow_mode_reads / (double)tot->global_acq : 0.0);
+               tot->global_acq ? (double)tot->slow_mode_reads / (double)tot->global_acq : 0.0,
+               lines_per_lock);
     } else {
         printf("kv: workload %c, %s, affinity %.2f, %ld keys x %zu B, %d locks, alg %s "
                "(%d tournament), %s, mode %s, data %s, %dx%d\n",

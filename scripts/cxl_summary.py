@@ -3,7 +3,7 @@
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
 Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt kv kvreact kviso
-kvbase klayout (default: those whose CSV exists).
+kvbase klayout kstride (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -109,6 +109,22 @@ def mt(d):
         r["p99"] = (r.p99 / 1e3).round(1)
         out.append("open loop (MT_MAIN, Poisson): k/s achieved, lock p50 / p99 us\n" + r.round(3).to_string())
     return "\n\n".join(out)
+
+
+def kstride(d):
+    """Phase kstride: throughput vs lock-block stride."""
+    d = d.copy()
+    d["stride_B"] = d.lines_per_lock * 64
+    r = d.groupby(["config", "lines_per_lock", "stride_B"]).agg(
+        n=("achieved_rps", "size"), thr=("achieved_rps", "median"), lo=("achieved_rps", "min"),
+        hi=("achieved_rps", "max"), p50=("lock_p50", "median"), err=("errors", "max"))
+    for k in ("thr", "lo", "hi"):
+        r[k] = (r[k] / 1e3).round(0)
+    r["stride_mod_1K"] = r.index.get_level_values("stride_B") % 1024
+    out = "k ops/s (median, min, max) by lines per lock (stride = 64 B x lines)\n" + r.to_string()
+    if d.errors.max() > 0:
+        out += "\n!!! %d runs with KV check errors" % (d.errors > 0).sum()
+    return out
 
 
 def klayout(d):
@@ -303,7 +319,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout"]
+                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -332,6 +348,8 @@ def main():
             print(kvbase(d))
         elif ph == "klayout":
             print(klayout(d))
+        elif ph == "kstride":
+            print(kstride(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()

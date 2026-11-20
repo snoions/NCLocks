@@ -299,6 +299,8 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints);
 /* Static configuration (read-only after create). */
 const struct ncl_sys_cfg *ncl_sys_cfg(void);
 int ncl_participants(void);
+/* Meta-region lines per lock (the stride between lock blocks / 64 B). */
+size_t ncl_lines_per_lock(void);
 /* SERVER in MODE_HANDOFF: effective chain window (succ[] lines per lock), else 0. */
 int ncl_chain_window(void);
 

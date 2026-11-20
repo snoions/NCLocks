@@ -859,6 +859,7 @@ int ncl_chain_window(void)
     return cfg.alg == NCL_ALG_SERVER && cfg.mode == NCL_MODE_HANDOFF ? (int)ncl_srv_chain_lines(&cfg) : 0;
 }
 int ncl_participants(void) { return hdr ? hdr->participants : 0; }
+size_t ncl_lines_per_lock(void) { return hdr ? (size_t)hdr->lines_per_lock : 0; }
 
 ncl_line_t *ncl_user_line(size_t i)
 {
