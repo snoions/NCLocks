@@ -818,3 +818,34 @@ Open loop, Zipf 0.99, L=1024 (lock p50 / p99 us): coherent pthread 0.35 / 0.9 at
   its capacity 2.4x higher (~16M vs ~6.9M).
 - The non-coherent reactive lock again matches the oracle map (6888 vs 6852 at Zipf
   L=1024).
+
+## Metadata layout of the reactive lock (`klayout`, 2026-11-20 02:53)
+
+`results/cxl_20261120_0253/klayout.csv`: after `34eb4ed`; 3 reps, 33 runs, no errors.
+16x3, cf, 2a, L=1024. k ops/s (median); block = metadata lines per lock (stride = 64 B x
+block).
+
+| uniform keys | block (stride) | x, y | k ops/s |
+|---|---|---|---|
+| fixed per-lock layout | 45 (2880 B) | every other block mid-pair | 11097 |
+| fixed, padded by 1 | 46 (2944 B) | one 128 B pair | 11072 |
+| plain Lamport | 2 (128 B) | one pair | 11021 |
+| **fixed, padded by 3** | **48 (3072 B)** | one pair | **10618 (-4.3%)** |
+| reactive pinned to Lamport, [mode][x][y] | 48 (3072 B) | split | 10362 (-6.6%) |
+| reactive pinned to Lamport, [x][y][mode] | 48 (3072 B) | one pair | 10567 (-4.8%) |
+
+| Zipf 0.99 | k ops/s | open loop 6M p50 / p99 (us) |
+|---|---|---|
+| fixed 16-hottest map (45-line blocks) | 6913 | 20.5 / 164 |
+| reactive 12:4:64, [mode][x][y] | 6888 | |
+| reactive 12:4:64, [x][y][mode] | **6944** | **17.4 / 164** |
+
+- **On CXL it is the stride, not the pair alignment** (the opposite of the dev box): 45-,
+  46- and 2-line blocks are within 0.7%, while 48-line blocks (3072 B, a multiple of 1 KB)
+  cost 4.3% even with x and y in one pair. The reactive block is 48 lines, so most of its
+  Lamport-path cost is this stride; the [x][y][mode] order recovers another 2 points.
+  Likely the device's interleaving: with a 3 KB stride every lock's hot lines fall on the
+  same offsets modulo 1 KB.
+- Slow-path `mode` reads stay negligible (1.6% of global acquisitions).
+- With Zipf keys the reordered reactive lock now slightly beats the oracle map, also in open
+  loop at 6M (p50 17.4 vs 20.5 us).
