@@ -118,3 +118,16 @@ coherent memory (isolates the cost of non-coherence for the same algorithms); an
 non-coherent reactive lock and 16-hottest map on cf.
 
 Dev box (4x3, single short runs): coherent 21-43M ops/s, non-coherent cf 10-12M (2.2-3.6x).
+
+### Metadata layout: Lamport's x and y in one 128-byte pair (`klayout`)
+
+The reactive lock's Lamport path cost ~6% on CXL with no extra metadata access. Dev box
+(4x3, cf, uniform keys, L=1024): the fast variants all keep Lamport's `x` and `y` in one
+128-byte-aligned pair of lines; the slow ones split them. Reactive pinned to Lamport:
+[mode][x][y] 11.6M, [x][y][mode] (`--react-layout xy-first`) 12.3M; plain Lamport (2-line
+blocks) 12.35M; fixed per-lock layout (45-line blocks, so every other block starts
+mid-pair) 11.9-12.0M, padded to 46 or 48 lines 12.3M. One line of padding helps as much as
+three, so it is the pair alignment (likely the adjacent-line prefetcher), not the stride.
+Slow-path `mode` reads are negligible (0.3% of global acquisitions). With Zipf keys the
+xy-first reactive lock matches the 16-hottest map (11.17M vs 11.14M). Sweep phase
+`klayout` measures it on CXL.

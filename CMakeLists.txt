@@ -349,6 +349,22 @@ foreach(m phase1 local handoff)
   add_test(NAME stress_reactive_cf_${m}_fast_mode
     COMMAND ncl_stress -a reactive -b cached-flush -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} --react 0:64 --mode-delay 3000 --timeout 90)
 endforeach()
+# The xy-first block layout ([x][y][mode][tree]): safe variants and two unsafe ones.
+foreach(be emu cached-flush)
+  foreach(m phase1 local)
+    add_test(NAME stress_reactive_xyfirst_${be}_${m}_toggle_late
+      COMMAND ncl_stress -a reactive -b ${be} -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} --react-layout xy-first --debug-react 8 --lamport-delay 3000 --timeout 90)
+    add_test(NAME stress_reactive_xyfirst_${be}_${m}_fast_mode
+      COMMAND ncl_stress -a reactive -b ${be} -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} --react-layout xy-first --react 0:64 --mode-delay 3000 --timeout 90)
+  endforeach()
+endforeach()
+add_test(NAME reactive_xyfirst_detects_no_new_lock
+  COMMAND ncl_stress -a reactive -b emu -n 8 -t 2 -l 2 -i 50000 -d 2000 --react-layout xy-first --react 0:64 --debug-react 1 --mode-delay 3000 --timeout 40)
+add_test(NAME reactive_xyfirst_detects_no_invalid
+  COMMAND ncl_stress -a reactive -b emu -n 8 -t 2 -l 2 -i 50000 -d 2000 --react-layout xy-first --debug-react 12 --timeout 20)
+set_tests_properties(reactive_xyfirst_detects_no_new_lock reactive_xyfirst_detects_no_invalid PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kv_emu_reactive_pinned_xyfirst COMMAND ncl_kv -b emu -a reactive -M local --algmap top:4 --react off --react-layout xy-first ${KV_ARGS})
+add_test(NAME kv_emu_reactive_xyfirst_0_64 COMMAND ncl_kv -b emu -a reactive -M local --react 0:64 --react-layout xy-first ${KV_ARGS})
 add_test(NAME reactive_emu_detects_mode_before_flag
   COMMAND ncl_stress -a reactive -b emu -n 8 -t 2 -l 1 -i 50000 -d 2000 --react 0:64 --debug-react 32 --mode-delay 5000 --timeout 20)
 add_test(NAME reactive_cf_detects_mode_before_flag

@@ -172,6 +172,7 @@ struct ncl_sys_cfg {
                                invalidated) and release with dirty hints (mandatory).
                                0: ncl_acquire invalidates the lock's whole range when
                                the lock arrives at the node. */
+    int pad_lines;          /* extra meta-region lines per lock (layout experiments) */
     size_t data_size;       /* bytes of protected-data region */
     size_t user_meta_lines; /* extra uncached lines for applications/tests */
     uint32_t dev_lat_ns;

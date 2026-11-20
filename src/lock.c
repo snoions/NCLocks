@@ -262,7 +262,11 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         base_lines = a > b ? a : b;
         base_scan = sa > sb ? sa : sb;
     }
-    size_t lines_per_lock = base_lines + handoff_lines(c, P);
+    if (c->pad_lines < 0 || c->pad_lines > 1024) {
+        fprintf(stderr, "ncl: pad_lines must be in [0, 1024]\n");
+        return -1;
+    }
+    size_t lines_per_lock = base_lines + handoff_lines(c, P) + (size_t)c->pad_lines;
     size_t scan_per_lock = base_scan + handoff_scan_lines(c, P);
     size_t hdr_sz = round_line(sizeof(struct ncl_hdr));
     size_t descs_sz = round_line(sizeof(struct ncl_lock_desc) * (size_t)c->nlocks);

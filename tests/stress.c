@@ -261,6 +261,7 @@ static void usage(const char *argv0)
             "                16 no slow-path re-check (with --lamport-delay)\n"
             "  --lamport-delay NS  DEBUG: Lamport spins between reading y == 0 and storing y\n"
             "  --mode-delay NS  DEBUG: reactive tournament acquirer spins before reading mode\n"
+            "  --react-layout mode-first|xy-first  reactive lock block layout\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
@@ -306,6 +307,7 @@ int main(int argc, char **argv)
         {"debug-react", required_argument, 0, 13},
         {"lamport-delay", required_argument, 0, 14},
         {"mode-delay", required_argument, 0, 15},
+        {"react-layout", required_argument, 0, 16},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -389,6 +391,11 @@ int main(int argc, char **argv)
         case 13: ncl_debug_react = atoi(optarg); break;
         case 14: lamport_delay_ns = (unsigned)atoi(optarg); break;
         case 15: mode_delay_ns = (unsigned)atoi(optarg); break;
+        case 16:
+            if (!strcmp(optarg, "xy-first")) ncl_react_layout = 1;
+            else if (!strcmp(optarg, "mode-first")) ncl_react_layout = 0;
+            else { usage(argv[0]); return 2; }
+            break;
         case 12:
             if (ncl_react_parse(optarg) < 0) {
                 usage(argv[0]);

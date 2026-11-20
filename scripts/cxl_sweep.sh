@@ -41,6 +41,10 @@
 #              Coherent: pthread mutex per stripe (-m: no submutex; and with it), tournament
 #              and reactive (2a); cf: reactive 12:4:64 and the 16-hottest map (2a). Zipf 0.99
 #              L=1024 and 64, uniform L=1024; open loop up to KVBASE_RATES
+#   klayout    KV, 16x3 cf: why the reactive lock's Lamport path costs ~6% on CXL. Uniform
+#              L=1024: fixed Lamport (45-line blocks, padded to 46 and 48, plain 2-line), reactive
+#              pinned to Lamport with [mode][x][y] vs [x][y][mode] blocks; Zipf L=1024:
+#              16-hottest map vs reactive 12:4:64 in both layouts (closed, open 6M)
 #   conc       ncl_memconc: aggregate throughput of T threads issuing one access pattern
 #              (uc load/store/fence/Dekker, same-line load, full-line clwb, 8- vs 64-byte
 #              movnti) on uc (pool on MEMNODE), cf on MEMNODE and cf on CPUNODE (DRAM)
@@ -414,6 +418,29 @@ kviso() {
   done; done
 }
 
+klayout() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/klayout.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T v
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C -M local ${CFG[cf_clwb]})
+  local PIN="-a reactive --react off --algmap top:0"
+  for rep in $(seq "$REPS"); do
+    for v in "--algmap top:0" "--algmap top:0 --pad-lines 1" "--algmap top:0 --pad-lines 3" "-a lamport" \
+             "$PIN --react-layout mode-first" "$PIN --react-layout xy-first"; do
+      run "$csv" "$rep" uniform -d uniform -l 1024 $v "${KC[@]}"
+    done
+    for v in "--algmap top:16" "-a reactive --react 12:4:64 --react-layout mode-first" \
+             "-a reactive --react 12:4:64 --react-layout xy-first"; do
+      run "$csv" "$rep" zipf -z 0.99 -l 1024 $v "${KC[@]}"
+    done
+    for v in "--algmap top:16" "-a reactive --react 12:4:64 --react-layout xy-first"; do
+      run "$csv" "$rep" open6M -z 0.99 -l 1024 -r 6000k $v "${KC[@]}"
+    done
+  done
+}
+
 kvbase() {
   [ -x "$KV" ] || die "$KV not built"
   local csv=$OUT/kvbase.csv
@@ -505,6 +532,7 @@ for ph in $PHASES; do
     kvreact) kvreact ;;
     kviso) kviso ;;
     kvbase) kvbase ;;
+    klayout) klayout ;;
     *) die "unknown phase $ph" ;;
   esac
 done

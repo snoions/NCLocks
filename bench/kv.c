@@ -81,6 +81,7 @@ struct result {
     uint64_t ops[OP__N], completed, offered, unserved, errors, updates;
     uint64_t local_handoffs, acquires;
     uint64_t global_acq, tour_acq, switches; /* REACTIVE: mode mix and switches */
+    uint64_t slow_mode_reads, lamport_slow;
     struct hist h[H__N];
 };
 
@@ -348,6 +349,8 @@ static int node_main(int node, int wfd)
     tot->global_acq = st.path[NCL_PATH_TOURNAMENT] + st.path[NCL_PATH_LAMPORT_FAST] +
                       st.path[NCL_PATH_LAMPORT_SLOW];
     tot->switches = st.base.react_up + st.base.react_down;
+    tot->slow_mode_reads = st.base.react_slow_mode_reads;
+    tot->lamport_slow = st.path[NCL_PATH_LAMPORT_SLOW];
     int rc = write_full(wfd, tot, sizeof *tot) < 0 ? 3 : 0;
     close(wfd);
     return rc;
@@ -407,6 +410,8 @@ static void usage(const char *a0)
             "  --full        conservative data maintenance (whole stripe) instead of precise\n"
             "  -c NS         extra critical-section time    -s SECS -W SECS (2, 0.2)\n"
             "  -r RATE       open loop, Poisson, aggregate req/s (k/M ok); default closed loop\n"
+            "  --react-layout mode-first|xy-first  reactive lock block layout (mode-first)\n"
+            "  --pad-lines N extra metadata lines per lock (layout experiments)\n"
             "  -m            no node-local submutex: every thread is a global participant\n"
             "                (Phase 1 only; with -b coherent -a pthread: one plain mutex per stripe)\n"
             "  -P            don't pin    -C one CSV row    -H CSV header\n"
@@ -419,7 +424,7 @@ static void usage(const char *a0)
     "backend,mode,local_cap,meta_layout,data,nodes,threads_per_node,target_rps,achieved_rps,"  \
     "unserved_frac,lock_p50,lock_p99,lock_p999,op_p50,op_p99,op_p999,node_min_max_ratio,"      \
     "local_handoff_frac,hot_stripe_share,errors,tournament_acq_frac,mode_switches,react,"   \
-    "no_submutex"
+    "no_submutex,react_layout,pad_lines,lamport_slow_frac,slow_mode_reads_per_acq"
 
 int main(int argc, char **argv)
 {
@@ -436,6 +441,8 @@ int main(int argc, char **argv)
                                  {"wb", required_argument, 0, 1005},
                                  {"debug", required_argument, 0, 1006},
                                  {"react", required_argument, 0, 1007},
+                                 {"react-layout", required_argument, 0, 1008},
+                                 {"pad-lines", required_argument, 0, 1009},
                                  {0, 0, 0, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "n:t:l:k:V:w:d:z:F:a:M:K:b:U:c:s:W:r:mPCHh", lo, NULL)) != -1) {
@@ -479,6 +486,12 @@ int main(int argc, char **argv)
             algmap_top = atoi(optarg + 4);
             break;
         case 1002: full = 1; break;
+        case 1008:
+            if (!strcmp(optarg, "xy-first")) ncl_react_layout = 1;
+            else if (!strcmp(optarg, "mode-first")) ncl_react_layout = 0;
+            else { usage(argv[0]); return 2; }
+            break;
+        case 1009: cfg.pad_lines = atoi(optarg); break;
         case 1007:
             if (ncl_react_parse(optarg) < 0) { usage(argv[0]); return 2; }
             break;
@@ -637,6 +650,8 @@ int main(int argc, char **argv)
         tot->global_acq += nr->global_acq;
         tot->tour_acq += nr->tour_acq;
         tot->switches += nr->switches;
+        tot->slow_mode_reads += nr->slow_mode_reads;
+        tot->lamport_slow += nr->lamport_slow;
         for (int h = 0; h < H__N; h++)
             hist_merge(&tot->h[h], &nr->h[h]);
         close(rfd[n]);
@@ -683,7 +698,7 @@ int main(int argc, char **argv)
     snprintf(modebuf, sizeof modebuf, "%s", ncl_mode_name(cfg.mode));
     if (csv) {
         printf("%c,%s,%.2f,%.2f,%ld,%zu,%d,%s,%d,%d,%s,%s,%d,%s,%s,%d,%d,%.0f,%.0f,%.5f,%lu,%lu,"
-               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s,%d\n",
+               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s,%d,%s,%d,%.4f,%.4f\n",
                workload, zipf ? "zipf" : "uniform", zipf ? theta : 0.0, affinity, nkeys, vbytes,
                nlocks, algmap_top >= 0 && !react_map ? "map" : ncl_alg_name(cfg.alg), algmap_top, ntour,
                ncl_backend_name(cfg.backend), modebuf,
@@ -693,7 +708,10 @@ int main(int argc, char **argv)
                (unsigned long)hist_pct(hl, 0.99), (unsigned long)hist_pct(hl, 0.999),
                (unsigned long)hist_pct(ho, 0.5), (unsigned long)hist_pct(ho, 0.99),
                (unsigned long)hist_pct(ho, 0.999), fair, lh, hot_share, (unsigned long)errors, tf,
-               (unsigned long)tot->switches, react, cfg.no_submutex);
+               (unsigned long)tot->switches, react, cfg.no_submutex,
+               ncl_react_layout ? "xy-first" : "mode-first", cfg.pad_lines,
+               tot->global_acq ? (double)tot->lamport_slow / (double)tot->global_acq : 0.0,
+               tot->global_acq ? (double)tot->slow_mode_reads / (double)tot->global_acq : 0.0);
     } else {
         printf("kv: workload %c, %s, affinity %.2f, %ld keys x %zu B, %d locks, alg %s "
                "(%d tournament), %s, mode %s, data %s, %dx%d\n",

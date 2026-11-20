@@ -129,6 +129,7 @@ struct ncl_base_stats {
     uint64_t react_up;    /* REACTIVE: switched Lamport -> tournament */
     uint64_t react_down;  /* REACTIVE: switched tournament -> Lamport */
     uint64_t react_stale; /* REACTIVE: acquired the wrong mode's lock, retried */
+    uint64_t react_slow_mode_reads; /* REACTIVE: mode re-reads after a Lamport slow-path success */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -231,6 +232,9 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out);
  * ncl_react_dwell acquisitions in tournament mode (>= 64). Default 8:4:64. */
 extern unsigned ncl_react_up, ncl_react_down, ncl_react_dwell;
 extern int ncl_react_off; /* 1: never switch (modes stay as initialized) */
+/* REACTIVE metadata block layout (set before ncl_sys_create): 0 = [mode][x][y][tree],
+ * 1 = [x][y][mode][tree] (Lamport's x, y at the offsets of a plain Lamport block). */
+extern int ncl_react_layout;
 /* "U:D[:W]" -> ncl_react_up/down/dwell (W default 64), or "off"; 0 or -1 (bad). */
 int ncl_react_parse(const char *s);
 /* DEBUG bits (ncl_stress --debug-react): 1 = switch to the tournament without

@@ -110,9 +110,14 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
     case NCL_ALG_PTHREAD:
         b->mtx = (pthread_mutex_t *)(void *)lines;
         break;
-    case NCL_ALG_REACTIVE: /* [mode][x, y][tree]; b[] in scan */
-        b->mode = lines;
-        b->lam = lines + 1;
+    case NCL_ALG_REACTIVE: /* [mode][x, y][tree] or (ncl_react_layout) [x, y][mode][tree]; b[] in scan */
+        if (ncl_react_layout) {
+            b->lam = lines;
+            b->mode = lines + lam_lines(P);
+        } else {
+            b->mode = lines;
+            b->lam = lines + 1;
+        }
         b->lam_b = scan;
         b->tree = lines + 1 + lam_lines(P);
         /* Start from the current mode (set by the creator, or 0). */
@@ -223,6 +228,8 @@ start:
             NCL_STAT(st->lamport_retries++);
             goto start;
         }
+        if (b->alg == NCL_ALG_REACTIVE && !takeover)
+            NCL_STAT(st->react_slow_mode_reads++);
         if (b->alg == NCL_ALG_REACTIVE && !takeover && !(ncl_debug_react & 16) &&
             ncl_uc_load(b->mode) == 1) {
             /* Our y overwrote RX_INVALID: restore it and go to the tournament. */
@@ -776,6 +783,7 @@ static uint64_t tournament_lock_mode(struct ncl_base *b, int i, struct ncl_base_
 }
 
 unsigned ncl_react_up = 8, ncl_react_down = 4, ncl_react_dwell = 64;
+int ncl_react_layout = 0;
 int ncl_react_off = 0;
 
 int ncl_react_parse(const char *s)
@@ -894,8 +902,9 @@ static void reactive_unlock(struct ncl_base *b, int i)
 void ncl_base_reactive_set_mode(ncl_line_t *lines, int P, int mode)
 {
     (void)P;
-    ncl_uc_store(&lines[0], mode ? 1 : 0);    /* mode */
-    ncl_uc_store(&lines[2], mode ? RX_INVALID : 0); /* Lamport's y: [mode][x][y] */
+    /* [mode][x][y] or (ncl_react_layout) [x][y][mode] */
+    ncl_uc_store(&lines[ncl_react_layout ? 2 : 0], mode ? 1 : 0);          /* mode */
+    ncl_uc_store(&lines[ncl_react_layout ? 1 : 2], mode ? RX_INVALID : 0); /* Lamport's y */
     ncl_fence();
 }
 
