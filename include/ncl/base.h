@@ -31,6 +31,11 @@
  *                   over the INVALID Lamport lock) and writing `mode`. Switches
  *                   on the rate of cross-node contention
  *                   (ncl_base_stats.contended). NOT model-checked.
+ *   BAKERY          Flat bakery over all P participants with the choosing
+ *                   flag merged into the ticket (design §4g, g3/g5): one
+ *                   single-writer word per participant, slot[i] = {choosing
+ *                   (bit 63), ticket}; ~4 rounds at any P, FCFS. Waiters
+ *                   poll only their predecessor (g6). NOT model-checked.
  *   PTHREAD         Reference baseline, NOT a non-coherent algorithm: a
  *                   process-shared pthread_mutex_t (futex, i.e. coherent
  *                   cross-node atomics) in the lock's first metadata line.
@@ -58,6 +63,7 @@ typedef enum {
     NCL_ALG_AKSRV = 6,
     NCL_ALG_PTHREAD = 7,
     NCL_ALG_REACTIVE = 8,
+    NCL_ALG_BAKERY = 9,
 } ncl_alg_t;
 
 /* (e)-style: fast path + lock-server slow path holding the top SLOW side. */
@@ -76,6 +82,8 @@ enum {
     NCL_PATH_LOCAL_HANDOFF,    /* MODE_LOCAL/HANDOFF: submutex + global ownership passed in-node */
     NCL_PATH_GLOBAL_HANDOFF,   /* MODE_HANDOFF: owner field handed to this node by the releaser */
     NCL_PATH_PTHREAD,          /* PTHREAD baseline */
+    NCL_PATH_BAKERY_FAST,      /* BAKERY: nobody blocked us after round 4 */
+    NCL_PATH_BAKERY_WAIT,      /* BAKERY: waited on at least one other participant */
     NCL_PATH__COUNT,
 };
 
@@ -105,6 +113,7 @@ struct ncl_base {
     int rx_lastm;      /* REACTIVE, holder: mode at this node's previous global acquisition */
     int rx_inval;      /* REACTIVE, holder: switched to the tournament, so release the
                           Lamport lock as INVALID */
+    ncl_line_t *bak;   /* BAKERY: slot[0..P-1] (scan region) */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -130,6 +139,9 @@ struct ncl_base_stats {
     uint64_t react_down;  /* REACTIVE: switched tournament -> Lamport */
     uint64_t react_stale; /* REACTIVE: acquired the wrong mode's lock, retried */
     uint64_t react_slow_mode_reads; /* REACTIVE: mode re-reads after a Lamport slow-path success */
+    uint64_t bak_choosing_seen; /* BAKERY: a blocker was in its doorway (choosing) when read */
+    uint64_t bak_pred_polls;    /* BAKERY: loads of the predecessor's slot while waiting */
+    uint64_t bak_rescans;       /* BAKERY: batched re-reads of the remaining blockers */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -154,7 +166,7 @@ int ncl_base_init_shared(ncl_alg_t alg, ncl_line_t *lines);
  * state a switch leaves). */
 void ncl_base_reactive_set_mode(ncl_line_t *lines, int P, int mode);
 
-/* LAMPORT/TOURNAMENT/HYBRID/AK/PTHREAD only. Acquire as participant i; returns the
+/* LAMPORT/TOURNAMENT/HYBRID/AK/REACTIVE/BAKERY/PTHREAD only. Acquire as participant i; returns the
  * NCL_PATH_* taken. Release with the value ncl_base_lock returned. */
 int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st);
 void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats *st);
@@ -252,6 +264,17 @@ extern int ncl_debug_react;
  * spins between acquiring and reading `mode`. Bit 16 of
  * ncl_debug_react skips the slow-path mode re-check that handles it (UNSAFE). */
 extern uint64_t ncl_debug_lamport_delay, ncl_debug_mode_delay;
+
+/* DEBUG bits (ncl_stress --debug-bakery), each UNSAFE: 1 = skip the choosing
+ * store (round 1), 2 = ignore choosing in the wait. ncl_debug_bakery_delay
+ * (--bakery-delay): cycles spun between reading the tickets (round 2) and
+ * publishing ours (round 3), which widens the doorway. */
+extern int ncl_debug_bakery;
+extern uint64_t ncl_debug_bakery_delay;
+/* BAKERY wait (ncl_bench/ncl_stress --bakery-poll): 0 = poll the predecessor
+ * (default, design §4g g6), 1 = re-read every remaining blocker on each poll
+ * (ablation). */
+extern int ncl_bakery_poll_all;
 
 /* Exponential backoff for spin loops (pause iterations, capped). */
 extern unsigned ncl_backoff_cap;

@@ -498,3 +498,45 @@ add_test(NAME cpus_rejects_bad_list
 set_tests_properties(cpus_rejects_bad_list PROPERTIES WILL_FAIL TRUE)
 add_test(NAME stress_tournament_emu_n24
   COMMAND ncl_stress -a tournament -b emu -n 24 -t 1 -l 2 -i 5000 --timeout 100)
+# Flat merged bakery (-a bakery, design §4g g3/g5/g6): every backend, the split layout,
+# each mode, the ablation, and a widened doorway (--bakery-delay). Dropping the choosing
+# store (1) or ignoring choosing in the wait (2) must FAIL with the widened doorway.
+foreach(be emu cached-flush coherent uc)
+  add_test(NAME stress_bakery_${be}
+    COMMAND ncl_stress -a bakery -b ${be} -n 4 -t 2 -l 3 -i 20000 --timeout 100)
+  set_tests_properties(stress_bakery_${be} PROPERTIES SKIP_RETURN_CODE 77)
+  if(be STREQUAL "uc")
+    set_tests_properties(stress_bakery_uc PROPERTIES RESOURCE_LOCK ncl_uc_device)
+  endif()
+endforeach()
+add_test(NAME stress_bakery_cached-flush_batch_n8
+  COMMAND ncl_stress -a bakery -b cached-flush -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+add_test(NAME stress_bakery_emu_nosub
+  COMMAND ncl_stress -a bakery -b emu -n 3 -t 3 -l 2 -i 10000 -m --timeout 100)
+add_test(NAME stress_bakery_emu_precise
+  COMMAND ncl_stress -a bakery -b emu -n 4 -t 2 -l 3 -i 20000 -H --timeout 100)
+foreach(be emu uc)
+  foreach(m phase1 local handoff)
+    add_test(NAME stress_bakery_${be}_split_${m}
+      COMMAND ncl_stress -a bakery -b ${be} -U split -n 6 -t 2 -l 3 -i 20000 -d 2000 -M ${m} -K 1 --timeout 100)
+    if(be STREQUAL "uc")
+      set_tests_properties(stress_bakery_uc_split_${m} PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+    endif()
+  endforeach()
+endforeach()
+foreach(m phase1 local handoff)
+  add_test(NAME stress_bakery_emu_${m}_doorway
+    COMMAND ncl_stress -a bakery -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 -M ${m} --bakery-delay 3000 --timeout 200)
+endforeach()
+add_test(NAME bakery_emu_detects_no_choosing
+  COMMAND ncl_stress -a bakery -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --debug-bakery 1 --timeout 40)
+add_test(NAME bakery_emu_detects_ignore_choosing
+  COMMAND ncl_stress -a bakery -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --debug-bakery 2 --timeout 40)
+set_tests_properties(bakery_emu_detects_no_choosing bakery_emu_detects_ignore_choosing PROPERTIES WILL_FAIL TRUE)
+# Ablation of predecessor polling (--bakery-poll all: every poll re-reads all blockers).
+add_test(NAME stress_bakery_emu_pollall_doorway
+  COMMAND ncl_stress -a bakery -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --bakery-poll all --timeout 200)
+add_test(NAME stress_bakery_cached-flush_pollall_n8
+  COMMAND ncl_stress -a bakery -b cached-flush -n 8 -t 2 -l 2 -i 10000 --bakery-poll all --timeout 100)
+add_test(NAME kv_emu_bakery_local COMMAND ncl_kv -b emu -a bakery -M local ${KV_ARGS})
+add_test(NAME kv_emu_bakery_handoff COMMAND ncl_kv -b emu -a bakery -M handoff ${KV_ARGS})

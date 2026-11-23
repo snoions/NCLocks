@@ -55,6 +55,12 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   model-checked; `docs/hybrid.md`.
 - `-a aksrv`: (e) with AK's fast path; the home server runs AK's reset when its queue drains,
   while holding the top SLOW side. Not model-checked; `docs/hybrid.md`.
+- `-a bakery` (design §4g, g3/g5/g6): flat bakery over all N with the choosing flag merged
+  into the ticket (`slot[i]` = choosing bit 63 + ticket, one scan-region line each, single
+  writer), ~4 rounds at any N on cf, FCFS. Waiters poll only their predecessor until its
+  slot changes, then re-read the remaining blockers in one batch; spin then `sched_yield()`
+  (FCFS convoys under oversubscription). `--debug-bakery 1|2` with `--bakery-delay` must
+  FAIL. Not model-checked. Biased tournaments (§4g g1, g2, g7, g8) are not implemented.
 - `-a pthread`: reference baseline, a process-shared `pthread_mutex_t` (futex, i.e. coherent
   cross-node atomics) in the lock's metadata line. `-b coherent` and Phase 1 only (rejected
   elsewhere: on uc it would be x86 bus locks, meaningless for CXL); `-m` gives every thread

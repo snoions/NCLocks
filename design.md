@@ -356,6 +356,73 @@ Motivation (`docs/cxl_results.md`, "KV store"): with several threads per node, c
 - **Tested:** stress in every mode and layout at 8:4, with a switch on every acquisition (`--debug-react 8`), that plus a widened late-store window (`--lamport-delay`), and 0:64 with a widened mode-check window (`--mode-delay`). Each removed step fails: switching without taking the tournament (mutex violations), no `mode` re-check, no INVALID release, no slow-path re-check, and loading `mode` before the root's flag and turn with a gap between them (hangs) (ctests `stress_reactive_*`, `reactive_*_detects_*`). Without an artificial gap the reversed order is not observable: the switcher stores `mode` a whole critical section before its release. **Not model-checked.**
 - **Measured, first version** (consecutive-event trigger, `mode` read on every acquisition; `docs/cxl_results.md`): 14-30% below the per-lock oracle on CXL; the version above removes both causes.
 
+### (g) Biased tournaments (Open, not implemented, not model-checked)
+
+Goal: a node that held a lock recently re-acquires it through fewer arbitration levels, while cold nodes keep a fair arbitration point. Every design changes the arbitration structure only while holding the lock, with the departing owner's cooperation. Reshaping the tree while nodes are mid-path is rejected: it needs quiescence and the same cooperative revocation anyway. Baseline is Phase 2a (cohort passing already covers a dominant node with waiting threads), so the bias pays only when a node re-acquires after its local queue drained or after the cap `-K` forced a release. Measured upper bound on cf: a Peterson level costs ~0.5-2 us (tournament 8 -> 10 us from 4 to 5 levels, `docs/cxl_results.md`); compare also with Lamport, AK and the reactive lock (§4f).
+
+**Shared rules.** Single writer per line, one line per variable. Batch invalidations and loads; fence only where the algorithm orders. Recency is tracked node-locally; shared metadata is written only on admission, eviction or drop, never on every acquisition. Retained or owned shared state needs a node-side lease, because without cross-node atomics no other node can revoke it. The lease state is node-local (`PARKED`/`HELD`/`RELEASING`-style word changed with coherent CAS, as in §7 "Lease parking"), so a node's sweeper never drops state while one of its threads re-enters on it.
+
+**(g1) Prefix retention** on the balanced Peterson tournament.
+- Release: clear the root first, then levels top-down with a store-store fence between levels (as §4b), keeping a contiguous leaf-side prefix 1..j. Next acquire starts at level j+1.
+- **Contiguity is a safety rule.** Keep only the levels below the lowest level with a waiter: dropping level i while keeping a higher level lets the sibling that wins level i climb onto a side still held above (two nodes on one side).
+- Release-time check: one batched load of the opposing flags of the retained levels; drop every level at and above the lowest one with a waiter.
+- **Idle retainer.** A node blocked on a retained level waits until the retainer drops; only the retainer may write its flags. A per-node sweeper polls the opposing flags of its retained levels and drops on a waiter or on lease expiry. Its poll period bounds cold-node latency and sets background traffic (the (e) poll-backoff trade-off): sweep it, report open-loop p99.
+- The root is never retained (retaining it is holding the lock).
+
+**(g2) Hot-slot subtree under an asymmetric root.** Root Peterson: one side a k-slot Peterson subtree, the other the full cold tree (the §4d/§4e top-lock shape). A node claims a free slot only while holding the lock (admit on a second recent hit), and evicts itself after clearing its hot-tree state; one path per acquisition. Hot flags are cleared at every release, so an idle slot owner delays only admissions, never acquisitions. Root alternation guarantees the cold side every other acquisition under contention.
+
+**(g3) n-ary root: bakery with the choosing flag merged into the ticket.** The root becomes an n-way mutex over the two subtree winners and r recent-holder seats (leased as in g2). Seat i owns one word `slot[i] = {choosing (bit 63), ticket (bits 0-62)}`, one line per slot, single writer:
+
+```
+acquire(i):
+  slot[i] = {choosing=1, ticket=0}; writeback; fence     # round 1
+  invalidate all slot[j]; fence; read all                # round 2 (one batch)
+  t = 1 + max ticket seen
+  slot[i] = {choosing=0, ticket=t}; writeback; fence     # round 3
+  invalidate all slot[j]; fence; read all                # round 4 (one batch)
+  for each j != i: wait while slot[j].choosing
+                   or (slot[j].ticket != 0 and (slot[j].ticket, j) < (t, i))
+release(i):
+  slot[i] = {0, 0}; writeback
+```
+- The fence before each batch is a full store-load fence (`ncl_fence`); an `sfence` alone does not order the slot store before the loads. On cf this is `ncl_uc_store` + `ncl_uc_load_many`.
+- The single store in round 3 publishes the ticket and clears `choosing` together, which classic bakery needs in that order.
+- Seeing `choosing` again after `choosing == 0` was seen is harmless: j's new doorway started after `t` was visible, so it draws a larger ticket. At most one extra doorway of delay per j.
+- Uncontended: 4 rounds; FCFS at the root. Tickets grow only while the root stays contended and return to 0 when it drains.
+- A seat changes owner only while the lock is held, after the departing owner's `{0, 0}` is written back.
+
+**(g4) Composition.** Retention below the hot or n-ary node; hot-slot owners may retain inside the hot subtree.
+
+**Cost model behind g5-g9 (cf).** Width is nearly free and serialized rounds are not: a batched read of K lines costs about one round (`docs/backends.md`: 7 lines 112 ns batched vs 531 ns serial), and on the CXL host 7 stores + `clwb` + one `mfence` take 401 ns. A binary Peterson level is 2 serialized write rounds (flag, then turn) + 1 load round; a merged-bakery node is 2 write + 2 load rounds at any width. On uc, loads are serial (~500 ns each), width costs K x L, and none of this holds.
+
+**(g5) Flatten before biasing: `-a bakery` (implemented, not model-checked).** One merged bakery (g3) over all N participants: ~4 rounds at any N, FCFS, single-writer lines only. N=16: binary tournament ~12 rounds, 4-ary bakery tree ~8, flat ~4. Bias saves levels, and the flat bakery has one; it is the baseline every biased design must beat on cf. Slots are in the scan region (one line each).
+
+**(g6) Predecessor polling.** After round 4 the waiter keeps the set of blockers. It polls only its predecessor p (the non-choosing blocker with the largest (ticket, id) below its own; a choosing blocker if there is none) until `slot[p]` differs from the value seen (not until it is 0: p may release and re-enter, so 0 can be too brief to see), then re-reads the remaining blockers in one batch and drops those that no longer block. A blocker, once seen not blocking, is never re-checked (classic bakery's per-j waits; one read with `choosing == 0` and a non-blocking ticket satisfies both of its waits at once). Under FCFS the batch usually empties, so each waiter polls one line: a near-queue handoff instead of every waiter reading every slot (the 2b owner-line hot spot, `docs/cxl_results.md`). A periodic full re-read bounds the cost of a predecessor that keeps re-entering. Not model-checked.
+
+**(g7) Adaptive n-ary root, switched at release.** Per lock, the root runs either a Peterson node between the two subtree winners (mode P) or a bakery node with recent-holder seats (mode B), chosen by a `mode` word written only by a holder. Both root algorithms re-read `mode` after acquiring (in the batch they already do, after the entry-check loads as in §4f); on a mismatch the node releases and retries in the other mode. The **switch happens at release**, after the critical section, and the switcher never takes the other mode's lock:
+```
+critical section
+data writeback; fence
+mode = new; writeback; fence_ss     # only on a switch: the release point for new-mode arrivals
+release the old mode's lock         # as usual
+```
+- *New-mode arrivals* may acquire the new lock at any time; reading `mode == new` orders their entry after the `mode` store, so after the switcher's critical section and data writeback. Reading the old value, they retry.
+- *Old-mode arrivals* acquire the old lock only after the switcher releases it, so their post-acquire `mode` read sees the new value; they release and retry.
+- Invariant: the `mode` store is a release point and follows the switcher's critical section. Requirements: data writeback and fence before the `mode` store; the store-store fence between it and the old release; both algorithms re-read `mode` after acquiring (Lamport's fast path does not, hence §4f's INVALID `y` and switch-with-both-locks).
+- Overhead: 0 extra rounds in mode P (one more line in an existing batch); in mode B, paths through the root pay bakery's second load round. The switch costs one write round, at release only. Policy: node-local history as in §4f.
+
+**(g8) Permanent seats.** Since width is cheap, every node owns a seat at the n-ary root permanently (N + 2 slots), so each slot has one writer forever: no admission or eviction writes, no leases, no sweeper, no seat hand-over rule. A node chooses per acquisition, from node-local history only, whether to use its seat or climb the tree. Zero slots cost nothing in the scan. Caveat: if the seat is always faster, the tree survives only to cut root polling under heavy contention, which g6 already reduces; then the choice depends on load, not recency, and the design is no longer a bias. Measure whether the tree is still worth it.
+
+**(g9) Single-writer Peterson levels (speculative).** Kessels' variant splits `turn` into one bit per side; merging that bit into the side's flag word might cut a level to one serialized write. Whether reading the other side's bit before our flag is visible stays safe needs model checking. Pursue only if the tree survives g5.
+
+**Overhead of an adaptive n-ary node over a plain tournament:** mode discovery 0 rounds (g7), seat lookup 0 (node-local, g8), width a few ns per line (cf), bakery's second load round (inherent; mode B only, paths through that node). A bakery node pays off when it replaces at least one Peterson level (2 write + 1 load rounds).
+
+**Order of work:** g5 (`-a bakery`) with g6, measured on CXL cf against the tournament, Lamport and reactive; then g7 + g8, or g1 alone if the flat bakery loses under contention. g2 if clustering hurts g1 under Zipfian skew. Evaluate in Phase 1 and 2a before 2b, where the tournament is only the gate.
+
+**Path counters:** retained-level hits (and levels skipped), release-time drops, lease drops, hot-node fast and slow entries, admissions, evictions, yields.
+
+**Stress negative tests (emu, must FAIL):** non-contiguous drop; no release check plus no sweeper (hang, `--timeout`); bakery without the `choosing` store, or ignoring `choosing` in the wait (`ncl_stress --debug-bakery 1|2` with `--bakery-delay` widening the doorway). A missing round-2 fence is a store-load reordering the emulator does not model (x86 TSO underneath); it needs model checking or the target device.
+
 ## 5. Correctness verification
 
 - **Model checking** (e.g. GenMC, or TLA+ with an explicit model of writeback and invalidation): base algorithms under the memory rules; gate + owner field + announcements; hybrid (splitter + tournament + top Peterson, including the splitter-reset rule and its ordering); lock-server queues, grant slots, NACK/migration; (e) server ownership of the top lock's slow side and its splitter reset.

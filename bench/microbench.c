@@ -335,7 +335,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [options]\n"
             "  -n N        nodes (default 2)            -t T   threads per node (default 1)\n"
-            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv|ak|aksrv|pthread\n"
+            "  -l L        locks (default 1)            -a ALG lamport|tournament|hybrid|server|fastsrv|ak|aksrv|reactive|bakery|pthread\n"
             "  -b BACKEND  coherent|cached-flush|uc|emu (default cached-flush)\n"
             "  -L NS       injected device latency      -m     no submutex (ablation)\n"
             "  -s SECS     duration (default 2)         -W SECS warmup, not recorded (0.2)\n"
@@ -383,6 +383,8 @@ static void usage(const char *argv0)
             "  --cpus LIST   CPUs for pinned threads, e.g. 0-59,120-179 (default: this\n"
             "                process's affinity, e.g. from numactl --cpunodebind)\n"
             "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n"
+            "  --bakery-poll pred|all  -a bakery wait: poll the predecessor (default) or re-read\n"
+            "                every blocker on each poll (ablation)\n"
             "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
             "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
             "                acquisitions on the tournament (8:4:64)\n",
@@ -410,6 +412,7 @@ int main(int argc, char **argv)
         {"cpus", required_argument, 0, 1002},
         {"wb", required_argument, 0, 1003},
         {"react", required_argument, 0, 1006},
+        {"bakery-poll", required_argument, 0, 1007},
         {"wait", required_argument, 0, 1004},
         {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
@@ -499,6 +502,11 @@ int main(int argc, char **argv)
         case 1003:
             if (!strcmp(optarg, "clwb")) { if (ncl_wb_mode_set(NCL_WB_CLWB) < 0) return 2; }
             else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
+            break;
+        case 1007:
+            if (!strcmp(optarg, "all")) ncl_bakery_poll_all = 1;
+            else if (!strcmp(optarg, "pred")) ncl_bakery_poll_all = 0;
+            else { fprintf(stderr, "--bakery-poll: pred|all\n"); return 2; }
             break;
         case 1006:
             if (ncl_react_parse(optarg) < 0) { usage(argv[0]); return 2; }
@@ -759,6 +767,15 @@ int main(int argc, char **argv)
                    b->split_resets + b->split_reset_skips
                        ? (double)b->split_scan_loads / (double)(b->split_resets + b->split_reset_skips)
                        : 0.0);
+        }
+        if (cfg.alg == NCL_ALG_BAKERY && all_paths) {
+            uint64_t w = tot->paths[NCL_PATH_BAKERY_WAIT];
+            printf("bakery: waited=%.1f%%  pred_polls/wait=%.2f rescans/wait=%.2f "
+                   "choosing_seen/wait=%.3f\n",
+                   100 * (double)w / (double)all_paths,
+                   w ? (double)b->bak_pred_polls / (double)w : 0.0,
+                   w ? (double)b->bak_rescans / (double)w : 0.0,
+                   w ? (double)b->bak_choosing_seen / (double)w : 0.0);
         }
         const struct ncl_srv_stats *v = &tot->srv;
         if (cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg)) {

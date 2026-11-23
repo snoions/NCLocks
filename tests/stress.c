@@ -41,7 +41,7 @@ static long iters = 100000;
 static int timeout_s = 0;
 static unsigned reset_delay_ns = 0;
 static unsigned grant_delay_ns = 0;
-static unsigned lamport_delay_ns = 0, mode_delay_ns = 0;
+static unsigned lamport_delay_ns = 0, mode_delay_ns = 0, bakery_delay_ns = 0;
 static unsigned max_delay_ns = 200;
 static size_t stride;
 static uint64_t delay_cycles;
@@ -201,6 +201,10 @@ static int node_main(int node)
     if (sb.react_up || sb.react_down || sb.react_stale)
         printf(" react_up=%lu react_down=%lu react_stale=%lu", (unsigned long)sb.react_up,
                (unsigned long)sb.react_down, (unsigned long)sb.react_stale);
+    if (sb.bak_pred_polls || sb.bak_rescans)
+        printf(" bak_pred_polls=%lu bak_rescans=%lu bak_choosing_seen=%lu",
+               (unsigned long)sb.bak_pred_polls, (unsigned long)sb.bak_rescans,
+               (unsigned long)sb.bak_choosing_seen);
     if (st.ho.stale_announce)
         printf(" STALE_ANNOUNCE=%lu", (unsigned long)st.ho.stale_announce);
     if (st.global_releases != st.acquires)
@@ -225,7 +229,7 @@ static void usage(const char *argv0)
             "  -i I          iterations per thread (default 100000)\n"
             "  -w W          data words per lock (default 16)\n"
             "  -d NS         max random delay in/out of CS, ns (default 200)\n"
-            "  -a ALG        lamport|tournament|hybrid|server|fastsrv|ak|aksrv|pthread (default lamport)\n"
+            "  -a ALG        lamport|tournament|hybrid|server|fastsrv|ak|aksrv|reactive|bakery|pthread (default lamport)\n"
             "  -b BACKEND    coherent|cached-flush|uc|emu (default emu)\n"
             "  -L NS         injected device latency, ns (default 0)\n"
             "  -m            ablation: no local submutex\n"
@@ -262,6 +266,9 @@ static void usage(const char *argv0)
             "  --lamport-delay NS  DEBUG: Lamport spins between reading y == 0 and storing y\n"
             "  --mode-delay NS  DEBUG: reactive tournament acquirer spins before reading mode\n"
             "  --react-layout mode-first|xy-first  reactive lock block layout\n"
+            "  --debug-bakery BITS  bakery, UNSAFE: 1 = no choosing store, 2 = ignore choosing\n"
+            "  --bakery-poll pred|all  bakery wait: predecessor poll (default) or all blockers\n"
+            "  --bakery-delay NS  DEBUG: bakery spins between reading tickets and publishing its own\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
@@ -308,6 +315,9 @@ int main(int argc, char **argv)
         {"lamport-delay", required_argument, 0, 14},
         {"mode-delay", required_argument, 0, 15},
         {"react-layout", required_argument, 0, 16},
+        {"debug-bakery", required_argument, 0, 17},
+        {"bakery-delay", required_argument, 0, 18},
+        {"bakery-poll", required_argument, 0, 19},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -391,6 +401,13 @@ int main(int argc, char **argv)
         case 13: ncl_debug_react = atoi(optarg); break;
         case 14: lamport_delay_ns = (unsigned)atoi(optarg); break;
         case 15: mode_delay_ns = (unsigned)atoi(optarg); break;
+        case 17: ncl_debug_bakery = atoi(optarg); break;
+        case 18: bakery_delay_ns = (unsigned)atoi(optarg); break;
+        case 19:
+            if (!strcmp(optarg, "all")) ncl_bakery_poll_all = 1;
+            else if (!strcmp(optarg, "pred")) ncl_bakery_poll_all = 0;
+            else { usage(argv[0]); return 2; }
+            break;
         case 16:
             if (!strcmp(optarg, "xy-first")) ncl_react_layout = 1;
             else if (!strcmp(optarg, "mode-first")) ncl_react_layout = 0;
@@ -461,6 +478,7 @@ int main(int argc, char **argv)
     ncl_debug_grant_delay = ncl_ns_to_cycles(grant_delay_ns);
     ncl_debug_lamport_delay = ncl_ns_to_cycles(lamport_delay_ns);
     ncl_debug_mode_delay = ncl_ns_to_cycles(mode_delay_ns);
+    ncl_debug_bakery_delay = ncl_ns_to_cycles(bakery_delay_ns);
 
     for (int l = 0; l < nlocks; l++) {
         if (ncl_lock_set_data(l, (ncl_off_t)l * stride, stride) < 0)

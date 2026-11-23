@@ -346,7 +346,8 @@ static int node_main(int node, int wfd)
     tot->local_handoffs = st.path[NCL_PATH_LOCAL_HANDOFF];
     tot->tour_acq = st.path[NCL_PATH_TOURNAMENT];
     tot->global_acq = st.path[NCL_PATH_TOURNAMENT] + st.path[NCL_PATH_LAMPORT_FAST] +
-                      st.path[NCL_PATH_LAMPORT_SLOW];
+                      st.path[NCL_PATH_LAMPORT_SLOW] + st.path[NCL_PATH_BAKERY_FAST] +
+                      st.path[NCL_PATH_BAKERY_WAIT];
     tot->switches = st.base.react_up + st.base.react_down;
     tot->slow_mode_reads = st.base.react_slow_mode_reads;
     tot->lamport_slow = st.path[NCL_PATH_LAMPORT_SLOW];

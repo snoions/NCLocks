@@ -1,5 +1,6 @@
 #include "ncl/base.h"
 
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,8 @@ const char *const ncl_path_names[NCL_PATH__COUNT] = {
     [NCL_PATH_LOCAL_HANDOFF] = "local_handoff",
     [NCL_PATH_GLOBAL_HANDOFF] = "global_handoff",
     [NCL_PATH_PTHREAD] = "pthread",
+    [NCL_PATH_BAKERY_FAST] = "bakery_fast",
+    [NCL_PATH_BAKERY_WAIT] = "bakery_wait",
 };
 
 static int pow2ceil(int n)
@@ -48,6 +51,7 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
     case NCL_ALG_AKSRV: return ak_lines(P) + top_lines();
     case NCL_ALG_PTHREAD: return 1;
     case NCL_ALG_REACTIVE: return 1 + lam_lines(P) + (tree_lines(P) ? tree_lines(P) : 1);
+    case NCL_ALG_BAKERY: return 0; /* slot[] is in scan */
     }
     return 0;
 }
@@ -57,7 +61,8 @@ size_t ncl_base_nscan(ncl_alg_t alg, int P)
     switch (alg) {
     case NCL_ALG_LAMPORT:            /* b[] */
     case NCL_ALG_REACTIVE:           /* Lamport's b[] */
-    case NCL_ALG_HYBRID: return (size_t)P; /* present[] */
+    case NCL_ALG_HYBRID:             /* present[] */
+    case NCL_ALG_BAKERY: return (size_t)P; /* slot[] */
     case NCL_ALG_FASTSRV: return (size_t)P + 1; /* present[] + server reset marker */
     case NCL_ALG_TOURNAMENT:
     case NCL_ALG_SERVER:
@@ -109,6 +114,9 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
         break;
     case NCL_ALG_PTHREAD:
         b->mtx = (pthread_mutex_t *)(void *)lines;
+        break;
+    case NCL_ALG_BAKERY:
+        b->bak = scan;
         break;
     case NCL_ALG_REACTIVE: /* [mode][x, y][tree] or (ncl_react_layout) [x, y][mode][tree]; b[] in scan */
         if (ncl_react_layout) {
@@ -908,6 +916,140 @@ void ncl_base_reactive_set_mode(ncl_line_t *lines, int P, int mode)
     ncl_fence();
 }
 
+/* ---- BAKERY: flat bakery, choosing merged into the ticket (design §4g) ------
+ * slot[i] = {choosing (bit 63), ticket (bits 0-62)}, one line each, written
+ * only by participant i. acquire: {choosing, 0}; fence; read all; t = 1 +
+ * max ticket; {0, t} (publishes the ticket and clears choosing in one store);
+ * fence; read all; then wait until no j blocks: j blocks while choosing, or
+ * while its ticket is nonzero and (ticket, j) < (t, i). A j once seen not
+ * blocking is never re-checked: one read with choosing == 0 and a
+ * non-blocking ticket satisfies both of classic bakery's waits for j. If j
+ * is later seen choosing again, its doorway started after t was visible, so
+ * it draws a larger ticket.
+ * Waiting (g6): poll only the predecessor (largest (ticket, j) blocker below
+ * us; a choosing blocker if there is none) until its slot changes, then
+ * re-read the remaining blockers in one batch. "Changes", not "becomes 0":
+ * the predecessor may release and re-enter between two polls. NOT
+ * model-checked. */
+
+int ncl_debug_bakery = 0;
+uint64_t ncl_debug_bakery_delay = 0;
+int ncl_bakery_poll_all = 0;
+
+#define BAK_CHOOSING ((uint64_t)1 << 63)
+#define BAK_SLOT(b, j) (&(b)->bak[(j)])
+#define BAK_REREAD_POLLS 64 /* full re-read of the blockers at least this often */
+
+static int bak_blocks(uint64_t v, int j, uint64_t t, int i)
+{
+    if (v & BAK_CHOOSING)
+        return !(ncl_debug_bakery & 2); /* DEBUG 2: ignore choosing (UNSAFE) */
+    return v != 0 && (v < t || (v == t && j < i));
+}
+
+static int bakery_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    const int P = b->P;
+    ncl_line_t *ls[NCL_MAX_PARTICIPANTS];
+    int idx[NCL_MAX_PARTICIPANTS];
+    uint64_t v[NCL_MAX_PARTICIPANTS];
+    int n = 0;
+    for (int j = 0; j < P; j++)
+        if (j != i) {
+            idx[n] = j;
+            ls[n++] = BAK_SLOT(b, j);
+        }
+
+    if (!(ncl_debug_bakery & 1)) /* DEBUG 1: no choosing store (UNSAFE) */
+        ncl_uc_store(BAK_SLOT(b, i), BAK_CHOOSING);  /* round 1 */
+    ncl_fence();                                      /* choosing visible before the reads */
+    ncl_uc_load_many(ls, n, v);                       /* round 2 */
+    uint64_t t = 0;
+    for (int k = 0; k < n; k++) {
+        uint64_t tk = v[k] & ~BAK_CHOOSING;
+        if (tk > t)
+            t = tk;
+    }
+    t++;
+    if (t >= BAK_CHOOSING)
+        abort(); /* 2^63 tickets: unreachable in practice */
+    if (NCL_UNLIKELY(ncl_debug_bakery_delay))
+        ncl_lat_spin_cycles(ncl_debug_bakery_delay); /* widen the doorway */
+    ncl_uc_store(BAK_SLOT(b, i), t);                  /* round 3 */
+    ncl_fence();                                      /* ticket visible before the reads */
+    ncl_uc_load_many(ls, n, v);                       /* round 4 */
+
+    /* Keep the blockers, with the value last seen. */
+    int m = 0, saw_choosing = 0;
+    for (int k = 0; k < n; k++)
+        if (bak_blocks(v[k], idx[k], t, i)) {
+            saw_choosing |= (v[k] & BAK_CHOOSING) != 0;
+            ls[m] = ls[k];
+            idx[m] = idx[k];
+            v[m++] = v[k];
+        }
+    if (!m) {
+        ncl_fence(); /* lock acquired before critical-section accesses */
+        return NCL_PATH_BAKERY_FAST;
+    }
+    st->contended++;
+    unsigned capped = 0; /* polls made at the backoff cap, over the whole wait */
+    struct ncl_backoff bo_all; /* --bakery-poll all: one backoff over the whole wait */
+    ncl_backoff_init(&bo_all);
+    while (m) {
+        /* Predecessor: the largest non-choosing (ticket, j) blocker, else a choosing one. */
+        int p = -1;
+        for (int k = 0; k < m; k++) {
+            if (v[k] & BAK_CHOOSING) {
+                if (p < 0)
+                    p = k;
+                continue;
+            }
+            if (p < 0 || (v[p] & BAK_CHOOSING) || v[k] > v[p] || (v[k] == v[p] && idx[k] > idx[p]))
+                p = k;
+        }
+        struct ncl_backoff bo;
+        ncl_backoff_init(&bo);
+        if (ncl_bakery_poll_all) { /* ablation: every poll re-reads all blockers */
+            if (bo_all.cur >= ncl_backoff_cap && ++capped > 16)
+                sched_yield();
+            ncl_backoff(&bo_all);
+        }
+        for (int polls = 0; !ncl_bakery_poll_all && polls < BAK_REREAD_POLLS; polls++) {
+            NCL_STAT(st->bak_pred_polls++);
+            if (ncl_uc_load(ls[p]) != v[p])
+                break;
+            /* FCFS: a descheduled predecessor stalls everyone behind it, so
+             * once fully backed off, yield (oversubscribed runs; returns at
+             * once when nothing else is runnable). */
+            if (bo.cur >= ncl_backoff_cap && ++capped > 16)
+                sched_yield();
+            ncl_backoff(&bo);
+        }
+        NCL_STAT(st->bak_rescans++);
+        ncl_uc_load_many(ls, m, v);
+        int m2 = 0;
+        for (int k = 0; k < m; k++)
+            if (bak_blocks(v[k], idx[k], t, i)) {
+                saw_choosing |= (v[k] & BAK_CHOOSING) != 0;
+                ls[m2] = ls[k];
+                idx[m2] = idx[k];
+                v[m2++] = v[k];
+            }
+        m = m2;
+    }
+    if (saw_choosing)
+        NCL_STAT(st->bak_choosing_seen++);
+    ncl_fence(); /* lock acquired before critical-section accesses */
+    return NCL_PATH_BAKERY_WAIT;
+}
+
+static void bakery_unlock(struct ncl_base *b, int i)
+{
+    ncl_fence(); /* critical-section effects (incl. data writeback) first */
+    ncl_uc_store(BAK_SLOT(b, i), 0);
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
 int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
@@ -918,6 +1060,7 @@ int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     case NCL_ALG_REACTIVE: return reactive_lock(b, i, st);
     case NCL_ALG_HYBRID: return hybrid_lock(b, i, st);
     case NCL_ALG_AK: return ak_lock(b, i, st);
+    case NCL_ALG_BAKERY: return bakery_lock(b, i, st);
     case NCL_ALG_PTHREAD:
         if (pthread_mutex_lock(b->mtx))
             abort();
@@ -937,6 +1080,7 @@ void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats 
     case NCL_ALG_REACTIVE: reactive_unlock(b, i); break;
     case NCL_ALG_HYBRID: hybrid_unlock(b, i, path, st); break;
     case NCL_ALG_AK: ak_unlock(b, i, path, st); break;
+    case NCL_ALG_BAKERY: bakery_unlock(b, i); break;
     case NCL_ALG_PTHREAD:
         if (pthread_mutex_unlock(b->mtx))
             abort();
@@ -959,6 +1103,7 @@ const char *ncl_alg_name(ncl_alg_t a)
     case NCL_ALG_SERVER: return "server";
     case NCL_ALG_FASTSRV: return "fastsrv";
     case NCL_ALG_REACTIVE: return "reactive";
+    case NCL_ALG_BAKERY: return "bakery";
     }
     return "?";
 }
@@ -974,6 +1119,7 @@ int ncl_alg_parse(const char *s, ncl_alg_t *out)
     else if (!strcmp(s, "server") || !strcmp(s, "c")) *out = NCL_ALG_SERVER;
     else if (!strcmp(s, "fastsrv") || !strcmp(s, "e")) *out = NCL_ALG_FASTSRV;
     else if (!strcmp(s, "reactive") || !strcmp(s, "f")) *out = NCL_ALG_REACTIVE;
+    else if (!strcmp(s, "bakery") || !strcmp(s, "g")) *out = NCL_ALG_BAKERY;
     else return -1;
     return 0;
 }
