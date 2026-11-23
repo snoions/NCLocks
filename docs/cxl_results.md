@@ -878,3 +878,76 @@ x lines), via `--pad-lines`:
 - The scan region (Lamport's `b[]`, announce lines) has P = 16 lines per lock, a 1 KB
   stride, in every configuration measured so far; it may carry the same penalty for all of
   them.
+
+## Flat merged bakery (`bakery`, `kvbakery`, 2026-11-23 19:49)
+
+`results/cxl_20261123_1949/`: `-a bakery` (design §4g g5/g6) against the tournament,
+Lamport and reactive 12:4:64; cf + clwb, CXL node 2, 3 reps, medians, 516 + 132 runs, no
+errors, spread mostly below 5% (max 11%). k acquisitions/s, fairness = per-node min/max.
+
+**Nearly uncontended (L=256), closed loop:**
+
+| N x T | tournament | Lamport | reactive | bakery | bakery line reads/s |
+|---|---|---|---|---|---|
+| 4x3 (2a) | 2714 | 2982 | 2962 | **3550** | 32M |
+| 8x3 (2a) | 3922 | 5660 | 5586 | **6119** | 86M |
+| 16x2 (2a) | 4008 | 7167 | 7021 | **7227** | 217M |
+| 16x3 (2a) | 5779 | **9638** | 9467 | 7692 | 231M |
+| 32x2 (2a) | 6136 | **10938** | 10825 | 4349 (fair 0.83) | 270M |
+| 16x1 (P1) | 2077 | 3894 | | **4247** | 127M |
+| 32x1 (P1) | 3365 | **7084** | | 4421 | 274M |
+
+- **Per acquisition, the bakery is the fastest lock measured.** Open loop at 16x3 L=256, its
+  lock p50 / p99 is the lowest at every rate (0.5M: 3.6 / 6.9 us; Lamport 4.0 / 7.4,
+  tournament 7.7 / 14.8) and it stays unsaturated at 6M, where the tournament saturates.
+  At 16x1 its lock p50 equals Lamport's (2.4 us) with a lower p99.
+- **In aggregate it hits the device's read bandwidth.** Each acquisition reads the other
+  P-1 slots twice (rounds 2 and 4). Its plateau is 230-275M line reads/s (last column),
+  the device's measured ceiling (`rdbatch` 263-275M at T=32-60, "Device concurrency"). Below
+  that (N <= 8, 16x1) it beats Lamport; at 16x3 it is 20% below, at 32 nodes 60% below and
+  less fair. The §4g cost model ("width is nearly free") holds for latency, not for
+  bandwidth: reads per acquisition grow as 2(N-1) against O(1) for Lamport's fast path.
+
+**Contended (L=1):**
+
+| N x T | Phase 1: tournament / bakery | 2a: tournament / bakery |
+|---|---|---|
+| 4x3 | 417 / 210 | 1530 / 1447 |
+| 8x3 | 478 / 178 | 1525 / 1448 |
+| 16x3 | 486 / 146 | 1441 / 1318 |
+| 32x2 | 478 / 108 | 1388 / 1219 |
+| 16x1 / 32x1 | 507 / 142, 507 / 104 | |
+
+- **A cross-node handoff costs 3-4.5x the tournament's** (16x3: 6.8 us vs 2.1 us), and the
+  gap grows with N. Cohort passing (2a, `-K 64`) hides most of it (-5 to -12%). Fairness
+  is 1.00 throughout (Lamport: 0.15-0.87).
+- Open loop 16x3 L=1: lowest p50 at 100k (3.7 us; tournament 7.9), 4.5x the tournament's
+  from 500k on (70 vs 15 us); no rate up to 1.25M saturates it.
+- Middle contention (16x3, 2a): L=4 bakery 1399 vs tournament 2397; L=16 3911 vs 4227;
+  L=64 **7145** vs 5332 (Lamport 5134).
+- Likely cause (not measured on CXL; the CSV has no bakery counters): the strict wait rule
+  (`wait while slot[j].choosing ...`) makes the successor wait for the releasing node's next
+  doorway. In Phase 1 the node's next thread (or, at T=1, the releaser itself) starts its
+  doorway right after the release, so the successor's re-read often finds it choosing and
+  waits two more rounds. On the dev box 26-37% of contended waits saw a choosing blocker.
+  Classic bakery does not wait there: once j was seen with choosing = 0 after our ticket
+  was published, only j's ticket matters, and {choosing, 0} has ticket 0.
+
+**Predecessor polling (g6)** vs re-reading every blocker on each poll: Phase 1 L=1
+1.4-1.8x faster (16x3 146k vs 103k; 32x2 109k vs 59k); 2a L=1 +6-15%; 2a L=16 mixed (16x3:
+3872k vs 4428k, poll-all 14% faster; 32x2 equal).
+
+**KV store (16x3, 2a):**
+
+| keys, L | Lamport map | top:16 | tournament map | reactive | bakery | server chain |
+|---|---|---|---|---|---|---|
+| uniform, 1024 | **11.14M** | 10.87M | 5.78M | 10.97M | 7.72M | 7.00M |
+| Zipf 0.99, 1024 | 1.50M | **6.91M** | 5.22M | 6.88M | 3.53M | 5.57M |
+| Zipf 0.99, 64 | 1.31M | 5.31M | 4.99M | **5.32M** | 3.10M | 5.07M |
+| Zipf 0.99 + F 0.9, 1024 | **11.32M** | 10.48M | 5.96M | 11.29M | 8.07M | 7.15M |
+
+- Uniform: the read-bandwidth plateau again (-31% vs Lamport). Zipf: the hot stripes are
+  contended, so the handoff cost dominates (-49% vs reactive). Fairness 0.96-0.98 (others
+  0.84-0.95).
+- Open loop, Zipf L=1024: the bakery has the lowest op p50 / p99 at 1M (3.7 / 8.7 us vs
+  reactive 4.4 / 13.8) and saturates at 3.5M; the map and reactive reach 6M.

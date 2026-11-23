@@ -540,3 +540,33 @@ add_test(NAME stress_bakery_cached-flush_pollall_n8
   COMMAND ncl_stress -a bakery -b cached-flush -n 8 -t 2 -l 2 -i 10000 --bakery-poll all --timeout 100)
 add_test(NAME kv_emu_bakery_local COMMAND ncl_kv -b emu -a bakery -M local ${KV_ARGS})
 add_test(NAME kv_emu_bakery_handoff COMMAND ncl_kv -b emu -a bakery -M handoff ${KV_ARGS})
+# k-ary bakery tree (--bakery-arity K): partial nodes at every level (n=7 k=3,
+# n=17 k=4: 17 -> 5 -> 2), each backend family, split layout, 2a, ablation, KV.
+# Releasing leaf to root (--debug-bakery 4) lets a lower node's next winner write a
+# seat still held above and must FAIL with the widened gap (--bakery-delay).
+foreach(nk "7;3" "17;4" "8;2")
+  list(GET nk 0 n)
+  list(GET nk 1 k)
+  add_test(NAME stress_bakery_tree_emu_n${n}_k${k}
+    COMMAND ncl_stress -a bakery --bakery-arity ${k} -b emu -n ${n} -t 2 -l 2 -i 5000 --timeout 200)
+endforeach()
+add_test(NAME stress_bakery_tree_cached-flush_n16_k4
+  COMMAND ncl_stress -a bakery --bakery-arity 4 -b cached-flush -n 16 -t 1 -l 2 -i 10000 --timeout 100)
+add_test(NAME stress_bakery_tree_uc_n8_k2
+  COMMAND ncl_stress -a bakery --bakery-arity 2 -b uc -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+set_tests_properties(stress_bakery_tree_uc_n8_k2 PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+add_test(NAME stress_bakery_tree_emu_split_local
+  COMMAND ncl_stress -a bakery --bakery-arity 4 -b emu -U split -n 9 -t 2 -l 3 -i 10000 -d 2000 -M local -K 1 --timeout 200)
+add_test(NAME stress_bakery_tree_emu_nosub
+  COMMAND ncl_stress -a bakery --bakery-arity 4 -b emu -n 3 -t 3 -l 2 -i 10000 -m --timeout 200)
+foreach(k 2 4)
+  add_test(NAME stress_bakery_tree_emu_k${k}_delay
+    COMMAND ncl_stress -a bakery --bakery-arity ${k} -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --timeout 200)
+  add_test(NAME bakery_tree_k${k}_detects_leaf_first_release
+    COMMAND ncl_stress -a bakery --bakery-arity ${k} -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --debug-bakery 4 --timeout 60)
+  set_tests_properties(bakery_tree_k${k}_detects_leaf_first_release PROPERTIES WILL_FAIL TRUE)
+endforeach()
+add_test(NAME bakery_tree_detects_no_choosing
+  COMMAND ncl_stress -a bakery --bakery-arity 4 -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --debug-bakery 1 --timeout 60)
+set_tests_properties(bakery_tree_detects_no_choosing PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kv_emu_bakery_tree_local COMMAND ncl_kv -b emu -a bakery --bakery-arity 2 -M local ${KV_ARGS})

@@ -39,6 +39,37 @@ static size_t tree_lines(int P) { return 3 * (size_t)(pow2ceil(P) - 1); }
 static size_t top_lines(void) { return 3; }
 static size_t ak_lines(int P) { return 4 + 2 * (size_t)P; }
 
+int ncl_bakery_arity = 0;
+
+/* BAKERY tree (arity k; k < 2 or k >= P: one flat node): level l has cnt[l]
+ * entities (cnt[0] = P participants, cnt[l+1] = ceil(cnt[l] / k)); its nodes
+ * hold the cnt[l] seats in groups of k, so a node's width is the number of
+ * children that exist. Levels stop when one entity is left (the holder).
+ * Returns the slot lines (sum of cnt[l] over the levels). */
+static size_t bak_tree_lines(int P, int k, int *levels, int *cnt)
+{
+    if (k < 2 || k >= P)
+        k = P;
+    size_t lines = 0;
+    int n = P, L = 0;
+    while (n > 1) {
+        if (cnt)
+            cnt[L] = n;
+        lines += (size_t)n;
+        L++;
+        n = (n + k - 1) / k;
+    }
+    if (P == 1) { /* one participant: one node of width 1 */
+        if (cnt)
+            cnt[0] = 1;
+        lines = 1;
+        L = 1;
+    }
+    if (levels)
+        *levels = L;
+    return lines;
+}
+
 size_t ncl_base_nlines(ncl_alg_t alg, int P)
 {
     switch (alg) {
@@ -51,7 +82,7 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
     case NCL_ALG_AKSRV: return ak_lines(P) + top_lines();
     case NCL_ALG_PTHREAD: return 1;
     case NCL_ALG_REACTIVE: return 1 + lam_lines(P) + (tree_lines(P) ? tree_lines(P) : 1);
-    case NCL_ALG_BAKERY: return 0; /* slot[] is in scan */
+    case NCL_ALG_BAKERY: return 0; /* slots are in scan */
     }
     return 0;
 }
@@ -61,8 +92,8 @@ size_t ncl_base_nscan(ncl_alg_t alg, int P)
     switch (alg) {
     case NCL_ALG_LAMPORT:            /* b[] */
     case NCL_ALG_REACTIVE:           /* Lamport's b[] */
-    case NCL_ALG_HYBRID:             /* present[] */
-    case NCL_ALG_BAKERY: return (size_t)P; /* slot[] */
+    case NCL_ALG_HYBRID: return (size_t)P; /* present[] */
+    case NCL_ALG_BAKERY: return bak_tree_lines(P, ncl_bakery_arity, NULL, NULL);
     case NCL_ALG_FASTSRV: return (size_t)P + 1; /* present[] + server reset marker */
     case NCL_ALG_TOURNAMENT:
     case NCL_ALG_SERVER:
@@ -117,6 +148,8 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
         break;
     case NCL_ALG_BAKERY:
         b->bak = scan;
+        bak_tree_lines(P, ncl_bakery_arity, &b->bak_levels, b->bak_cnt);
+        b->bak_k = ncl_bakery_arity >= 2 && ncl_bakery_arity < P ? ncl_bakery_arity : P;
         break;
     case NCL_ALG_REACTIVE: /* [mode][x, y][tree] or (ncl_react_layout) [x, y][mode][tree]; b[] in scan */
         if (ncl_react_layout) {
@@ -937,7 +970,6 @@ uint64_t ncl_debug_bakery_delay = 0;
 int ncl_bakery_poll_all = 0;
 
 #define BAK_CHOOSING ((uint64_t)1 << 63)
-#define BAK_SLOT(b, j) (&(b)->bak[(j)])
 #define BAK_REREAD_POLLS 64 /* full re-read of the blockers at least this often */
 
 static int bak_blocks(uint64_t v, int j, uint64_t t, int i)
@@ -947,9 +979,10 @@ static int bak_blocks(uint64_t v, int j, uint64_t t, int i)
     return v != 0 && (v < t || (v == t && j < i));
 }
 
-static int bakery_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+/* One bakery node: seat i of the w slots at `slots`. Returns 1 if it waited. */
+static int bak_node_lock(ncl_line_t *slots, int w, int i, struct ncl_base_stats *st)
 {
-    const int P = b->P;
+    const int P = w;
     ncl_line_t *ls[NCL_MAX_PARTICIPANTS];
     int idx[NCL_MAX_PARTICIPANTS];
     uint64_t v[NCL_MAX_PARTICIPANTS];
@@ -957,11 +990,11 @@ static int bakery_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     for (int j = 0; j < P; j++)
         if (j != i) {
             idx[n] = j;
-            ls[n++] = BAK_SLOT(b, j);
+            ls[n++] = &slots[j];
         }
 
     if (!(ncl_debug_bakery & 1)) /* DEBUG 1: no choosing store (UNSAFE) */
-        ncl_uc_store(BAK_SLOT(b, i), BAK_CHOOSING);  /* round 1 */
+        ncl_uc_store(&slots[i], BAK_CHOOSING);  /* round 1 */
     ncl_fence();                                      /* choosing visible before the reads */
     ncl_uc_load_many(ls, n, v);                       /* round 2 */
     uint64_t t = 0;
@@ -975,7 +1008,7 @@ static int bakery_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
         abort(); /* 2^63 tickets: unreachable in practice */
     if (NCL_UNLIKELY(ncl_debug_bakery_delay))
         ncl_lat_spin_cycles(ncl_debug_bakery_delay); /* widen the doorway */
-    ncl_uc_store(BAK_SLOT(b, i), t);                  /* round 3 */
+    ncl_uc_store(&slots[i], t);                  /* round 3 */
     ncl_fence();                                      /* ticket visible before the reads */
     ncl_uc_load_many(ls, n, v);                       /* round 4 */
 
@@ -988,10 +1021,8 @@ static int bakery_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
             idx[m] = idx[k];
             v[m++] = v[k];
         }
-    if (!m) {
-        ncl_fence(); /* lock acquired before critical-section accesses */
-        return NCL_PATH_BAKERY_FAST;
-    }
+    if (!m)
+        return 0;
     st->contended++;
     unsigned capped = 0; /* polls made at the backoff cap, over the whole wait */
     struct ncl_backoff bo_all; /* --bakery-poll all: one backoff over the whole wait */
@@ -1040,14 +1071,57 @@ static int bakery_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     }
     if (saw_choosing)
         NCL_STAT(st->bak_choosing_seen++);
-    ncl_fence(); /* lock acquired before critical-section accesses */
-    return NCL_PATH_BAKERY_WAIT;
+    return 1;
 }
 
+/* Node of entity e at level l: slots, width and seat. Level l's seats start
+ * after the lower levels' (sum of cnt[0..l-1]); node e / k holds seats
+ * (e / k) * k .. min(+k, cnt[l]) - 1. */
+static ncl_line_t *bak_node(struct ncl_base *b, int l, int e, int *w, int *seat)
+{
+    size_t off = 0;
+    for (int m = 0; m < l; m++)
+        off += (size_t)b->bak_cnt[m];
+    int k = b->bak_k, first = (e / k) * k;
+    int left = b->bak_cnt[l] - first;
+    *w = left < k ? left : k;
+    *seat = e - first;
+    return b->bak + off + first;
+}
+
+/* Climb leaf to root, one bakery node per level (flat: one level). */
+static int bakery_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    int waited = 0, e = i;
+    for (int l = 0; l < b->bak_levels; l++, e /= b->bak_k) {
+        int w, seat;
+        ncl_line_t *slots = bak_node(b, l, e, &w, &seat);
+        waited |= bak_node_lock(slots, w, seat, st);
+    }
+    ncl_fence(); /* lock acquired before critical-section accesses */
+    return waited ? NCL_PATH_BAKERY_WAIT : NCL_PATH_BAKERY_FAST;
+}
+
+/* Release root to leaf, store-store ordered: a seat at a higher node is shared
+ * over time by its whole subtree, and releasing a lower node first would let
+ * the next subtree winner write the seat we still hold (two writers). */
 static void bakery_unlock(struct ncl_base *b, int i)
 {
+    int ent[32];
+    for (int l = 0, e = i; l < b->bak_levels; l++, e /= b->bak_k)
+        ent[l] = e;
     ncl_fence(); /* critical-section effects (incl. data writeback) first */
-    ncl_uc_store(BAK_SLOT(b, i), 0);
+    for (int k = b->bak_levels - 1; k >= 0; k--) {
+        int l = (ncl_debug_bakery & 4) ? b->bak_levels - 1 - k : k; /* DEBUG 4: leaf first (UNSAFE) */
+        int w, seat;
+        ncl_line_t *slots = bak_node(b, l, ent[l], &w, &seat);
+        ncl_uc_store(&slots[seat], 0);
+        if (k) {
+            ncl_fence_ss();
+            if (NCL_UNLIKELY(ncl_debug_bakery_delay))
+                ncl_lat_spin_cycles(ncl_debug_bakery_delay); /* widen the gap between levels */
+        }
+    }
 }
 
 /* ---- dispatch ----------------------------------------------------------- */

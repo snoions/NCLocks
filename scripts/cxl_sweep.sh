@@ -68,6 +68,13 @@
 #   kvbakery   KV store at KV_NT, 2a: -a bakery vs the fixed maps (all Lamport, 16 hottest on
 #              the tournament, all tournament), reactive (REACT_BEST) and the server chain;
 #              Zipf 0.99 (L=64, 1024), uniform, Zipf 0.99 + affinity 0.9; open loop at KV_RATES
+#   bktree     k-ary bakery tree (--bakery-arity BKTREE_K; 0 = flat) vs the tournament and
+#              Lamport, Phase 1 and 2a only. Parts: nt (BAKERY_NT, L=1 and 256), t1
+#              (BAKERY_T1_NT, Phase 1), locks (MT_MAIN, L=4,16,64, 2a), open (MT_MAIN, 2a,
+#              L=1 at MT_RATES1, L=256 at MT_RATES256). Arities >= N are skipped (= flat).
+#              CSV column bakery_arity.
+#   kvbktree   KV store at KV_NT, 2a: bakery at each BKTREE_K vs the Lamport map, the 16-hottest
+#              map and reactive (REACT_BEST); uniform, Zipf 0.99, Zipf 0.99 + affinity 0.9, L=1024
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
 # rep and config name; failures and warnings go to $OUT/errors.log. Runs are
@@ -87,7 +94,7 @@
 #      CONC_T ("1 2 4 8 16 24 32 48 60"), CONC_SECS (1), MEMCONC (build/ncl_memconc),
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16),
 #      BAKERY_NT ("4x3 8x3 16x2 16x3 32x2"), BAKERY_T1_NT ("16x1 32x1"),
-#      BAKERY_POLL_NT ("16x3 32x2"), REACT_BEST ("12:4:64")
+#      BAKERY_POLL_NT ("16x3 32x2"), REACT_BEST ("12:4:64"), BKTREE_K ("0 2 4 8")
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -121,6 +128,7 @@ BAKERY_NT=${BAKERY_NT:-"4x3 8x3 16x2 16x3 32x2"} # phase bakery, part nt
 BAKERY_T1_NT=${BAKERY_T1_NT:-"16x1 32x1"}       # phase bakery, part t1
 BAKERY_POLL_NT=${BAKERY_POLL_NT:-"16x3 32x2"}   # phase bakery, parts poll_pred / poll_all
 REACT_BEST=${REACT_BEST:-12:4:64}                # reactive threshold in bakery / kvbakery
+BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bakery arities (0 = flat)
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
 # U:D[:W]: up when >= U of the last 16 contended; down when <= D of the last 64, after
@@ -635,6 +643,66 @@ kvbakery() {
   done; done
 }
 
+# Variants for nodes N: the tournament, Lamport, and the bakery at each arity < N
+# (0 = flat). Result in the array BKV.
+bktree_variants() {
+  BKV=("-a tournament" "-a lamport")
+  local k
+  for k in $BKTREE_K; do
+    [ "$k" = 0 ] || [ "$k" -lt "$1" ] || continue
+    BKV+=("-a bakery --bakery-arity $k")
+  done
+}
+
+bktree() {
+  local csv=$OUT/bktree.csv; header "$csv"
+  local MODES=("-M phase1" "-M local -K 64")
+  local v m l r MN MT
+  MN=${MT_MAIN%x*}; MT=${MT_MAIN#*x}
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for nt in $BAKERY_NT; do nt_split "$nt"; bktree_variants "$N"; for l in 1 256; do
+      for m in "${MODES[@]}"; do for v in "${BKV[@]}"; do
+        run "$csv" "$rep" "$c:nt" $v $m -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+      done; done
+    done; done
+    for nt in $BAKERY_T1_NT; do nt_split "$nt"; bktree_variants "$N"; for l in 1 256; do
+      for v in "${BKV[@]}"; do
+        run "$csv" "$rep" "$c:t1" $v -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+      done
+    done; done
+    bktree_variants "$MN"
+    for l in 4 16 64; do for v in "${BKV[@]}"; do
+      run "$csv" "$rep" "$c:locks" $v -M local -K 64 -n "$MN" -t "$MT" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+    done; done
+    for l in 1 256; do
+      local rates=$MT_RATES1; [ "$l" = 256 ] && rates=$MT_RATES256
+      for r in $rates; do for v in "${BKV[@]}"; do
+        run "$csv" "$rep" "$c:open" $v -M local -K 64 -n "$MN" -t "$MT" -l "$l" -r "$r" -A poisson ${CFG[$c]} "${COMMON[@]}"
+      done; done
+    done
+  done; done
+}
+
+kvbktree() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/kvbktree.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T c v m k
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C)
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for v in "-d uniform" "-z 0.99" "-z 0.99 -F 0.9"; do
+      for m in "--algmap top:0" "--algmap top:16" "-a reactive --react $REACT_BEST"; do
+        run "$csv" "$rep" "$c:closed" $v -l 1024 $m -M local ${CFG[$c]} "${KC[@]}"
+      done
+      for k in $BKTREE_K; do
+        [ "$k" = 0 ] || [ "$k" -lt "$N" ] || continue
+        run "$csv" "$rep" "$c:closed" $v -l 1024 -a bakery --bakery-arity "$k" -M local ${CFG[$c]} "${KC[@]}"
+      done
+    done
+  done; done
+}
+
 PHASES=${*:-"preflight p1 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
@@ -662,6 +730,8 @@ for ph in $PHASES; do
     kfix) kfix ;;
     bakery) bakery ;;
     kvbakery) kvbakery ;;
+    bktree) bktree ;;
+    kvbktree) kvbktree ;;
     *) die "unknown phase $ph" ;;
   esac
 done

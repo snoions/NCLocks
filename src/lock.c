@@ -228,6 +228,10 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         fprintf(stderr, "ncl: bad nnodes=%d / nlocks=%d\n", c->nnodes, c->nlocks);
         return -1;
     }
+    if (c->alg == NCL_ALG_BAKERY && (ncl_bakery_arity < 0 || ncl_bakery_arity == 1)) {
+        fprintf(stderr, "ncl: --bakery-arity must be 0 (flat) or >= 2\n");
+        return -1;
+    }
     if (c->alg == NCL_ALG_PTHREAD && c->backend != NCL_BACKEND_COHERENT) {
         /* A futex mutex needs coherent cross-node atomics: the reference point
          * "if coherent atomics existed", not a lock for non-coherent memory.

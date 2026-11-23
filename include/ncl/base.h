@@ -31,11 +31,12 @@
  *                   over the INVALID Lamport lock) and writing `mode`. Switches
  *                   on the rate of cross-node contention
  *                   (ncl_base_stats.contended). NOT model-checked.
- *   BAKERY          Flat bakery over all P participants with the choosing
- *                   flag merged into the ticket (design §4g, g3/g5): one
- *                   single-writer word per participant, slot[i] = {choosing
- *                   (bit 63), ticket}; ~4 rounds at any P, FCFS. Waiters
- *                   poll only their predecessor (g6). NOT model-checked.
+ *   BAKERY          Bakery with the choosing flag merged into the ticket
+ *                   (design §4g, g3/g5): one single-writer word per seat,
+ *                   slot = {choosing (bit 63), ticket}; ~4 rounds per node,
+ *                   FCFS. Flat (one node over all P, default) or a k-ary
+ *                   tree of such nodes (ncl_bakery_arity). Waiters poll only
+ *                   their predecessor (g6). NOT model-checked.
  *   PTHREAD         Reference baseline, NOT a non-coherent algorithm: a
  *                   process-shared pthread_mutex_t (futex, i.e. coherent
  *                   cross-node atomics) in the lock's first metadata line.
@@ -113,7 +114,10 @@ struct ncl_base {
     int rx_lastm;      /* REACTIVE, holder: mode at this node's previous global acquisition */
     int rx_inval;      /* REACTIVE, holder: switched to the tournament, so release the
                           Lamport lock as INVALID */
-    ncl_line_t *bak;   /* BAKERY: slot[0..P-1] (scan region) */
+    ncl_line_t *bak;   /* BAKERY: tree slots, level by level (scan region) */
+    int bak_k;         /* BAKERY: arity (P: one flat node) */
+    int bak_levels;    /* BAKERY: tree levels (1: flat) */
+    int bak_cnt[32];   /* BAKERY: entities (= seats) at each level; level 0 = P */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -266,15 +270,23 @@ extern int ncl_debug_react;
 extern uint64_t ncl_debug_lamport_delay, ncl_debug_mode_delay;
 
 /* DEBUG bits (ncl_stress --debug-bakery), each UNSAFE: 1 = skip the choosing
- * store (round 1), 2 = ignore choosing in the wait. ncl_debug_bakery_delay
+ * store (round 1), 2 = ignore choosing in the wait, 4 = tree: release leaf to
+ * root (a lower node's next winner writes a seat still held above). ncl_debug_bakery_delay
  * (--bakery-delay): cycles spun between reading the tickets (round 2) and
- * publishing ours (round 3), which widens the doorway. */
+ * publishing ours (round 3), which widens the doorway, and between the levels
+ * of a tree release. */
 extern int ncl_debug_bakery;
 extern uint64_t ncl_debug_bakery_delay;
 /* BAKERY wait (ncl_bench/ncl_stress --bakery-poll): 0 = poll the predecessor
  * (default, design §4g g6), 1 = re-read every remaining blocker on each poll
  * (ablation). */
 extern int ncl_bakery_poll_all;
+/* BAKERY tree arity (design §4g, g5): 0 (default) or >= P = one flat node over
+ * all P participants; 2 <= k < P = a tree of k-way merged-bakery nodes (each
+ * as wide as its existing children), climbed leaf to root, released root to
+ * leaf. Fixes the scan-region layout: set before ncl_sys_create and keep it
+ * the same in every process. */
+extern int ncl_bakery_arity;
 
 /* Exponential backoff for spin loops (pause iterations, capped). */
 extern unsigned ncl_backoff_cap;

@@ -60,7 +60,12 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   writer), ~4 rounds at any N on cf, FCFS. Waiters poll only their predecessor until its
   slot changes, then re-read the remaining blockers in one batch; spin then `sched_yield()`
   (FCFS convoys under oversubscription). `--debug-bakery 1|2` with `--bakery-delay` must
-  FAIL. Not model-checked. Biased tournaments (§4g g1, g2, g7, g8) are not implemented.
+  FAIL. `--bakery-arity K` (g5b): a tree of K-way bakery nodes instead (fewer lines read per
+  acquisition; the flat bakery hits the CXL device's read bandwidth at 16-32 nodes),
+  released root to leaf (`--debug-bakery 4` = leaf first, must FAIL). CSV column
+  `bakery_arity`; sweep phases `bakery`, `kvbakery`, `bktree`, `kvbktree`. Not model-checked.
+  Biased tournaments (§4g g1, g2, g7, g8) are not implemented. Phase 2b is deprioritized
+  (no measured advantage): evaluate new locks in Phase 1 and 2a.
 - `-a pthread`: reference baseline, a process-shared `pthread_mutex_t` (futex, i.e. coherent
   cross-node atomics) in the lock's metadata line. `-b coherent` and Phase 1 only (rejected
   elsewhere: on uc it would be x86 bus locks, meaningless for CXL); `-m` gives every thread

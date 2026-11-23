@@ -267,6 +267,7 @@ static void usage(const char *argv0)
             "  --mode-delay NS  DEBUG: reactive tournament acquirer spins before reading mode\n"
             "  --react-layout mode-first|xy-first  reactive lock block layout\n"
             "  --debug-bakery BITS  bakery, UNSAFE: 1 = no choosing store, 2 = ignore choosing\n"
+            "  --bakery-arity K  bakery: tree of K-way nodes (0 = flat)\n"
             "  --bakery-poll pred|all  bakery wait: predecessor poll (default) or all blockers\n"
             "  --bakery-delay NS  DEBUG: bakery spins between reading tickets and publishing its own\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
@@ -318,6 +319,7 @@ int main(int argc, char **argv)
         {"debug-bakery", required_argument, 0, 17},
         {"bakery-delay", required_argument, 0, 18},
         {"bakery-poll", required_argument, 0, 19},
+        {"bakery-arity", required_argument, 0, 20},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -403,6 +405,7 @@ int main(int argc, char **argv)
         case 15: mode_delay_ns = (unsigned)atoi(optarg); break;
         case 17: ncl_debug_bakery = atoi(optarg); break;
         case 18: bakery_delay_ns = (unsigned)atoi(optarg); break;
+        case 20: ncl_bakery_arity = atoi(optarg); break;
         case 19:
             if (!strcmp(optarg, "all")) ncl_bakery_poll_all = 1;
             else if (!strcmp(optarg, "pred")) ncl_bakery_poll_all = 0;
