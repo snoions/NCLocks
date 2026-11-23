@@ -189,8 +189,8 @@ static int pick_op(uint64_t *rng)
     }
 }
 
-static void do_op(struct ncl_thread *t, struct result *r, uint64_t *rng, int op, long k,
-                  uint64_t *tacq)
+/* Values are a function of (key, version), so each read can be checked. */
+static void do_op(struct ncl_thread *t, struct result *r, int op, long k, uint64_t *tacq)
 {
     int s = key_stripe[k];
     struct record *p = rec(k);
@@ -221,7 +221,6 @@ static void do_op(struct ncl_thread *t, struct result *r, uint64_t *rng, int op,
         r->updates++;
         wrote = 1;
     }
-    (void)rng;
     if (cs_cycles)
         ncl_lat_spin_cycles(cs_cycles);
     if (full)
@@ -273,7 +272,7 @@ static void *worker_main(void *arg)
         int op = pick_op(&rng);
         long k = pick_key(w->node, &rng);
         uint64_t acq;
-        do_op(&t, r, &rng, op, k, &acq);
+        do_op(&t, r, op, k, &acq);
         uint64_t done = __rdtsc();
         if (done >= twarm && done < tend)
             r->completed++;
