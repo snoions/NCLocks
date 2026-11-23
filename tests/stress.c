@@ -202,9 +202,9 @@ static int node_main(int node)
         printf(" react_up=%lu react_down=%lu react_stale=%lu", (unsigned long)sb.react_up,
                (unsigned long)sb.react_down, (unsigned long)sb.react_stale);
     if (sb.bak_pred_polls || sb.bak_rescans)
-        printf(" bak_pred_polls=%lu bak_rescans=%lu bak_choosing_seen=%lu",
+        printf(" bak_pred_polls=%lu bak_rescans=%lu bak_choosing_seen=%lu bak_classic_drops=%lu",
                (unsigned long)sb.bak_pred_polls, (unsigned long)sb.bak_rescans,
-               (unsigned long)sb.bak_choosing_seen);
+               (unsigned long)sb.bak_choosing_seen, (unsigned long)sb.bak_classic_drops);
     if (st.ho.stale_announce)
         printf(" STALE_ANNOUNCE=%lu", (unsigned long)st.ho.stale_announce);
     if (st.global_releases != st.acquires)
@@ -266,9 +266,12 @@ static void usage(const char *argv0)
             "  --lamport-delay NS  DEBUG: Lamport spins between reading y == 0 and storing y\n"
             "  --mode-delay NS  DEBUG: reactive tournament acquirer spins before reading mode\n"
             "  --react-layout mode-first|xy-first  reactive lock block layout\n"
-            "  --debug-bakery BITS  bakery, UNSAFE: 1 = no choosing store, 2 = ignore choosing\n"
+            "  --debug-bakery BITS  bakery, UNSAFE: 1 = no choosing store, 2 = ignore choosing,\n"
+            "                4 = leaf-first tree release, 8 = classic wait clears j before our ticket\n"
             "  --bakery-arity K  bakery: tree of K-way nodes (0 = flat)\n"
             "  --bakery-poll pred|all  bakery wait: predecessor poll (default) or all blockers\n"
+            "  --bakery-wait strict|classic  bakery: wait while j is choosing (default), or not\n"
+            "                once j was seen not choosing after our ticket was visible\n"
             "  --bakery-delay NS  DEBUG: bakery spins between reading tickets and publishing its own\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
@@ -320,6 +323,7 @@ int main(int argc, char **argv)
         {"bakery-delay", required_argument, 0, 18},
         {"bakery-poll", required_argument, 0, 19},
         {"bakery-arity", required_argument, 0, 20},
+        {"bakery-wait", required_argument, 0, 21},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0},
     };
@@ -406,6 +410,12 @@ int main(int argc, char **argv)
         case 17: ncl_debug_bakery = atoi(optarg); break;
         case 18: bakery_delay_ns = (unsigned)atoi(optarg); break;
         case 20: ncl_bakery_arity = atoi(optarg); break;
+        case 21:
+            if (!strcmp(optarg, "classic")) ncl_bakery_wait_classic = 1;
+            else if (!strcmp(optarg, "strict")) ncl_bakery_wait_classic = 0;
+            else { fprintf(stderr, "--bakery-wait: strict|classic\n"); return 2; }
+            break;
+
         case 19:
             if (!strcmp(optarg, "all")) ncl_bakery_poll_all = 1;
             else if (!strcmp(optarg, "pred")) ncl_bakery_poll_all = 0;

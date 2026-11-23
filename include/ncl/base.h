@@ -146,6 +146,7 @@ struct ncl_base_stats {
     uint64_t bak_choosing_seen; /* BAKERY: a blocker was in its doorway (choosing) when read */
     uint64_t bak_pred_polls;    /* BAKERY: loads of the predecessor's slot while waiting */
     uint64_t bak_rescans;       /* BAKERY: batched re-reads of the remaining blockers */
+    uint64_t bak_classic_drops; /* BAKERY classic wait: blockers dropped while choosing */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -275,12 +276,18 @@ extern uint64_t ncl_debug_lamport_delay, ncl_debug_mode_delay;
  * (--bakery-delay): cycles spun between reading the tickets (round 2) and
  * publishing ours (round 3), which widens the doorway, and between the levels
  * of a tree release. */
+/* (bit 8, with --bakery-wait classic: also treat j as seen not choosing from the
+ * round-2 read, made before our ticket was visible.) */
 extern int ncl_debug_bakery;
 extern uint64_t ncl_debug_bakery_delay;
 /* BAKERY wait (ncl_bench/ncl_stress --bakery-poll): 0 = poll the predecessor
  * (default, design §4g g6), 1 = re-read every remaining blocker on each poll
  * (ablation). */
 extern int ncl_bakery_poll_all;
+/* BAKERY wait rule (--bakery-wait): 0 = strict (default; wait while j is
+ * choosing, on every read), 1 = classic (once j was seen not choosing after our
+ * ticket was visible, only its ticket matters; design §4g g3). */
+extern int ncl_bakery_wait_classic;
 /* BAKERY tree arity (design §4g, g5): 0 (default) or >= P = one flat node over
  * all P participants; 2 <= k < P = a tree of k-way merged-bakery nodes (each
  * as wide as its existing children), climbed leaf to root, released root to

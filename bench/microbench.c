@@ -386,6 +386,8 @@ static void usage(const char *argv0)
             "  --bakery-arity K  -a bakery: tree of K-way nodes (0 = one flat node, default)\n"
             "  --bakery-poll pred|all  -a bakery wait: poll the predecessor (default) or re-read\n"
             "                every blocker on each poll (ablation)\n"
+            "  --bakery-wait strict|classic  -a bakery: wait while a blocker is choosing\n"
+            "                (default), or once seen not choosing, by its ticket only\n"
             "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
             "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
             "                acquisitions on the tournament (8:4:64)\n",
@@ -397,7 +399,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll,bakery_wait"
 
 int main(int argc, char **argv)
 {
@@ -415,6 +417,7 @@ int main(int argc, char **argv)
         {"react", required_argument, 0, 1006},
         {"bakery-poll", required_argument, 0, 1007},
         {"bakery-arity", required_argument, 0, 1008},
+        {"bakery-wait", required_argument, 0, 1009},
         {"wait", required_argument, 0, 1004},
         {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
@@ -506,6 +509,12 @@ int main(int argc, char **argv)
             else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
             break;
         case 1008: ncl_bakery_arity = atoi(optarg); break;
+        case 1009:
+            if (!strcmp(optarg, "classic")) ncl_bakery_wait_classic = 1;
+            else if (!strcmp(optarg, "strict")) ncl_bakery_wait_classic = 0;
+            else { fprintf(stderr, "--bakery-wait: strict|classic\n"); return 2; }
+            break;
+
         case 1007:
             if (!strcmp(optarg, "all")) ncl_bakery_poll_all = 1;
             else if (!strcmp(optarg, "pred")) ncl_bakery_poll_all = 0;
@@ -689,7 +698,7 @@ int main(int argc, char **argv)
         snprintf(bak_arity, sizeof bak_arity, "%d", ncl_bakery_arity);
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s,%s\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -718,7 +727,8 @@ int main(int argc, char **argv)
                pin ? cpus_csv : "none",
                cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER ? "-" : WAIT_NAME(cfg.handoff_wait),
                PER(tot->ho.grant_polls), ho_desc, PER(tot->ho.gate_skips), bak_arity,
-               cfg.alg != NCL_ALG_BAKERY ? "-" : ncl_bakery_poll_all ? "all" : "pred");
+               cfg.alg != NCL_ALG_BAKERY ? "-" : ncl_bakery_poll_all ? "all" : "pred",
+               cfg.alg != NCL_ALG_BAKERY ? "-" : ncl_bakery_wait_classic ? "classic" : "strict");
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -778,11 +788,12 @@ int main(int argc, char **argv)
         if (cfg.alg == NCL_ALG_BAKERY && all_paths) {
             uint64_t w = tot->paths[NCL_PATH_BAKERY_WAIT];
             printf("bakery: waited=%.1f%%  pred_polls/wait=%.2f rescans/wait=%.2f "
-                   "choosing_seen/wait=%.3f\n",
+                   "choosing_seen/wait=%.3f classic_drops/wait=%.3f\n",
                    100 * (double)w / (double)all_paths,
                    w ? (double)b->bak_pred_polls / (double)w : 0.0,
                    w ? (double)b->bak_rescans / (double)w : 0.0,
-                   w ? (double)b->bak_choosing_seen / (double)w : 0.0);
+                   w ? (double)b->bak_choosing_seen / (double)w : 0.0,
+                   w ? (double)b->bak_classic_drops / (double)w : 0.0);
         }
         const struct ncl_srv_stats *v = &tot->srv;
         if (cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg)) {

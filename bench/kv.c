@@ -404,6 +404,7 @@ static void usage(const char *a0)
             "                the highest expected load use the tournament, the rest Lamport\n"
             "                (-a reactive: they start in tournament mode; --react off pins them)\n"
             "  --bakery-arity K  -a bakery: tree of K-way nodes (0 = flat, default)\n"
+            "  --bakery-wait strict|classic  -a bakery wait rule (as ncl_bench)\n"
             "  -M MODE -K CAP -b BACKEND -U LAYOUT --wb clwb --mem-node N --cpus LIST: as ncl_bench\n"
             "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
             "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
@@ -428,7 +429,7 @@ static void usage(const char *a0)
     "unserved_frac,lock_p50,lock_p99,lock_p999,op_p50,op_p99,op_p999,node_min_max_ratio,"      \
     "local_handoff_frac,hot_stripe_share,errors,tournament_acq_frac,mode_switches,react,"   \
     "no_submutex,react_layout,pad_lines,lamport_slow_frac,slow_mode_reads_per_acq,"          \
-    "lines_per_lock,raw_layout,bakery_arity"
+    "lines_per_lock,raw_layout,bakery_arity,bakery_wait"
 
 int main(int argc, char **argv)
 {
@@ -449,6 +450,7 @@ int main(int argc, char **argv)
                                  {"pad-lines", required_argument, 0, 1009},
                                  {"raw-layout", no_argument, 0, 1010},
                                  {"bakery-arity", required_argument, 0, 1011},
+                                 {"bakery-wait", required_argument, 0, 1012},
                                  {0, 0, 0, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "n:t:l:k:V:w:d:z:F:a:M:K:b:U:c:s:W:r:mPCHh", lo, NULL)) != -1) {
@@ -500,6 +502,12 @@ int main(int argc, char **argv)
         case 1009: cfg.pad_lines = atoi(optarg); break;
         case 1010: cfg.raw_layout = 1; break;
         case 1011: ncl_bakery_arity = atoi(optarg); break;
+        case 1012:
+            if (!strcmp(optarg, "classic")) ncl_bakery_wait_classic = 1;
+            else if (!strcmp(optarg, "strict")) ncl_bakery_wait_classic = 0;
+            else { fprintf(stderr, "--bakery-wait: strict|classic\n"); return 2; }
+            break;
+
         case 1007:
             if (ncl_react_parse(optarg) < 0) { usage(argv[0]); return 2; }
             break;
@@ -710,7 +718,7 @@ int main(int argc, char **argv)
         snprintf(bak_arity, sizeof bak_arity, "%d", ncl_bakery_arity);
     if (csv) {
         printf("%c,%s,%.2f,%.2f,%ld,%zu,%d,%s,%d,%d,%s,%s,%d,%s,%s,%d,%d,%.0f,%.0f,%.5f,%lu,%lu,"
-               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s,%d,%s,%d,%.4f,%.4f,%zu,%d,%s\n",
+               "%lu,%lu,%lu,%lu,%.3f,%.4f,%.4f,%lu,%.4f,%lu,%s,%d,%s,%d,%.4f,%.4f,%zu,%d,%s,%s\n",
                workload, zipf ? "zipf" : "uniform", zipf ? theta : 0.0, affinity, nkeys, vbytes,
                nlocks, algmap_top >= 0 && !react_map ? "map" : ncl_alg_name(cfg.alg), algmap_top, ntour,
                ncl_backend_name(cfg.backend), modebuf,
@@ -724,7 +732,8 @@ int main(int argc, char **argv)
                ncl_react_layout ? "xy-first" : "mode-first", cfg.pad_lines,
                tot->global_acq ? (double)tot->lamport_slow / (double)tot->global_acq : 0.0,
                tot->global_acq ? (double)tot->slow_mode_reads / (double)tot->global_acq : 0.0,
-               lines_per_lock, cfg.raw_layout, bak_arity);
+               lines_per_lock, cfg.raw_layout, bak_arity,
+               cfg.alg != NCL_ALG_BAKERY ? "-" : ncl_bakery_wait_classic ? "classic" : "strict");
     } else {
         printf("kv: workload %c, %s, affinity %.2f, %ld keys x %zu B, %d locks, alg %s "
                "(%d tournament), %s, mode %s, data %s, %dx%d\n",

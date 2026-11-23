@@ -570,3 +570,24 @@ add_test(NAME bakery_tree_detects_no_choosing
   COMMAND ncl_stress -a bakery --bakery-arity 4 -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --debug-bakery 1 --timeout 60)
 set_tests_properties(bakery_tree_detects_no_choosing PROPERTIES WILL_FAIL TRUE)
 add_test(NAME kv_emu_bakery_tree_local COMMAND ncl_kv -b emu -a bakery --bakery-arity 2 -M local ${KV_ARGS})
+# Classic wait rule (--bakery-wait classic): flat and tree, doorway widened, 2a, cf, KV.
+# It must still need the choosing store (--debug-bakery 1), and clearing j from the
+# round-2 read, before our ticket is visible (--debug-bakery 8), must FAIL.
+foreach(k 0 2)
+  add_test(NAME stress_bakery_classic_emu_k${k}_doorway
+    COMMAND ncl_stress -a bakery --bakery-arity ${k} --bakery-wait classic -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --timeout 200)
+  add_test(NAME bakery_classic_k${k}_detects_no_choosing
+    COMMAND ncl_stress -a bakery --bakery-arity ${k} --bakery-wait classic -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --debug-bakery 1 --timeout 60)
+  add_test(NAME bakery_classic_k${k}_detects_early_clear
+    COMMAND ncl_stress -a bakery --bakery-arity ${k} --bakery-wait classic -b emu -n 8 -t 2 -l 1 -i 30000 -d 2000 --bakery-delay 3000 --debug-bakery 8 --timeout 60)
+  set_tests_properties(bakery_classic_k${k}_detects_no_choosing bakery_classic_k${k}_detects_early_clear
+    PROPERTIES WILL_FAIL TRUE)
+endforeach()
+add_test(NAME stress_bakery_classic_emu_split_local
+  COMMAND ncl_stress -a bakery --bakery-wait classic -b emu -U split -n 6 -t 2 -l 3 -i 20000 -d 2000 -M local -K 1 --timeout 200)
+add_test(NAME stress_bakery_classic_cached-flush_n8
+  COMMAND ncl_stress -a bakery --bakery-wait classic -b cached-flush -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+add_test(NAME stress_bakery_classic_uc_n8
+  COMMAND ncl_stress -a bakery --bakery-wait classic -b uc -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+set_tests_properties(stress_bakery_classic_uc_n8 PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+add_test(NAME kv_emu_bakery_classic_local COMMAND ncl_kv -b emu -a bakery --bakery-wait classic -M local ${KV_ARGS})

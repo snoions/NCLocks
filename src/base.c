@@ -963,8 +963,14 @@ void ncl_base_reactive_set_mode(ncl_line_t *lines, int P, int mode)
  * us; a choosing blocker if there is none) until its slot changes, then
  * re-read the remaining blockers in one batch. "Changes", not "becomes 0":
  * the predecessor may release and re-enter between two polls. NOT
- * model-checked. */
+ * model-checked.
+ * --bakery-wait classic: a blocker j once seen with choosing == 0 (any read
+ * after our round-3 fence) is waited on by ticket only; seeing it choosing
+ * again drops it (its new doorway started after t was visible, so it draws a
+ * larger ticket, and a choosing slot holds ticket 0). The strict rule (default,
+ * the spec's pseudocode) keeps waiting until j's new ticket is published. */
 
+int ncl_bakery_wait_classic = 0;
 int ncl_debug_bakery = 0;
 uint64_t ncl_debug_bakery_delay = 0;
 int ncl_bakery_poll_all = 0;
@@ -972,10 +978,11 @@ int ncl_bakery_poll_all = 0;
 #define BAK_CHOOSING ((uint64_t)1 << 63)
 #define BAK_REREAD_POLLS 64 /* full re-read of the blockers at least this often */
 
-static int bak_blocks(uint64_t v, int j, uint64_t t, int i)
+/* clr: j was seen with choosing == 0 after our ticket was visible (classic rule). */
+static int bak_blocks(uint64_t v, int j, uint64_t t, int i, int clr)
 {
     if (v & BAK_CHOOSING)
-        return !(ncl_debug_bakery & 2); /* DEBUG 2: ignore choosing (UNSAFE) */
+        return !clr && !(ncl_debug_bakery & 2); /* DEBUG 2: ignore choosing (UNSAFE) */
     return v != 0 && (v < t || (v == t && j < i));
 }
 
@@ -986,6 +993,7 @@ static int bak_node_lock(ncl_line_t *slots, int w, int i, struct ncl_base_stats 
     ncl_line_t *ls[NCL_MAX_PARTICIPANTS];
     int idx[NCL_MAX_PARTICIPANTS];
     uint64_t v[NCL_MAX_PARTICIPANTS];
+    unsigned char clr[NCL_MAX_PARTICIPANTS]; /* classic rule: seen not choosing */
     int n = 0;
     for (int j = 0; j < P; j++)
         if (j != i) {
@@ -999,6 +1007,9 @@ static int bak_node_lock(ncl_line_t *slots, int w, int i, struct ncl_base_stats 
     ncl_uc_load_many(ls, n, v);                       /* round 2 */
     uint64_t t = 0;
     for (int k = 0; k < n; k++) {
+        /* DEBUG 8 (UNSAFE, classic only): clear j from this read, made before
+         * our ticket was visible. */
+        clr[k] = (ncl_debug_bakery & 8) && !(v[k] & BAK_CHOOSING);
         uint64_t tk = v[k] & ~BAK_CHOOSING;
         if (tk > t)
             t = tk;
@@ -1014,13 +1025,18 @@ static int bak_node_lock(ncl_line_t *slots, int w, int i, struct ncl_base_stats 
 
     /* Keep the blockers, with the value last seen. */
     int m = 0, saw_choosing = 0;
-    for (int k = 0; k < n; k++)
-        if (bak_blocks(v[k], idx[k], t, i)) {
+    for (int k = 0; k < n; k++) {
+        int c = ncl_bakery_wait_classic && (clr[k] || !(v[k] & BAK_CHOOSING));
+        if (bak_blocks(v[k], idx[k], t, i, c)) {
             saw_choosing |= (v[k] & BAK_CHOOSING) != 0;
             ls[m] = ls[k];
             idx[m] = idx[k];
+            clr[m] = (unsigned char)c;
             v[m++] = v[k];
+        } else if (c && (v[k] & BAK_CHOOSING)) {
+            NCL_STAT(st->bak_classic_drops++);
         }
+    }
     if (!m)
         return 0;
     st->contended++;
@@ -1060,13 +1076,17 @@ static int bak_node_lock(ncl_line_t *slots, int w, int i, struct ncl_base_stats 
         NCL_STAT(st->bak_rescans++);
         ncl_uc_load_many(ls, m, v);
         int m2 = 0;
-        for (int k = 0; k < m; k++)
-            if (bak_blocks(v[k], idx[k], t, i)) {
+        for (int k = 0; k < m; k++) {
+            if (bak_blocks(v[k], idx[k], t, i, clr[k])) {
                 saw_choosing |= (v[k] & BAK_CHOOSING) != 0;
                 ls[m2] = ls[k];
                 idx[m2] = idx[k];
+                clr[m2] = clr[k] || (ncl_bakery_wait_classic && !(v[k] & BAK_CHOOSING));
                 v[m2++] = v[k];
+            } else if (clr[k] && (v[k] & BAK_CHOOSING)) {
+                NCL_STAT(st->bak_classic_drops++); /* strict would have waited */
             }
+        }
         m = m2;
     }
     if (saw_choosing)

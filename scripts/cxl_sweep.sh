@@ -75,6 +75,11 @@
 #              CSV column bakery_arity.
 #   kvbktree   KV store at KV_NT, 2a: bakery at each BKTREE_K vs the Lamport map, the 16-hottest
 #              map and reactive (REACT_BEST); uniform, Zipf 0.99, Zipf 0.99 + affinity 0.9, L=1024
+#   bkwait     bakery wait rule, --bakery-wait strict vs classic, at each BKWAIT_K (0 = flat),
+#              with the tournament as reference. Parts: nt (BAKERY_NT, L=1 and 16, Phase 1
+#              and 2a), t1 (BAKERY_T1_NT, Phase 1, L=1). CSV column bakery_wait.
+#   kvbkwait   KV store at KV_NT, 2a, L=1024: bakery strict vs classic at each BKWAIT_K;
+#              uniform, Zipf 0.99, Zipf 0.99 + affinity 0.9
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
 # rep and config name; failures and warnings go to $OUT/errors.log. Runs are
@@ -94,7 +99,8 @@
 #      CONC_T ("1 2 4 8 16 24 32 48 60"), CONC_SECS (1), MEMCONC (build/ncl_memconc),
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16),
 #      BAKERY_NT ("4x3 8x3 16x2 16x3 32x2"), BAKERY_T1_NT ("16x1 32x1"),
-#      BAKERY_POLL_NT ("16x3 32x2"), REACT_BEST ("12:4:64"), BKTREE_K ("0 2 4 8")
+#      BAKERY_POLL_NT ("16x3 32x2"), REACT_BEST ("12:4:64"), BKTREE_K ("0 2 4 8"),
+#      BKWAIT_K ("0 2 4")
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -129,6 +135,7 @@ BAKERY_T1_NT=${BAKERY_T1_NT:-"16x1 32x1"}       # phase bakery, part t1
 BAKERY_POLL_NT=${BAKERY_POLL_NT:-"16x3 32x2"}   # phase bakery, parts poll_pred / poll_all
 REACT_BEST=${REACT_BEST:-12:4:64}                # reactive threshold in bakery / kvbakery
 BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bakery arities (0 = flat)
+BKWAIT_K=${BKWAIT_K:-"0 2 4"}                     # phases bkwait / kvbkwait
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
 # U:D[:W]: up when >= U of the last 16 contended; down when <= D of the last 64, after
@@ -703,6 +710,52 @@ kvbktree() {
   done; done
 }
 
+# Bakery variants for bkwait: the tournament, then strict and classic at each
+# BKWAIT_K below $1 (0 = flat).
+bkwait_variants() {
+  BKV=("-a tournament")
+  local k w
+  for k in $BKWAIT_K; do
+    [ "$k" = 0 ] || [ "$k" -lt "$1" ] || continue
+    for w in strict classic; do BKV+=("-a bakery --bakery-arity $k --bakery-wait $w"); done
+  done
+}
+
+bkwait() {
+  local csv=$OUT/bkwait.csv; header "$csv"
+  local MODES=("-M phase1" "-M local -K 64")
+  local v m l
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for nt in $BAKERY_NT; do nt_split "$nt"; bkwait_variants "$N"; for l in 1 16; do
+      for m in "${MODES[@]}"; do for v in "${BKV[@]}"; do
+        run "$csv" "$rep" "$c:nt" $v $m -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+      done; done
+    done; done
+    for nt in $BAKERY_T1_NT; do nt_split "$nt"; bkwait_variants "$N"; for v in "${BKV[@]}"; do
+      run "$csv" "$rep" "$c:t1" $v -n "$N" -t "$T" -l 1 ${CFG[$c]} "${COMMON[@]}"
+    done; done
+  done; done
+}
+
+kvbkwait() {
+  [ -x "$KV" ] || die "$KV not built"
+  local csv=$OUT/kvbkwait.csv
+  [ -s "$csv" ] || echo "rep,config,$("$KV" -H)" >"$csv"
+  local RUNBIN=$KV N T c v k w
+  N=${KV_NT%x*}; T=${KV_NT#*x}
+  local KC=(-n "$N" -t "$T" -s "$SECS" -W "$WARMUP" -C)
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for v in "-d uniform" "-z 0.99" "-z 0.99 -F 0.9"; do
+      for k in $BKWAIT_K; do
+        [ "$k" = 0 ] || [ "$k" -lt "$N" ] || continue
+        for w in strict classic; do
+          run "$csv" "$rep" "$c:closed" $v -l 1024 -a bakery --bakery-arity "$k" --bakery-wait "$w" -M local ${CFG[$c]} "${KC[@]}"
+        done
+      done
+    done
+  done; done
+}
+
 PHASES=${*:-"preflight p1 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
@@ -732,6 +785,8 @@ for ph in $PHASES; do
     kvbakery) kvbakery ;;
     bktree) bktree ;;
     kvbktree) kvbktree ;;
+    bkwait) bkwait ;;
+    kvbkwait) kvbkwait ;;
     *) die "unknown phase $ph" ;;
   esac
 done

@@ -951,3 +951,78 @@ errors, spread mostly below 5% (max 11%). k acquisitions/s, fairness = per-node 
   0.84-0.95).
 - Open loop, Zipf L=1024: the bakery has the lowest op p50 / p99 at 1M (3.7 / 8.7 us vs
   reactive 4.4 / 13.8) and saturates at 3.5M; the map and reactive reach 6M.
+
+## k-ary bakery tree (`bktree`, `kvbktree`, 2026-11-23 21:07)
+
+`results/cxl_20261123_2107/`: `-a bakery --bakery-arity K` (design §4g g5b; flat = K 0)
+against the tournament and Lamport; cf + clwb, CXL node 2, 3 reps, medians, 684 + 63 runs,
+no failed runs. Median spread is 0.9%; the largest is 16% (flat 16x2 L=256 P1) and the next 10%.
+Arities >= N are not run. `preflight` did not run (typo `preflisht` in `errors.log`).
+k acquisitions/s.
+
+**Contended (L=1, Phase 1):**
+
+| N x T | tournament | flat | K2 | K4 | K8 | Lamport |
+|---|---|---|---|---|---|---|
+| 4x3 | **419** | 213 | 294 | | | 125 |
+| 8x3 | **493** | 176 | 387 | 271 | | 69 |
+| 16x2 | **486** | 142 | 387 | 313 | 258 | 36 |
+| 16x3 | **483** | 146 | 383 | 299 | 255 | 37 |
+| 32x2 | **473** | 109 | 379 | 336 | 325 | 18 |
+| 16x1 | **505** | 143 | 390 | 350 | 248 | 36 |
+| 32x1 | **501** | 104 | 390 | 345 | 366 | 18 |
+
+- **K2 recovers most of the gap and stays flat in N**: 78-81% of the tournament from 8
+  to 32 nodes (flat: 21-36%). A cross-node handoff costs 2.6 us against the tournament's
+  2.1 us; the flat bakery's 6.8 us (16x3) was its width, not the doorway alone. Fairness
+  0.98-1.00.
+- **2a, L=1:** the tree matches the tournament (16x3: K2-K8 1408-1431 vs 1441; 32x2
+  1378-1382 vs 1392; flat 1312 / 1229).
+- Open loop 16x3 L=1: the flat bakery has the lowest p50 at 100k (2.6 us; tournament 5.6,
+  K2 7.7). From 500k the tournament leads (p50 12.8 us; K2 23.6, K4 34.8, flat 69.6).
+  Nothing saturates up to 1.25M except Lamport.
+
+**Nearly uncontended (L=256), closed loop:**
+
+| N x T | tournament | Lamport | flat | K2 | K4 | K8 |
+|---|---|---|---|---|---|---|
+| 4x3 (2a) | 2696 | 2959 | **3465** | 2190 | | |
+| 8x3 (2a) | 3882 | 5637 | **5997** | 3080 | 4151 | |
+| 16x2 (2a) | 4010 | **7140** | 7131 | 3130 | 5286 | 5171 |
+| 16x3 (2a) | 5767 | **9610** | 7716 | 4462 | 7310 | 7060 |
+| 32x2 (2a) | 6039 | **11036** | 4516 (fair 0.84) | 4771 | 6790 | 7532 |
+| 16x1 (P1) | 2069 | 3890 | **4195** | 1655 | 2841 | 2814 |
+| 32x1 (P1) | 3359 | **7089** | 4614 | 2600 | 3940 | 5136 |
+
+- **Each level costs about 1.9 us uncontended.** Open loop 16x3 L=256 at 0.5M, lock p50:
+  flat 2.4 us (= Lamport), K4 / K8 (2 levels) 4.1, K2 (4 levels) 7.7, tournament 5.6.
+  Below the bandwidth ceiling (N <= 16), fewer levels win, and the flat bakery is fastest.
+- **At 32 nodes the tree lifts the ceiling:** K8 reads 20 lines per acquisition instead of
+  62. 32x2 K8 7.5M = 150M line reads/s, below the device's 230-275M; flat 4.5M = 280M.
+  K8 beats the tournament by 25% but is 32% below Lamport, which reads O(1) lines.
+- Open loop 16x3 L=256: K2 saturates at 5M (4.46M served) and the tournament at 6M
+  (5.73M). Flat, K4, K8 and Lamport serve 6M; flat and Lamport have the lowest p99 (21-27
+  us at 6M; K4 70, K8 86).
+- Middle contention (16x3, 2a): L=4 tournament **2342**, K2 1994, K4 1756, flat 1390; L=16
+  tournament **4264**, K4 4017, flat 3840; L=64 flat **7343**, K4 6327, tournament 5351,
+  Lamport 5177.
+
+**KV store (16x3, 2a, L=1024), M ops/s:**
+
+| keys | Lamport map | top:16 | reactive | flat | K2 | K4 | K8 |
+|---|---|---|---|---|---|---|---|
+| uniform | **11.11** | 10.89 | 10.95 | 7.73 | 4.54 | 7.60 | 7.29 |
+| Zipf 0.99 | 1.49 | **6.89** | **6.89** | 3.52 | 4.09 | 5.29 | 4.41 |
+| Zipf 0.99 + F 0.9 | **11.25** | 10.50 | 11.19 | 8.07 | 4.65 | 7.75 | 7.58 |
+
+- K4 is the best bakery under Zipf (+50% over flat) but 23% below top:16 and reactive.
+  Uniform: the flat bakery and K4 tie, 30% below the Lamport map. All runs: 0 errors.
+
+**Summary.** No single arity is best: K2 is best under contention and flat (N <= 16) or K8
+(32 nodes) when uncontended, and each is beaten by the tournament or Lamport in the same
+regime. The bakery wins only at middle contention with many locks (L=64, flat +37% over
+the tournament). In the KV store, it never wins. Per level, a 2-way bakery node handoff
+(2.6 us) costs more than a Peterson node (2.1 us). Whether the strict wait rule causes this
+(previous section) is still unmeasured. An adaptive root (§4g g7) can at best pick the better
+of the two root algorithms per regime; with these numbers it would not beat
+reactive Lamport/tournament.

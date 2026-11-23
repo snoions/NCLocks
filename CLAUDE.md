@@ -62,8 +62,11 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   (FCFS convoys under oversubscription). `--debug-bakery 1|2` with `--bakery-delay` must
   FAIL. `--bakery-arity K` (g5b): a tree of K-way bakery nodes instead (fewer lines read per
   acquisition; the flat bakery hits the CXL device's read bandwidth at 16-32 nodes),
-  released root to leaf (`--debug-bakery 4` = leaf first, must FAIL). CSV column
-  `bakery_arity`; sweep phases `bakery`, `kvbakery`, `bktree`, `kvbktree`. Not model-checked.
+  released root to leaf (`--debug-bakery 4` = leaf first, must FAIL). `--bakery-wait classic`
+  (g3): once a blocker was seen not choosing after our ticket was visible, wait on its ticket
+  only (default `strict` = the spec's pseudocode; `--debug-bakery 8` with classic must FAIL).
+  CSV columns `bakery_arity`, `bakery_wait`; sweep phases `bakery`, `kvbakery`, `bktree`,
+  `kvbktree`, `bkwait`, `kvbkwait`. Not model-checked.
   Biased tournaments (§4g g1, g2, g7, g8) are not implemented. Phase 2b is deprioritized
   (no measured advantage): evaluate new locks in Phase 1 and 2a.
 - `-a pthread`: reference baseline, a process-shared `pthread_mutex_t` (futex, i.e. coherent
