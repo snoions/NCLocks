@@ -53,6 +53,8 @@ set(NCL_RUN ${CMAKE_SOURCE_DIR}/scripts/ncl_run.sh)
 # rejected (exit 2, WILL_FAIL).
 add_test(NAME bench_emu_tournament
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_bench> -a tournament -b emu -n 4 -t 2 -s 0.3 -W 0.1 -P -C)
+add_test(NAME bench_cached-flush_tournament_active_subset
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_bench> -a tournament -b cached-flush -n 8 -t 2 --active 0,4 -s 0.3 -W 0.1 -r 100k -P)
 add_test(NAME bench_cached-flush_bakery_open
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_bench> -a bakery -b cached-flush -n 4 -t 2 -l 4 -s 0.3 -W 0.1 -r 200k -P)
 add_test(NAME bench_emu_server_local

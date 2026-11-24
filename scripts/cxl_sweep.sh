@@ -80,6 +80,14 @@
 #              and 2a), t1 (BAKERY_T1_NT, Phase 1, L=1). CSV column bakery_wait.
 #   kvbkwait   KV store at KV_NT, 2a, L=1024: bakery strict vs classic at each BKWAIT_K;
 #              uniform, Zipf 0.99, Zipf 0.99 + affinity 0.9
+#   g1bound    go/no-go for prefix retention (design §4g g1): only a subset of the N nodes
+#              acquires (ncl_bench --active), tournament with Lamport and reactive
+#              (REACT_BEST) as references, Phase 1 and 2a, L=1, think time G1_THINK ns, at
+#              G1_NT. Sets (config column): one {0}, near2 {0,1}, far2 {0,N/2}, near4 {0-3},
+#              far4 {0,N/4,N/2,3N/4}. Bounds = the tournament over just the levels g1 would
+#              still climb: bound1 (-n 2, node 0 alone: root only), bound2 (-n 2), bound4
+#              (-n 4). g1's ceiling: one -> bound1, far2 -> bound2, far4 -> bound4; near2
+#              and near4 meet at the leaves, where g1 retains nothing.
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
 # rep and config name; failures and warnings go to $OUT/errors.log. Runs are
@@ -100,7 +108,7 @@
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16),
 #      BAKERY_NT ("4x3 8x3 16x2 16x3 32x2"), BAKERY_T1_NT ("16x1 32x1"),
 #      BAKERY_POLL_NT ("16x3 32x2"), REACT_BEST ("12:4:64"), BKTREE_K ("0 2 4 8"),
-#      BKWAIT_K ("0 2 4")
+#      BKWAIT_K ("0 2 4"), G1_NT ("16x1 16x3 32x2"), G1_THINK ("0 2000 10000")
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -137,6 +145,8 @@ BAKERY_POLL_NT=${BAKERY_POLL_NT:-"16x3 32x2"}   # phase bakery, parts poll_pred 
 REACT_BEST=${REACT_BEST:-12:4:64}                # reactive threshold in bakery / kvbakery
 BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bakery arities (0 = flat)
 BKWAIT_K=${BKWAIT_K:-"0 2 4"}                     # phases bkwait / kvbkwait
+G1_NT=${G1_NT:-"16x1 16x3 32x2"}                 # phase g1bound
+G1_THINK=${G1_THINK:-"0 2000 10000"}             # phase g1bound: closed-loop think time, ns
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
 # U:D[:W]: up when >= U of the last 16 contended; down when <= D of the last 64, after
@@ -757,6 +767,29 @@ kvbkwait() {
   done; done
 }
 
+g1bound() {
+  local csv=$OUT/g1bound.csv; header "$csv"
+  local MODES=("-M phase1" "-M local -K 64")
+  local VARS=("-a tournament" "-a lamport" "-a reactive --react $REACT_BEST")
+  local m v th set act h q
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for nt in $G1_NT; do nt_split "$nt"; h=$((N / 2)); q=$((N / 4))
+      for th in $G1_THINK; do for m in "${MODES[@]}"; do
+        for set in "one:0" "near2:0,1" "far2:0,$h" "near4:0-3" "far4:0,$q,$h,$((h + q))"; do
+          act=${set#*:}
+          for v in "${VARS[@]}"; do
+            run "$csv" "$rep" "$c:${set%%:*}" $v $m -n "$N" -t "$T" -l 1 -T "$th" --active "$act" ${CFG[$c]} "${COMMON[@]}"
+          done
+        done
+        for set in "bound1:2:0" "bound2:2:0,1" "bound4:4:0-3"; do
+          IFS=: read -r tag n act <<<"$set"
+          run "$csv" "$rep" "$c:$tag" -a tournament $m -n "$n" -t "$T" -l 1 -T "$th" --active "$act" ${CFG[$c]} "${COMMON[@]}"
+        done
+      done; done
+    done
+  done; done
+}
+
 PHASES=${*:-"preflight p1 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
@@ -788,6 +821,7 @@ for ph in $PHASES; do
     kvbktree) kvbktree ;;
     bkwait) bkwait ;;
     kvbkwait) kvbkwait ;;
+    g1bound) g1bound ;;
     *) die "unknown phase $ph" ;;
   esac
 done

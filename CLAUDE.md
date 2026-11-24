@@ -68,7 +68,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   must FAIL).
   CSV columns `bakery_arity`, `bakery_wait`; sweep phases `bakery`, `kvbakery`, `bktree`,
   `kvbktree`, `bkwait`, `kvbkwait`. Not model-checked.
-  Biased tournaments (§4g g1, g2, g7, g8) are not implemented. Phase 2b is deprioritized
+  Biased tournaments (§4g g1, g2, g7, g8) are not implemented. Next: g1 (prefix retention;
+  the node's lock submutex is the sweeper's lease), after its go/no-go: sweep phase `g1bound`,
+  `ncl_bench --active LIST` (only those nodes acquire; CSV column `active`). Phase 2b is deprioritized
   (no measured advantage): evaluate new locks in Phase 1 and 2a.
 - `-a pthread`: reference baseline, a process-shared `pthread_mutex_t` (futex, i.e. coherent
   cross-node atomics) in the lock's metadata line. `-b coherent` and Phase 1 only (rejected

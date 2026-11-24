@@ -62,6 +62,12 @@ static const char *const h_names[] = {"lock", "service", "sojourn"};
 
 static int nnodes = 2, nthreads = 1, nlocks = 1, pin = 1, csv = 0;
 static int srv_place = NCL_SRV_PIN_NEXT;
+/* --active: nodes that run worker threads (bit n = node n); the others attach and
+ * take part in the start barrier and detach, but never acquire. 0 = all. */
+static uint64_t active_mask;
+static int nactive;
+static char active_desc[256] = "all";
+static int node_active(int n) { return (active_mask >> n) & 1; }
 static double secs = 2.0, warmup = 0.2, rate = 0;
 static int arrival = ARR_CLOSED;
 static double onoff_period_us = 1000, onoff_frac = 0.1;
@@ -128,7 +134,7 @@ struct sched {
 static void sched_init(struct sched *s, uint64_t seed)
 {
     s->rng = splitmix64(seed);
-    double per_thread = rate / (double)(nnodes * nthreads); /* req/s */
+    double per_thread = rate / (double)(nactive * nthreads); /* req/s */
     double gap = 1e9 * cyc_per_ns / per_thread;              /* cycles */
     if (arrival == ARR_ONOFF) {
         s->period = onoff_period_us * 1e3 * cyc_per_ns;
@@ -250,15 +256,16 @@ static int node_main(int node)
 {
     if (ncl_node_attach(node) < 0)
         return 2;
+    const int nt = node_active(node) ? nthreads : 0;
     struct worker *ws = calloc((size_t)nthreads, sizeof *ws);
-    for (int i = 0; i < nthreads; i++) {
+    for (int i = 0; i < nt; i++) {
         ws[i].node = node;
         ws[i].idx = i;
         pthread_create(&ws[i].tid, NULL, worker_main, &ws[i]);
     }
     harness_start();
     struct result *tot = calloc(1, sizeof *tot);
-    for (int i = 0; i < nthreads; i++) {
+    for (int i = 0; i < nt; i++) {
         pthread_join(ws[i].tid, NULL);
         tot->ops += ws[i].r.ops;
         tot->completed += ws[i].r.completed;
@@ -303,6 +310,36 @@ static int parse_arrival(const char *s)
     } else
         return -1;
     return 0;
+}
+
+/* "0,8" or "0-3,8": node ids < 64. Sets active_mask; 0 on success. */
+static int parse_active(const char *s)
+{
+    const char *p = s;
+    uint64_t m = 0;
+    while (*p) {
+        char *end;
+        long a = strtol(p, &end, 10), b = a;
+        if (end == p)
+            return -1;
+        if (*end == '-') {
+            p = end + 1;
+            b = strtol(p, &end, 10);
+            if (end == p)
+                return -1;
+        }
+        if (a < 0 || b < a || b >= NCL_MAX_NODES)
+            return -1;
+        for (long i = a; i <= b; i++)
+            m |= 1ull << i;
+        p = end;
+        if (*p == ',')
+            p++;
+        else if (*p)
+            return -1;
+    }
+    active_mask = m;
+    return m ? 0 : -1;
 }
 
 static void usage(const char *argv0)
@@ -364,6 +401,9 @@ static void usage(const char *argv0)
             "  --bakery-wait classic|strict  -a bakery: a blocker once seen not choosing is\n"
             "                waited on by its ticket only (classic, default), or waited on\n"
             "                while choosing on every read (strict)\n"
+            "  --active LIST only these nodes run workers, e.g. 0,8 or 0-3 (default all); the\n"
+            "                others take part in the lock structure but never acquire.\n"
+            "                Fairness and open-loop rates count active nodes only\n"
             "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
             "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
             "                acquisitions on the tournament (8:4:64)\n"
@@ -376,7 +416,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll,bakery_wait"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll,bakery_wait,active"
 
 int main(int argc, char **argv)
 {
@@ -395,6 +435,7 @@ int main(int argc, char **argv)
         {"bakery-poll", required_argument, 0, 1007},
         {"bakery-arity", required_argument, 0, 1008},
         {"bakery-wait", required_argument, 0, 1009},
+        {"active", required_argument, 0, 1010},
         {"wait", required_argument, 0, 1004},
         {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
@@ -493,6 +534,16 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "--bakery-wait: strict|classic\n"); return 2; }
             break;
 
+        case 1010:
+            if (parse_active(optarg) < 0) {
+                fprintf(stderr, "--active: node list, e.g. 0,8 or 0-3\n");
+                return 2;
+            }
+            snprintf(active_desc, sizeof active_desc, "%s", optarg);
+            for (char *q = active_desc; *q; q++) /* CSV-safe */
+                if (*q == ',')
+                    *q = ';';
+            break;
         case 1007:
             if (!strcmp(optarg, "all")) ncl_bakery_poll_all = 1;
             else if (!strcmp(optarg, "pred")) ncl_bakery_poll_all = 0;
@@ -555,6 +606,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "warmup (-W) must be shorter than the run (-s)\n");
         return 2;
     }
+
+    if (nnodes < 1 || nnodes > NCL_MAX_NODES) {
+        fprintf(stderr, "-n: 1..%d\n", NCL_MAX_NODES);
+        return 2;
+    }
+    if (!active_mask)
+        active_mask = nnodes == 64 ? ~0ull : (1ull << nnodes) - 1;
+    if (active_mask >> (nnodes - 1) >> 1) {
+        fprintf(stderr, "--active: node ids must be < -n (%d)\n", nnodes);
+        return 2;
+    }
+    nactive = __builtin_popcountll(active_mask);
 
     stride = (footprint + NCL_CACHELINE - 1) & ~(size_t)(NCL_CACHELINE - 1);
     if (!stride)
@@ -624,6 +687,8 @@ int main(int argc, char **argv)
     double unserved = tot->offered ? (double)tot->unserved / (double)tot->offered : 0;
     uint64_t nmin = UINT64_MAX, nmax = 0;
     for (int n = 0; n < nnodes; n++) {
+        if (!node_active(n))
+            continue;
         if (node_done[n] < nmin) nmin = node_done[n];
         if (node_done[n] > nmax) nmax = node_done[n];
     }
@@ -658,7 +723,7 @@ int main(int argc, char **argv)
         snprintf(bak_arity, sizeof bak_arity, "%d", ncl_bakery_arity);
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s,%s\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s,%s,%s\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -688,13 +753,16 @@ int main(int argc, char **argv)
                cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER ? "-" : WAIT_NAME(cfg.handoff_wait),
                PER(tot->ho.grant_polls), ho_desc, PER(tot->ho.gate_skips), bak_arity,
                cfg.alg != NCL_ALG_BAKERY ? "-" : ncl_bakery_poll_all ? "all" : "pred",
-               cfg.alg != NCL_ALG_BAKERY ? "-" : ncl_bakery_wait_classic ? "classic" : "strict");
+               cfg.alg != NCL_ALG_BAKERY ? "-" : ncl_bakery_wait_classic ? "classic" : "strict",
+               active_desc);
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), ncl_mode_name(cfg.mode),
                cfg.no_submutex ? "+no_submutex" : "", nnodes, nthreads, nlocks, cs_ns, footprint,
                cfg.dev_lat_ns, secs, warmup);
+        if (nactive < nnodes)
+            printf("active nodes: %s (%d of %d)\n", active_desc, nactive, nnodes);
         printf("mem: %s\n", ncl_mem_describe());
         printf("cpus: %s\n", pin ? ncl_cpus_describe() : "unpinned");
         if (arrival == ARR_CLOSED)
@@ -713,7 +781,8 @@ int main(int argc, char **argv)
                    (unsigned long)hist_pct(x, 0.99), (unsigned long)hist_pct(x, 0.999),
                    (unsigned long)x->max);
         }
-        printf("per-node completions (min/max = %.3f):", fair);
+        printf("per-node completions (min/max = %.3f%s):", fair,
+               nactive < nnodes ? " over active nodes" : "");
         for (int n = 0; n < nnodes; n++)
             printf(" %lu", (unsigned long)node_done[n]);
         printf("\n");
