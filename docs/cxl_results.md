@@ -1026,3 +1026,55 @@ the tournament). In the KV store, it never wins. Per level, a 2-way bakery node 
 (previous section) is still unmeasured. An adaptive root (§4g g7) can at best pick the better
 of the two root algorithms per regime; with these numbers it would not beat
 reactive Lamport/tournament.
+
+## Bakery wait rule (`bkwait`, `kvbkwait`, 2026-11-23 22:52)
+
+`results/cxl_20261123_2252/`: `--bakery-wait strict` (default, the spec's pseudocode) vs
+`classic` (design §4g g3) at flat, K=2 and K=4, with the tournament as reference; cf + clwb,
+CXL node 2, 3 reps, medians, 438 + 54 runs, no errors. Spread is mostly below 5% (max 10%).
+k acquisitions/s, classic / strict.
+
+**Contended (L=1, Phase 1):**
+
+| N x T | tournament | flat | K2 | K4 |
+|---|---|---|---|---|
+| 4x3 | **420** | 291 / 201 | 375 / 297 | |
+| 8x3 | **496** | 246 / 179 | 384 / 373 | 334 / 283 |
+| 16x2 | **490** | 228 / 142 | 386 / 387 | 332 / 311 |
+| 16x3 | **485** | 220 / 147 | 380 / 382 | 330 / 299 |
+| 32x2 | **473** | 205 / 110 | 374 / 374 | 362 / 335 |
+| 16x1 | **507** | 232 / 142 | 388 / 394 | 341 / 366 |
+| 32x1 | **510** | 216 / 105 | 377 / 380 | 370 / 334 |
+
+- **The flat bakery gains 1.4-2.1x**, more at larger N: the strict rule was most of its
+  contended cost. K4 gains 0-11% (16x1: -7%, within its 8% spread). K2 is unchanged at 8 nodes and above.
+  At 4x3, where the tree has a single 2-way root, it gains 26%.
+- **The tournament still leads by 22-27%** over the best bakery (K2 at 8+ nodes). The
+  strict rule does not explain the K2 tree's slower handoff.
+- Likely reason (hypothesis; the CSV has no bakery counters): the choosing case shows up
+  in the batched re-read of the *other* blockers after the predecessor changes. A
+  2-way node has no other blockers, so the predecessor poll sees its slot change to 0
+  before the re-entry.
+
+**L=16:**
+
+| N x T | 2a: tournament | flat | K4 | P1: tournament | flat | K4 |
+|---|---|---|---|---|---|---|
+| 4x3 | 2502 | **2719** / 2646 | | 2285 | **2422** / 2286 | |
+| 8x3 | 3277 | **3689** / 3436 | 3112 / 3051 | 2972 | **3232** / 2835 | 2757 / 2681 |
+| 16x2 | 3276 | **3668** / 3431 | 3402 / 3352 | 3074 | **3476** / 2849 | 3253 / 3152 |
+| 16x3 | **4241** | 4154 / 3885 | 4149 / 4043 | **3808** | 3316 / 2212 | 3652 / 3570 |
+| 32x2 | **4195** | 3621 / 3276 | 3952 / 3879 | **3923** | 3244 / 1670 | 3664 / 3667 |
+
+- With classic, the flat bakery beats the tournament at L=16 up to 16x2 (+6-13%). At 16x3
+  and 32x2 the tournament stays ahead. Phase 1 flat 32x2 nearly doubles (1670 → 3244),
+  and its p99 drops from 623 to 119 us.
+- 2a L=1: flat +4-10%, the trees ±2%; all within 3% of the tournament.
+
+**KV store (16x3, 2a, L=1024):** classic vs strict within ±2.5% everywhere (Zipf: flat
+3.60 / 3.53M, K4 5.46 / 5.33M; uniform flat 7.52 / 7.68M). Cohort passing and the many locks
+hide the doorway.
+
+**Summary.** Classic is never worse beyond noise and fixes most of the flat bakery's
+contended handoff. It does not change the overall picture: under contention the
+tournament still wins at every N, by about 22% over K2.
