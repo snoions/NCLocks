@@ -1078,3 +1078,46 @@ hide the doorway.
 **Summary.** Classic is never worse beyond noise and fixes most of the flat bakery's
 contended handoff. It does not change the overall picture: under contention the
 tournament still wins at every N, by about 22% over K2.
+
+## Prefix-retention go/no-go (`g1bound`, 2026-11-24 21:00)
+
+`results/cxl_20261124_2100/`: design §4g g1's ceiling. Only a subset of the N nodes
+acquires (`ncl_bench --active`), L=1, closed loop with think time 0 / 2 / 10 us; the bound
+is the tournament over just the levels g1 would still climb (`-n 2` with node 0 alone for
+one node, `-n 2` for {0, N/2}, `-n 4` for {0, N/4, N/2, 3N/4}). cf + clwb, CXL node 2,
+2 reps, medians, 648 runs, no failed runs. Median spread 3.8%; 41 of 324 cells spread more
+than 15%, mostly the leaf-meeting subsets (near2, near4) and reactive there (it flips
+modes between runs). The bound runs use other CPUs than the subset runs (nodes 0..n-1
+are adjacent), which is not controlled. The bound ignores g1's own costs (release check,
+sweeper).
+
+**Bound / best existing lock** (the best of tournament, Lamport and reactive at the same
+subset), by think time 0 / 2 / 10 us:
+
+| N x T, mode | one {0} | far2 {0, N/2} | far4 {0, N/4, N/2, 3N/4} |
+|---|---|---|---|
+| 16x1 P1 | 1.55 / 1.28 / 1.10 | 2.08 / 1.15 / 1.05 | 1.05 / 1.33 / 1.20 |
+| 16x1 2a | 1.41 / 1.21 / 1.08 | 1.62 / 1.15 / 1.05 | 1.08 / 1.21 / 1.24 |
+| 16x3 P1 | 1.43 / 1.32 / 1.09 | 1.49 / 1.48 / 1.83 | 0.93 / 0.96 / 0.91 |
+| 16x3 2a | 1.04 / 1.33 / 1.08 | 1.09 / 1.52 / 1.08 | 1.00 / 1.08 / 1.17 |
+| 32x2 P1 | 1.54 / 1.46 / 1.07 | 1.96 / 2.00 / 1.53 | 1.30 / 1.20 / 1.56 |
+| 32x2 2a | 1.11 / 1.19 / 1.08 | 1.21 / 2.06 / 1.05 | 1.16 / 1.37 / 1.38 |
+
+Against the plain tournament alone the bound is 1.2-3.7x for one node, 1.15-2.1x for
+far2 and 0.9-1.7x for far4.
+
+- **Go.** The bound beats every existing lock by >= 10% in 36 of 54 cells, by 8-106% (median 21%) in
+  2a at think 2 us (the deployment case, moderate load). It does not help where cohort
+  passing already hides the global path (2a, think 0: 0-21%), at light load for a single
+  node (think 10 us: 7-10%), or for 4 contenders at 16x3 Phase 1 (0.91-0.96; the
+  tournament with 2 unused lower levels is slightly faster than `-n 4`, possibly the CPU
+  placement).
+- **Per level.** Lock p50 for one node at 16x1 P1: tournament (4 levels) 5.2 us, bound
+  (root only) 1.3 us, Lamport 2.2 us: ~1.3 us per uncontended Peterson level, and one
+  level is cheaper than Lamport's fast path. g1's release check (one load round) comes out
+  of that 0.9 us margin; the acquire check alone is free on cf.
+- **Leaf meetings cost the tournament dearly.** {0,1} vs {0,8} at 16x1 P1 think 0: 155k vs
+  249k; 16x3 2a think 2 us: 371k vs 578k. The waiter climbs the upper levels after every
+  handoff, on the critical path. g1 keeps nothing there (g2's case).
+- **Reactive mispicks near2.** It often runs the tournament where Lamport is faster (16x1
+  P1 think 2 us: 239k vs 339k; 32x2 P1 think 10 us: 89k vs 239k), bimodal between runs.
