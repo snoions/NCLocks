@@ -207,6 +207,9 @@ struct ncl_sys_cfg {
     int debug_no_grant_wait; /* handoff, --wait own: clear the announce without waiting
                                 for a grant still on its way (unsafe with full-line
                                 writeback of the announce line) */
+    int retain;             /* 1: TOURNAMENT prefix retention (design §4g g1; Phase 1 and
+                               LOCAL, needs the submutex): a per-node sweeper thread drops
+                               kept levels (ncl_retain_poll_us, ncl_retain_lease_us) */
     /* EMU split: write back only the stored word of a cached metadata line (the old
      * model). Default 0: write back the node's whole line, as hardware does. */
     int emu_word_wb;
@@ -263,6 +266,23 @@ struct ncl_node_stats {
     struct ncl_srv_stats srv;
     struct ncl_handoff_stats ho;
 };
+
+/* cfg.retain sweeper (set in every process before ncl_node_attach): poll
+ * period (us; 0 = sched_yield between polls) and lease (us since the levels
+ * were kept; 0 = drop at the first poll). Defaults 10 and 1000. The sweeper is
+ * required for liveness: the acquire and release checks only cover the lock
+ * being acquired or released, so a node keeping levels of lock X while it waits
+ * for lock Y deadlocks with a node waiting for X while keeping levels of Y.
+ * Poll < 0 (--retain-poll off) runs without it: a negative test (must hang with
+ * several locks). */
+extern int ncl_retain_poll_us, ncl_retain_lease_us;
+/* Command-line helper shared by the binaries: --retain-check acquire|release|both|none
+ * (sets ncl_retain_check), --retain-poll US|off, --retain-lease US, --retain-max N,
+ * --retain-penalty P (0 = always keep). opt: "check", "poll", "lease", "max",
+ * "penalty". 0 or -1 (message printed). */
+int ncl_retain_opt(const char *opt, const char *arg);
+/* "both/poll10/lease1000/max0"-style description for reports ("-" if !cfg.retain). */
+const char *ncl_retain_describe(char *buf, size_t n);
 
 /* MODE_HANDOFF: overlap the global release's data writeback with the
  * release path's leading metadata loads (default 1; set in every process). */

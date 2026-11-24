@@ -42,7 +42,7 @@ static long iters = 100000;
 static int timeout_s = 0;
 static unsigned reset_delay_ns = 0;
 static unsigned grant_delay_ns = 0;
-static unsigned lamport_delay_ns = 0, mode_delay_ns = 0, bakery_delay_ns = 0;
+static unsigned lamport_delay_ns = 0, mode_delay_ns = 0, bakery_delay_ns = 0, retain_delay_ns = 0;
 static unsigned max_delay_ns = 200;
 static size_t stride;
 static uint64_t delay_cycles;
@@ -198,6 +198,13 @@ static int node_main(int node)
         printf(" bak_pred_polls=%lu bak_rescans=%lu bak_choosing_seen=%lu bak_classic_drops=%lu",
                (unsigned long)sb.bak_pred_polls, (unsigned long)sb.bak_rescans,
                (unsigned long)sb.bak_choosing_seen, (unsigned long)sb.bak_classic_drops);
+    if (sb.ret_hits || sb.ret_rel_drops || sb.ret_sweep_drops || sb.ret_lease_drops)
+        printf(" ret_hits=%lu ret_skipped=%lu ret_acq_drops=%lu ret_rel_drops=%lu"
+               " ret_sweep_drops=%lu ret_lease_drops=%lu ret_sweep_busy=%lu",
+               (unsigned long)sb.ret_hits, (unsigned long)sb.ret_levels_skipped,
+               (unsigned long)sb.ret_acq_drops, (unsigned long)sb.ret_rel_drops,
+               (unsigned long)sb.ret_sweep_drops, (unsigned long)sb.ret_lease_drops,
+               (unsigned long)sb.ret_sweep_busy);
     if (st.ho.stale_announce)
         printf(" STALE_ANNOUNCE=%lu", (unsigned long)st.ho.stale_announce);
     if (st.global_releases != st.acquires)
@@ -269,6 +276,17 @@ static void usage(const char *argv0)
             "                was visible, wait on its ticket only (classic, default), or wait\n"
             "                while j is choosing on every read (strict)\n"
             "  --bakery-delay NS  DEBUG: bakery spins between reading tickets and publishing its own\n"
+            "  --retain      tournament: prefix retention (design.md §4g g1) with a per-node sweeper\n"
+            "  --retain-check both|acquire|release|none  where kept levels are checked for\n"
+            "                waiters (default both)\n"
+            "  --retain-poll US|off  sweeper poll period (10; 0 = yield; off = no sweeper: UNSAFE,\n"
+            "                cross-lock deadlock, must hang with several locks)\n"
+            "  --retain-lease US  sweeper drops kept levels this long after they were kept (1000)\n"
+            "  --retain-max N  at most N locks with kept levels per node (0 = no limit)\n"
+            "  --retain-penalty P  adaptive keep policy (16; 0 = always keep)\n"
+            "  --debug-retain BITS  retain, UNSAFE: 1 = sweeper drops without the submutex,\n"
+            "                2 = release drops only the waiter's level (not contiguous)\n"
+            "  --retain-delay NS  DEBUG: acquirer spins between reading its kept levels and climbing\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
@@ -321,6 +339,14 @@ int main(int argc, char **argv)
         {"bakery-poll", required_argument, 0, 19},
         {"bakery-arity", required_argument, 0, 20},
         {"bakery-wait", required_argument, 0, 21},
+        {"retain", no_argument, 0, 22},
+        {"retain-check", required_argument, 0, 23},
+        {"retain-poll", required_argument, 0, 24},
+        {"retain-lease", required_argument, 0, 25},
+        {"retain-max", required_argument, 0, 26},
+        {"debug-retain", required_argument, 0, 27},
+        {"retain-delay", required_argument, 0, 28},
+        {"retain-penalty", required_argument, 0, 29},
         {"help", no_argument, 0, 'h'},
         HARNESS_LONGOPTS,
         {0, 0, 0, 0},
@@ -408,6 +434,14 @@ int main(int argc, char **argv)
         case 17: ncl_debug_bakery = atoi(optarg); break;
         case 18: bakery_delay_ns = (unsigned)atoi(optarg); break;
         case 20: ncl_bakery_arity = atoi(optarg); break;
+        case 22: cfg.retain = 1; break;
+        case 23: if (ncl_retain_opt("check", optarg) < 0) return 2; break;
+        case 24: if (ncl_retain_opt("poll", optarg) < 0) return 2; break;
+        case 25: if (ncl_retain_opt("lease", optarg) < 0) return 2; break;
+        case 26: if (ncl_retain_opt("max", optarg) < 0) return 2; break;
+        case 27: ncl_debug_retain = atoi(optarg); break;
+        case 28: retain_delay_ns = (unsigned)atoi(optarg); break;
+        case 29: if (ncl_retain_opt("penalty", optarg) < 0) return 2; break;
         case 21:
             if (!strcmp(optarg, "classic")) ncl_bakery_wait_classic = 1;
             else if (!strcmp(optarg, "strict")) ncl_bakery_wait_classic = 0;
@@ -524,6 +558,7 @@ int main(int argc, char **argv)
     ncl_debug_lamport_delay = ncl_ns_to_cycles(lamport_delay_ns);
     ncl_debug_mode_delay = ncl_ns_to_cycles(mode_delay_ns);
     ncl_debug_bakery_delay = ncl_ns_to_cycles(bakery_delay_ns);
+    ncl_debug_retain_delay = ncl_ns_to_cycles(retain_delay_ns);
 
     int rc = node_main(harness.node);
     if (rc || harness.node != 0) {

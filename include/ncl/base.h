@@ -118,6 +118,13 @@ struct ncl_base {
     int bak_k;         /* BAKERY: arity (P: one flat node) */
     int bak_levels;    /* BAKERY: tree levels (1: flat) */
     int bak_cnt[32];   /* BAKERY: entities (= seats) at each level; level 0 = P */
+    /* TOURNAMENT with prefix retention (ncl_retain, design §4g g1), node-local.
+     * Read and written only by the holder of the lock's node-local submutex (the
+     * sweeper reads them unlocked, but acts only after taking it). */
+    _Atomic int kept_levels;     /* levels 1..kept_levels (leaf side) still held */
+    _Atomic uint64_t kept_since; /* CLOCK_MONOTONIC ns when they were kept (lease) */
+    int ret_credit;              /* ncl_retain_penalty > 0: keep levels only while >= 0 */
+    int ret_pen;                 /* current penalty (0 = ncl_retain_penalty) */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -147,6 +154,16 @@ struct ncl_base_stats {
     uint64_t bak_pred_polls;    /* BAKERY: loads of the predecessor's slot while waiting */
     uint64_t bak_rescans;       /* BAKERY: batched re-reads of the remaining blockers */
     uint64_t bak_classic_drops; /* BAKERY classic wait: blockers dropped while choosing */
+    uint64_t ret_hits;          /* TOURNAMENT retain: acquisitions starting above the leaf */
+    uint64_t ret_levels_skipped; /* ...levels not climbed */
+    uint64_t ret_acq_drops;     /* acquire check found a waiter on a kept level */
+    uint64_t ret_rel_drops;     /* release check found a waiter on a level it would keep */
+    uint64_t ret_cap_skips;     /* release kept nothing: ncl_retain_max locks already kept */
+    uint64_t ret_sweep_drops;   /* sweeper dropped for a waiter */
+    uint64_t ret_lease_drops;   /* sweeper dropped on lease expiry */
+    uint64_t ret_sweep_busy;    /* sweeper's try-lock of the submutex failed */
+    uint64_t ret_sweep_polls;   /* sweeper polls that found kept levels to check */
+    uint64_t ret_policy_skips;  /* release kept nothing: the lock's credit is negative */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -294,6 +311,50 @@ extern int ncl_bakery_wait_classic;
  * leaf. Fixes the scan-region layout: set before ncl_sys_create and keep it
  * the same in every process. */
 extern int ncl_bakery_arity;
+
+/* ---- TOURNAMENT prefix retention (design §4g g1; NOT model-checked) --------
+ * With ncl_retain set (from cfg.retain at ncl_node_attach), a TOURNAMENT lock's
+ * global release clears the root and then only the levels down to the lowest
+ * one with a waiter, keeping a contiguous leaf-side prefix 1..kept_levels; the
+ * next acquisition by this node starts above it. Every access to kept_levels
+ * and to this node's flags in the tree is made holding the lock's node-local
+ * submutex: workers do, and the node's sweeper (src/lock.c) try-locks it before
+ * it drops anything. Waiters on kept levels are found by the release check, the
+ * acquire check (in the batch the first climbed level reads anyway) and the
+ * sweeper. */
+extern int ncl_retain;
+enum { NCL_RETAIN_CHECK_ACQUIRE = 1, NCL_RETAIN_CHECK_RELEASE = 2 };
+extern int ncl_retain_check; /* NCL_RETAIN_CHECK_* bits (default both) */
+extern int ncl_retain_max;   /* at most this many locks kept per node (0 = no limit) */
+/* Adaptive policy (0 = always keep): per lock, node-local, a credit that a hit
+ * (an acquisition reusing kept levels) raises by 1 (up to 8), a drop forced by
+ * a waiter (acquire check or sweeper) lowers by the current penalty, and every
+ * global release that keeps nothing raises by 1 (so it probes again after
+ * penalty releases); a release keeps levels only while the credit is >= 0. The
+ * penalty starts at ncl_retain_penalty, doubles with every forced drop (up to
+ * NCL_RETAIN_PENALTY_MAX) and returns to the start when the credit reaches 8
+ * (a run of hits). Without reuse, a waiter on an idle node's kept levels waits
+ * for its sweeper, which costs far more than a hit saves. */
+#define NCL_RETAIN_PENALTY_MAX 4096
+extern int ncl_retain_penalty;
+/* Locks with kept levels on this node (for ncl_retain_max). */
+extern _Atomic int ncl_retained_locks;
+/* DEBUG bits (ncl_stress --debug-retain), each UNSAFE: 1 = the sweeper drops
+ * without taking the submutex (races a re-entering thread), 2 = the release
+ * check drops only the waiter's level and keeps the ones above it (not
+ * contiguous). ncl_debug_retain_delay (--retain-delay): cycles an acquirer
+ * spins between reading kept_levels and climbing. */
+extern int ncl_debug_retain;
+extern uint64_t ncl_debug_retain_delay;
+/* Tree depth (levels; 0 when P = 1). */
+int ncl_tour_depth(const struct ncl_base *b);
+/* The opposing flags of levels 1..kept for participant i, out[l - 1] (kept <=
+ * depth - 1). A nonzero value means a waiter on that level. */
+void ncl_tour_kept_lines(const struct ncl_base *b, int i, int kept, ncl_line_t **out);
+/* Holding the submutex: drop kept levels from kept_levels down to `lowest`
+ * (>= 1), top-down, store-store ordered; kept_levels becomes lowest - 1.
+ * waiter: the drop is for a waiter (charges the adaptive policy). */
+void ncl_tour_drop(struct ncl_base *b, int i, int lowest, int waiter);
 
 /* Exponential backoff for spin loops (pause iterations, capped). */
 extern unsigned ncl_backoff_cap;

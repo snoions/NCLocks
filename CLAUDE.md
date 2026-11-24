@@ -68,9 +68,18 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   must FAIL).
   CSV columns `bakery_arity`, `bakery_wait`; sweep phases `bakery`, `kvbakery`, `bktree`,
   `kvbktree`, `bkwait`, `kvbkwait`. Not model-checked.
-  Biased tournaments (§4g g1, g2, g7, g8) are not implemented. Next: g1 (prefix retention;
-  the node's lock submutex is the sweeper's lease), after its go/no-go: sweep phase `g1bound`,
-  `ncl_bench --active LIST` (only those nodes acquire; CSV column `active`). Phase 2b is deprioritized
+  Biased tournaments g2, g7, g8 are not implemented.
+- `-a tournament --retain` (design §4g g1, not model-checked): prefix retention. A global
+  release keeps the levels below the lowest one with a waiter (`kept_levels`, node-local); the
+  next acquisition starts above them. Waiters on kept levels are found by the release and
+  acquire checks (`--retain-check`) and a per-node sweeper thread (`--retain-poll`,
+  `--retain-lease`, `--retain-max`), which drops only after try-locking the lock's submutex
+  (the submutex is the lease; `ncl_sub_trylock`). The sweeper is required for liveness
+  (cross-lock deadlock without it). Adaptive keep policy, `--retain-penalty` (default 16; 0 =
+  keep at every release): without it, many locks without reuse collapse (waiters wait for
+  sweepers). Phase 1 and 2a, needs the submutex. `--debug-retain 1|2` and `--retain-poll off`
+  must FAIL. `ncl_bench --active LIST`: only those nodes acquire (CSV column `active`); sweep
+  phases `g1bound` (go/no-go, measured: go) and `g1`; CSV columns `retain`, `ret_*_per_acq`. Phase 2b is deprioritized
   (no measured advantage): evaluate new locks in Phase 1 and 2a.
 - `-a pthread`: reference baseline, a process-shared `pthread_mutex_t` (futex, i.e. coherent
   cross-node atomics) in the lock's metadata line. `-b coherent` and Phase 1 only (rejected

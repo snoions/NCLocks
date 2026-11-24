@@ -88,6 +88,15 @@
 #              still climb: bound1 (-n 2, node 0 alone: root only), bound2 (-n 2), bound4
 #              (-n 4). g1's ceiling: one -> bound1, far2 -> bound2, far4 -> bound4; near2
 #              and near4 meet at the leaves, where g1 retains nothing.
+#   g1         prefix retention (-a tournament --retain, design §4g g1) at the g1bound
+#              subsets (one, far2, far4, near2) against the plain tournament, reactive
+#              (REACT_BEST) and the bounds, now on the same CPUs as the subset they bound
+#              (--cpus: the bound's node k runs where the subset's k-th node runs). Variants
+#              G1_VARIANTS (retain = defaults: both checks, adaptive policy; retain_always =
+#              keep at every release; retain_acq = acquire check only), Phase 1
+#              and 2a, L=1, think G1_THINK, at G1_NT. Part all (think 0): every node active,
+#              L = 1, 16, 256: what retention costs when contended or spread over many locks.
+#              CSV columns retain, ret_*_per_acq.
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
 # rep and config name; failures and warnings go to $OUT/errors.log. Runs are
@@ -108,7 +117,8 @@
 #      RATES1 / RATES256 (open2b offered loads at L=1 / L=256), OPEN2B_N (16),
 #      BAKERY_NT ("4x3 8x3 16x2 16x3 32x2"), BAKERY_T1_NT ("16x1 32x1"),
 #      BAKERY_POLL_NT ("16x3 32x2"), REACT_BEST ("12:4:64"), BKTREE_K ("0 2 4 8"),
-#      BKWAIT_K ("0 2 4"), G1_NT ("16x1 16x3 32x2"), G1_THINK ("0 2000 10000")
+#      BKWAIT_K ("0 2 4"), G1_NT ("16x1 16x3 32x2"), G1_THINK ("0 2000 10000"),
+#      G1_VARIANTS ("retain retain_always")
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -146,7 +156,8 @@ REACT_BEST=${REACT_BEST:-12:4:64}                # reactive threshold in bakery 
 BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bakery arities (0 = flat)
 BKWAIT_K=${BKWAIT_K:-"0 2 4"}                     # phases bkwait / kvbkwait
 G1_NT=${G1_NT:-"16x1 16x3 32x2"}                 # phase g1bound
-G1_THINK=${G1_THINK:-"0 2000 10000"}             # phase g1bound: closed-loop think time, ns
+G1_THINK=${G1_THINK:-"0 2000 10000"}             # phases g1bound, g1: closed-loop think time, ns
+G1_VARIANTS=${G1_VARIANTS:-"retain retain_always"} # phase g1: retention variants (g1_variant)
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
 # U:D[:W]: up when >= U of the last 16 contended; down when <= D of the last 64, after
@@ -790,6 +801,65 @@ g1bound() {
   done; done
 }
 
+# CPUs (comma list) that the given nodes' threads use under the default slot
+# mapping (node n, thread t -> slot n*T+t of CPUNODE's CPU list): T NODE...
+cpus_of_nodes() {
+  local t=$1; shift
+  local all=() part a b x n out=()
+  IFS=, read -ra part <<<"$(cat /sys/devices/system/node/node"$CPUNODE"/cpulist)"
+  for x in "${part[@]}"; do
+    a=${x%-*}; b=${x#*-}
+    for ((c = a; c <= b; c++)); do all+=("$c"); done
+  done
+  for n in "$@"; do
+    for ((x = 0; x < t; x++)); do out+=("${all[$(((n * t + x) % ${#all[@]}))]}"); done # wraps like ncl_cpu_slot
+  done
+  local IFS=,; echo "${out[*]}"
+}
+
+g1_variant() {
+  case $1 in
+    retain) echo "-a tournament --retain" ;;
+    retain_acq) echo "-a tournament --retain --retain-check acquire" ;;
+    retain_always) echo "-a tournament --retain --retain-penalty 0" ;;
+    *) die "unknown G1_VARIANTS entry $1" ;;
+  esac
+}
+
+g1() {
+  local csv=$OUT/g1.csv; header "$csv"
+  local MODES=("-M phase1" "-M local -K 64")
+  local m v th set act h q tag nodes nn vn l
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for nt in $G1_NT; do nt_split "$nt"; h=$((N / 2)); q=$((N / 4))
+      for th in $G1_THINK; do for m in "${MODES[@]}"; do
+        for set in "one:0" "far2:0,$h" "far4:0,$q,$h,$((h + q))" "near2:0,1"; do
+          tag=${set%%:*}; act=${set#*:}
+          for v in "-a tournament" "-a reactive --react $REACT_BEST"; do
+            run "$csv" "$rep" "$c:$tag" $v $m -n "$N" -t "$T" -l 1 -T "$th" --active "$act" ${CFG[$c]} "${COMMON[@]}"
+          done
+          for vn in $G1_VARIANTS; do
+            run "$csv" "$rep" "$c:$tag" $(g1_variant "$vn") $m -n "$N" -t "$T" -l 1 -T "$th" --active "$act" ${CFG[$c]} "${COMMON[@]}"
+          done
+        done
+        # Bounds on the CPUs of the subset they bound.
+        # bound1's idle node 1 gets node h's CPUs: every slot needs its own CPU.
+        for set in "bound1:2:0:0 $h" "bound2:2:0,1:0 $h" "bound4:4:0-3:0 $q $h $((h + q))"; do
+          IFS=: read -r tag nn act nodes <<<"$set"
+          local cpus; cpus=$(cpus_of_nodes "$T" $nodes)
+          run "$csv" "$rep" "$c:$tag" -a tournament $m -n "$nn" -t "$T" -l 1 -T "$th" --active "$act" --cpus "$cpus" ${CFG[$c]} "${COMMON[@]}"
+        done
+      done; done
+      for m in "${MODES[@]}"; do for l in 1 16 256; do
+        for v in "-a tournament" $(for vn in $G1_VARIANTS; do echo "$vn"; done); do
+          [ "$v" = "-a tournament" ] || v=$(g1_variant "$v")
+          run "$csv" "$rep" "$c:all" $v $m -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+        done
+      done; done
+    done
+  done; done
+}
+
 PHASES=${*:-"preflight p1 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
@@ -822,6 +892,7 @@ for ph in $PHASES; do
     bkwait) bkwait ;;
     kvbkwait) kvbkwait ;;
     g1bound) g1bound ;;
+    g1) g1 ;;
     *) die "unknown phase $ph" ;;
   esac
 done

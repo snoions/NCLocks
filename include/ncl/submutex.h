@@ -43,6 +43,20 @@ static inline void ncl_sub_lock(struct ncl_submutex *m, struct ncl_qnode *q)
     m->holder = q;
 }
 
+/* Take m only if it is free (nobody holds it or waits for it); 1 on success.
+ * Release with ncl_sub_unlock. */
+static inline bool ncl_sub_trylock(struct ncl_submutex *m, struct ncl_qnode *q)
+{
+    atomic_store_explicit(&q->next, NULL, memory_order_relaxed);
+    atomic_store_explicit(&q->locked, 0, memory_order_relaxed);
+    struct ncl_qnode *expect = NULL;
+    if (!atomic_compare_exchange_strong_explicit(&m->tail, &expect, q, memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return false;
+    m->holder = q;
+    return true;
+}
+
 /* True if another thread is queued behind the holder. Caller holds m. */
 static inline bool ncl_sub_has_waiter(struct ncl_submutex *m)
 {

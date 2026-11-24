@@ -2,10 +2,12 @@
 #include "ncl/cpus.h"
 #include "server.h"
 
+#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define NCL_MAGIC 0x4e434c4f434b5331ull /* "NCLOCKS1" */
 
@@ -247,6 +249,11 @@ static int sys_open(const struct ncl_sys_cfg *c, const char *path, int attach)
         fprintf(stderr, "ncl: pthread runs in phase1 mode only\n");
         return -1;
     }
+    if (c->retain && ((c->alg != NCL_ALG_TOURNAMENT && !c->alg_per_lock) ||
+                      c->mode == NCL_MODE_HANDOFF || c->no_submutex)) {
+        fprintf(stderr, "ncl: retain: tournament, phase1 or local mode, with the submutex\n");
+        return -1;
+    }
     int server = c->alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(c->alg);
     if (server && c->no_submutex) {
         fprintf(stderr, "ncl: %s needs the local submutex (no ablation)\n", ncl_alg_name(c->alg));
@@ -431,6 +438,150 @@ ncl_alg_t ncl_lock_alg(int lock)
     return (ncl_alg_t)d[lock].alg;
 }
 
+/* ---- prefix-retention sweeper (design §4g g1) -----------------------------
+ * One thread per node. It polls the opposing flags of every kept level of this
+ * node's locks in batches, without any claim (kept_levels read unlocked may be
+ * stale: that only makes it look at the wrong lines). On a waiter or an expired
+ * lease it try-locks the lock's submutex: the submutex is the lease, so a drop
+ * never overlaps a thread climbing from its kept levels. Holding it, it drops
+ * every kept level (kept_levels may have changed since the poll) and unlocks
+ * plainly; global_held is 0 whenever the submutex is free, so the next thread
+ * knows it holds nothing globally. If the try-lock fails, a thread is in or
+ * entering the protocol and its acquire or release check finds the waiter. */
+
+int ncl_retain_poll_us = 10, ncl_retain_lease_us = 1000;
+static pthread_t sweeper_tid;
+static int sweeper_on;
+static _Atomic int sweeper_stop;
+static struct ncl_base_stats sweep_st; /* written by the sweeper only; read after join */
+static struct ncl_qnode sweep_q;       /* the sweeper's (or detach's) submutex queue node */
+
+int ncl_retain_opt(const char *opt, const char *arg)
+{
+    char *end;
+    if (!strcmp(opt, "check")) {
+        if (!strcmp(arg, "both")) ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE | NCL_RETAIN_CHECK_RELEASE;
+        else if (!strcmp(arg, "acquire")) ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE;
+        else if (!strcmp(arg, "release")) ncl_retain_check = NCL_RETAIN_CHECK_RELEASE;
+        else if (!strcmp(arg, "none")) ncl_retain_check = 0;
+        else { fprintf(stderr, "--retain-check: both|acquire|release|none\n"); return -1; }
+        return 0;
+    }
+    if (!strcmp(opt, "poll") && !strcmp(arg, "off")) {
+        ncl_retain_poll_us = -1;
+        return 0;
+    }
+    long v = strtol(arg, &end, 10);
+    if (*end || v < 0 || v > 100000000) {
+        fprintf(stderr, "--retain-%s: a number >= 0%s\n", opt, !strcmp(opt, "poll") ? " or off" : "");
+        return -1;
+    }
+    if (!strcmp(opt, "poll")) ncl_retain_poll_us = (int)v;
+    else if (!strcmp(opt, "lease")) ncl_retain_lease_us = (int)v;
+    else if (!strcmp(opt, "max")) ncl_retain_max = (int)v;
+    else if (!strcmp(opt, "penalty")) ncl_retain_penalty = (int)v;
+    else return -1;
+    return 0;
+}
+
+const char *ncl_retain_describe(char *buf, size_t n)
+{
+    if (!cfg.retain) {
+        snprintf(buf, n, "-");
+        return buf;
+    }
+    static const char *const ck[] = {"none", "acquire", "release", "both"};
+    char poll[16];
+    if (ncl_retain_poll_us < 0)
+        snprintf(poll, sizeof poll, "off");
+    else
+        snprintf(poll, sizeof poll, "%d", ncl_retain_poll_us);
+    snprintf(buf, n, "%s/poll%s/lease%d/max%d/pen%d", ck[ncl_retain_check & 3], poll,
+             ncl_retain_lease_us, ncl_retain_max, ncl_retain_penalty);
+    return buf;
+}
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void sweep_drop(int l, int lease)
+{
+    struct ncl_local_lock *L = &local[l];
+    if (NCL_UNLIKELY(ncl_debug_retain & 1)) {
+        ncl_tour_drop(&L->base, my_node, 1, !lease); /* UNSAFE: races a re-entering thread */
+    } else {
+        if (!ncl_sub_trylock(&L->sub, &sweep_q)) {
+            NCL_STAT(sweep_st.ret_sweep_busy++);
+            return;
+        }
+        if (L->global_held) {
+            fprintf(stderr, "ncl: sweeper: free submutex with the global lock held\n");
+            abort();
+        }
+        ncl_tour_drop(&L->base, my_node, 1, !lease);
+        ncl_sub_unlock(&L->sub);
+    }
+    if (lease)
+        NCL_STAT(sweep_st.ret_lease_drops++);
+    else
+        NCL_STAT(sweep_st.ret_sweep_drops++);
+}
+
+static void *sweeper_main(void *arg)
+{
+    (void)arg;
+    enum { CHUNK = 64 };
+    ncl_line_t *ls[CHUNK];
+    uint64_t v[CHUNK];
+    int lk[CHUNK]; /* lock of each line */
+    const uint64_t lease_ns = (uint64_t)ncl_retain_lease_us * 1000u;
+    while (!atomic_load_explicit(&sweeper_stop, memory_order_relaxed)) {
+        int n = 0, last_waiter = -1;
+        uint64_t now = now_ns();
+        for (int l = 0; l <= cfg.nlocks; l++) {
+            int k = 0;
+            if (l < cfg.nlocks)
+                k = atomic_load_explicit(&local[l].base.kept_levels, memory_order_relaxed);
+            /* Flush the batch when full or at the end. */
+            if (n && (n + k > CHUNK || l == cfg.nlocks)) {
+                NCL_STAT(sweep_st.ret_sweep_polls++);
+                ncl_uc_load_many(ls, n, v);
+                for (int x = 0; x < n; x++)
+                    if (v[x] && lk[x] != last_waiter) {
+                        last_waiter = lk[x];
+                        sweep_drop(lk[x], 0);
+                    }
+                n = 0;
+            }
+            if (!k)
+                continue;
+            if (now - atomic_load_explicit(&local[l].base.kept_since, memory_order_relaxed) >=
+                lease_ns) {
+                sweep_drop(l, 1);
+                continue;
+            }
+            if (k > CHUNK)
+                k = CHUNK;
+            ncl_tour_kept_lines(&local[l].base, my_node, k, ls + n);
+            for (int x = 0; x < k; x++)
+                lk[n + x] = l;
+            n += k;
+        }
+        if (ncl_retain_poll_us > 0) {
+            struct timespec ts = {ncl_retain_poll_us / 1000000,
+                                  (long)(ncl_retain_poll_us % 1000000) * 1000};
+            nanosleep(&ts, NULL);
+        } else {
+            sched_yield();
+        }
+    }
+    return NULL;
+}
+
 int ncl_node_attach(int node_id)
 {
     hdr = (struct ncl_hdr *)ncl_meta_ptr(0);
@@ -475,6 +626,13 @@ int ncl_node_attach(int node_id)
         ncl_data_ctx_init(&local[l].dc, d[l].data_len ? ncl_data_ptr(d[l].data_off) : NULL,
                           d[l].data_len);
     }
+    ncl_retain = cfg.retain;
+    if (cfg.retain && ncl_retain_poll_us >= 0) {
+        atomic_store(&sweeper_stop, 0);
+        if (pthread_create(&sweeper_tid, NULL, sweeper_main, NULL))
+            return -1;
+        sweeper_on = 1;
+    }
     if (is_server() && ncl_srv_node_start(&cfg, &hdr->srv, node_id, blocks, hdr->lines_per_lock,
                                           sblocks, hdr->scan_per_lock) < 0)
         return -1;
@@ -485,6 +643,19 @@ static ncl_line_t *done_line(int n) { return (ncl_line_t *)ncl_meta_ptr(hdr->don
 
 void ncl_node_detach(void)
 {
+    if (sweeper_on) {
+        atomic_store(&sweeper_stop, 1);
+        pthread_join(sweeper_tid, NULL);
+        sweeper_on = 0;
+    }
+    /* Drop every kept level: other nodes may be waiting on them. */
+    if (cfg.retain)
+        for (int l = 0; l < cfg.nlocks; l++)
+            if (atomic_load_explicit(&local[l].base.kept_levels, memory_order_relaxed)) {
+                ncl_sub_lock(&local[l].sub, &sweep_q);
+                ncl_tour_drop(&local[l].base, my_node, 1, 0);
+                ncl_sub_unlock(&local[l].sub);
+            }
     ncl_uc_store(done_line(my_node), 1);
     ncl_fence();
     for (int n = 0; n < cfg.nnodes; n++)
@@ -925,6 +1096,7 @@ void ncl_node_stats(struct ncl_node_stats *out)
         for (size_t k = 0; k < NCL_HANDOFF_STATS_N; k++)
             ((uint64_t *)&out->ho)[k] += ((const uint64_t *)&s->ho)[k];
     }
+    ncl_base_stats_add(&out->base, &sweep_st);
     if (is_server())
         ncl_srv_stats(&out->srv);
 }
