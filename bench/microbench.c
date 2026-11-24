@@ -31,6 +31,9 @@
  * never started are reported as `unserved` and mean the offered load was not
  * sustainable (their latency is not in the histograms).
  *
+ * Nodes are separate processes (bench/harness.h): run it with
+ * scripts/ncl_run.sh ncl_bench [options]. Node 0 prints the report.
+ *
  * Not yet implemented: skew/phased access across nodes, node-local vs shared
  * access ratio.
  */
@@ -43,11 +46,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <x86intrin.h>
 
+#include "harness.h"
 #include "hist.h"
 #include "ncl/lock.h"
 #include "ncl/cpus.h"
@@ -188,9 +191,7 @@ static void *worker_main(void *arg)
         ncl_pin_self(ncl_cpu_slot(w->node * nthreads + w->idx));
     }
 
-    uint64_t start_ns;
-    while (!(start_ns = ncl_uc_load(ncl_user_line(0))))
-        ncl_cpu_relax();
+    uint64_t start_ns = harness_wait_start();
     while (now_ns() < start_ns)
         ncl_cpu_relax();
     const uint64_t t0 = __rdtsc(); /* TSC is invariant and shared on one host */
@@ -245,7 +246,7 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
-static int node_main(int node, int wfd)
+static int node_main(int node)
 {
     if (ncl_node_attach(node) < 0)
         return 2;
@@ -255,6 +256,7 @@ static int node_main(int node, int wfd)
         ws[i].idx = i;
         pthread_create(&ws[i].tid, NULL, worker_main, &ws[i]);
     }
+    harness_start();
     struct result *tot = calloc(1, sizeof *tot);
     for (int i = 0; i < nthreads; i++) {
         pthread_join(ws[i].tid, NULL);
@@ -273,36 +275,9 @@ static int node_main(int node, int wfd)
     ncl_base_stats_add(&tot->base, &st.srv.base);
     tot->srv = st.srv;
     tot->ho = st.ho;
-
-    const char *p = (const char *)tot;
-    size_t left = sizeof *tot;
-    while (left) {
-        ssize_t k = write(wfd, p, left);
-        if (k < 0 && errno == EINTR)
-            continue;
-        if (k <= 0)
-            return 3;
-        p += k;
-        left -= (size_t)k;
-    }
-    close(wfd);
+    harness_put_result(tot);
     free(tot);
     free(ws);
-    return 0;
-}
-
-static int read_full(int fd, void *buf, size_t len)
-{
-    char *p = buf;
-    while (len) {
-        ssize_t k = read(fd, p, len);
-        if (k < 0 && errno == EINTR)
-            continue;
-        if (k <= 0)
-            return -1;
-        p += k;
-        len -= (size_t)k;
-    }
     return 0;
 }
 
@@ -386,12 +361,14 @@ static void usage(const char *argv0)
             "  --bakery-arity K  -a bakery: tree of K-way nodes (0 = one flat node, default)\n"
             "  --bakery-poll pred|all  -a bakery wait: poll the predecessor (default) or re-read\n"
             "                every blocker on each poll (ablation)\n"
-            "  --bakery-wait strict|classic  -a bakery: wait while a blocker is choosing\n"
-            "                (default), or once seen not choosing, by its ticket only\n"
+            "  --bakery-wait classic|strict  -a bakery: a blocker once seen not choosing is\n"
+            "                waited on by its ticket only (classic, default), or waited on\n"
+            "                while choosing on every read (strict)\n"
             "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
             "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
-            "                acquisitions on the tournament (8:4:64)\n",
-            argv0);
+            "                acquisitions on the tournament (8:4:64)\n"
+            HARNESS_USAGE,
+            argv0, argv0);
 }
 
 #define CSV_HEADER                                                                         \
@@ -421,6 +398,7 @@ int main(int argc, char **argv)
         {"wait", required_argument, 0, 1004},
         {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
+        HARNESS_LONGOPTS,
         {0, 0, 0, 0},
     };
     int wait_set = 0;
@@ -546,9 +524,18 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
-        default: usage(argv[0]); return c == 'h' ? 0 : 2;
+        default: {
+            int h = harness_opt(c, optarg);
+            if (h > 0)
+                break;
+            if (h == 0)
+                usage(argv[0]);
+            return c == 'h' ? 0 : 2;
+        }
         }
     }
+    if (harness_check(argc, argv, "ncl_bench") < 0)
+        return 2;
     if (wait_set && (cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER)) {
         fprintf(stderr, "--wait applies to -M handoff with a gate algorithm (lamport, tournament, "
                         "hybrid, ak); the server chain already waits on its own slot\n");
@@ -576,55 +563,39 @@ int main(int argc, char **argv)
     cfg.threads_per_node = nthreads;
     cfg.nlocks = nlocks;
     cfg.data_size = stride * (size_t)nlocks;
-    cfg.user_meta_lines = 1;
     cfg.server_pin = pin ? srv_place : NCL_SRV_PIN_NONE;
-    if (ncl_sys_create(&cfg) < 0)
+    if (harness.role == HR_QUERY)
+        return harness_query(nnodes, cfg.backend, 0);
+    if (harness_open(&cfg, sizeof(struct result)) < 0)
         return 2;
-    if (pin) {
-        int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
-        ncl_cpus_check(nnodes * nthreads + (srv && srv_place == NCL_SRV_PIN_NEXT ? nnodes : 0),
-                       nnodes, nthreads, srv && srv_place == NCL_SRV_PIN_SIBLING);
+    if (harness.role == HR_INIT) {
+        if (pin) {
+            int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
+            ncl_cpus_check(nnodes * nthreads + (srv && srv_place == NCL_SRV_PIN_NEXT ? nnodes : 0),
+                           nnodes, nthreads, srv && srv_place == NCL_SRV_PIN_SIBLING);
+        }
+        for (int l = 0; l < nlocks; l++)
+            if (footprint && ncl_lock_set_data(l, (ncl_off_t)l * stride, footprint) < 0)
+                return 2;
+        ncl_sys_publish();
+        ncl_sys_destroy();
+        return 0;
     }
-    for (int l = 0; l < nlocks; l++)
-        if (footprint && ncl_lock_set_data(l, (ncl_off_t)l * stride, footprint) < 0)
-            return 2;
     cs_cycles = ncl_ns_to_cycles(cs_ns);
     think_cycles = ncl_ns_to_cycles(think_ns);
     cyc_per_ns = (double)ncl_ns_to_cycles(1000000) / 1e6;
 
-    pid_t *pids = calloc((size_t)nnodes, sizeof *pids);
-    int *rfd = calloc((size_t)nnodes, sizeof *rfd);
-    for (int n = 0; n < nnodes; n++) {
-        int pfd[2];
-        if (pipe(pfd) < 0) {
-            perror("pipe");
-            return 2;
-        }
-        pid_t p = fork();
-        if (p < 0) {
-            perror("fork");
-            return 2;
-        }
-        if (p == 0) {
-            close(pfd[0]);
-            _exit(node_main(n, pfd[1]));
-        }
-        close(pfd[1]);
-        rfd[n] = pfd[0];
-        pids[n] = p;
+    int rc = node_main(harness.node);
+    if (rc || harness.node != 0) {
+        ncl_sys_destroy();
+        return rc;
     }
-    ncl_uc_store(ncl_user_line(0), now_ns() + 50000000ull); /* start in 50 ms */
-    ncl_fence();
 
+    /* Node 0: gather every node's result and report. */
     struct result *tot = calloc(1, sizeof *tot), *nr = malloc(sizeof *nr);
     uint64_t node_done[NCL_MAX_NODES] = {0}; /* per-node completions: fairness */
-    int bad = 0;
     for (int n = 0; n < nnodes; n++) {
-        if (read_full(rfd[n], nr, sizeof *nr) < 0) {
-            fprintf(stderr, "node %d: no result\n", n);
-            bad = 1;
-            continue;
-        }
+        harness_get_result(n, nr);
         tot->ops += nr->ops;
         tot->completed += nr->completed;
         node_done[n] = nr->completed;
@@ -643,17 +614,6 @@ int main(int argc, char **argv)
         }
         for (int h = 0; h < H__COUNT; h++)
             hist_merge(&tot->h[h], &nr->h[h]);
-        close(rfd[n]);
-    }
-    for (int n = 0; n < nnodes; n++) {
-        int st;
-        waitpid(pids[n], &st, 0);
-        if (!WIFEXITED(st) || WEXITSTATUS(st))
-            bad = 1;
-    }
-    if (bad) {
-        fprintf(stderr, "a node failed\n");
-        return 1;
     }
 
     double window = secs - warmup;
@@ -844,7 +804,5 @@ int main(int argc, char **argv)
     ncl_sys_destroy();
     free(tot);
     free(nr);
-    free(pids);
-    free(rfd);
     return 0;
 }

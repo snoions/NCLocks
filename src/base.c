@@ -964,13 +964,14 @@ void ncl_base_reactive_set_mode(ncl_line_t *lines, int P, int mode)
  * re-read the remaining blockers in one batch. "Changes", not "becomes 0":
  * the predecessor may release and re-enter between two polls. NOT
  * model-checked.
- * --bakery-wait classic: a blocker j once seen with choosing == 0 (any read
- * after our round-3 fence) is waited on by ticket only; seeing it choosing
- * again drops it (its new doorway started after t was visible, so it draws a
- * larger ticket, and a choosing slot holds ticket 0). The strict rule (default,
- * the spec's pseudocode) keeps waiting until j's new ticket is published. */
+ * --bakery-wait classic (default): a blocker j once seen with choosing == 0
+ * (any read after our round-3 fence) is waited on by ticket only; seeing it
+ * choosing again drops it (its new doorway started after t was visible, so it
+ * draws a larger ticket, and a choosing slot holds ticket 0). --bakery-wait
+ * strict (the spec's first pseudocode) keeps waiting until j's new ticket is
+ * published. */
 
-int ncl_bakery_wait_classic = 0;
+int ncl_bakery_wait_classic = 1;
 int ncl_debug_bakery = 0;
 uint64_t ncl_debug_bakery_delay = 0;
 int ncl_bakery_poll_all = 0;

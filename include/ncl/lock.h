@@ -1,11 +1,13 @@
 /*
  * Two-level lock system (design §3): node-local submutex + global algorithm.
  *
- * Lifecycle:
- *   parent:  ncl_sys_create(cfg)          map region, write static config,
- *            ncl_lock_set_data(...)       zero metadata, register data ranges
- *            fork() one process per node
- *   node:    ncl_node_attach(node_id)     build node-local state
+ * Lifecycle (one process per node; scripts/ncl_run.sh launches them):
+ *   creator: ncl_sys_create(cfg, path)    create the shared file ("device"), write
+ *            ncl_lock_set_data(...)       static config, zero metadata, register
+ *            ncl_sys_publish()            data ranges; write it all back; exit
+ *   node:    ncl_sys_attach(cfg, path)    map the same file at the same VA (same cfg,
+ *                                         i.e. the same command line; checked)
+ *            ncl_node_attach(node_id)     build node-local state
  *            ncl_thread_init(&t, ...)     per thread
  *            ncl_acquire(&t, lock) / ncl_release(lock, hints, n)
  *
@@ -185,6 +187,8 @@ struct ncl_sys_cfg {
                                0 = default placement (or env NCL_MEM_NODE). uc: the
                                driver's pool must already be on that node (nid=) */
     uintptr_t base_addr;
+    uint64_t app_tag;       /* application fingerprint (e.g. a hash of the command line),
+                               stored by the creator and checked by ncl_sys_attach */
     /* SERVER/FASTSRV */
     int server_pin;              /* 0: unpinned; NCL_SRV_PIN_NEXT: node n's server on CPU
                                     (N*T + n) % ncpu; NCL_SRV_PIN_SIBLING: on the SMT
@@ -261,23 +265,31 @@ struct ncl_node_stats {
 };
 
 /* MODE_HANDOFF: overlap the global release's data writeback with the
- * release path's leading metadata loads (default 1; set before fork). */
+ * release path's leading metadata loads (default 1; set in every process). */
 extern int ncl_wb_overlap;
 
-int ncl_sys_create(const struct ncl_sys_cfg *cfg);
+/* Create the shared region in the file at `path` (NULL: an anonymous memfd, for
+ * a single process) and initialize it. Module-level knobs (ncl_bakery_arity,
+ * ...) must be set first, the same in every process. */
+int ncl_sys_create(const struct ncl_sys_cfg *cfg, const char *path);
+/* Map a region created by ncl_sys_create with the same cfg (checked against its
+ * header: layout and cfg->app_tag). Then ncl_node_attach. */
+int ncl_sys_attach(const struct ncl_sys_cfg *cfg, const char *path);
+/* Creator, after its setup (ncl_lock_set_*, data): write the region back. */
+void ncl_sys_publish(void);
 /* DEBUG (ncl_stress --grant-delay): cycles a 2b releaser spins between its
  * owner store and the grant store (--wait own, no --ho grant), widening the
  * window in which a waiter learns of the handoff from owner first. */
 extern uint64_t ncl_debug_grant_delay;
 void ncl_sys_destroy(void);
 
-/* Parent, before fork: associate [off, off+len) of the data region with lock. */
+/* Creator: associate [off, off+len) of the data region with lock. */
 int ncl_lock_set_data(int lock, ncl_off_t off, size_t len);
-/* Parent, before fork, cfg.alg_per_lock only: lock's base algorithm
+/* Creator, cfg.alg_per_lock only: lock's base algorithm
  * (NCL_ALG_LAMPORT or NCL_ALG_TOURNAMENT). Returns 0 or -1. */
 int ncl_lock_set_alg(int lock, ncl_alg_t alg);
 ncl_alg_t ncl_lock_alg(int lock);
-/* Parent, before fork, -a reactive only: start lock in mode (0 Lamport, 1
+/* Creator, -a reactive only: start lock in mode (0 Lamport, 1
  * tournament). Returns 0 or -1. */
 int ncl_lock_set_reactive_mode(int lock, int mode);
 

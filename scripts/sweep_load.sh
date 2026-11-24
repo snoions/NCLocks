@@ -11,6 +11,7 @@
 # background load) spreads over all points instead of biasing one.
 set -euo pipefail
 BENCH=${BENCH:-$(dirname "$0")/../build/ncl_bench}
+LAUNCH=$(dirname "$0")/ncl_run.sh # one process per node
 ALGS=${ALGS:-"lamport tournament hybrid"}
 RATES=${RATES:-"100k 250k 500k 750k 1M 1.25M 1.5M 1.75M 2M"}
 ARRIVALS=${ARRIVALS:-poisson}
@@ -20,7 +21,7 @@ for rep in $(seq 1 "$REPS"); do
   for a in $ALGS; do
     for arr in $ARRIVALS; do
       for r in $RATES; do
-        echo "$rep,$("$BENCH" -a "$a" -A "$arr" -r "$r" -C "$@")"
+        echo "$rep,$("$LAUNCH" "$BENCH" -a "$a" -A "$arr" -r "$r" -C "$@")"
       done
     done
   done

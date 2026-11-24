@@ -9,8 +9,8 @@ DIR kv`.
 - **Table.** K records (key, version, value of `-V` bytes; 64-byte aligned, so 128 B at
   the default 100 B) striped over L locks: stripe(k) = hash(k) mod L. Each stripe's
   records are contiguous and form the lock's registered data range.
-- **Index.** YCSB A/B/C/F never insert, so the key -> record map is static. The parent
-  builds it before the nodes fork; each node keeps its own copy (read-mostly metadata,
+- **Index.** YCSB A/B/C/F never insert, so the key -> record map is static. Every node
+  process builds the same one from the command line and keeps its own copy (read-mostly metadata,
   design §2). Inserts would need a shared, versioned index.
 - **Operations.** read (copy the value), update (new value, version + 1), read-modify-
   write. Workloads A (50/50 read/update), B (95/5), C (read only), F (50/50 read/RMW).

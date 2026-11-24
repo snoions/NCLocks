@@ -1,8 +1,8 @@
 /*
  * Runtime stress test (design §5).
  *
- * Forks one process per emulated node; each runs T threads that repeatedly
- * acquire a random lock. Every lock guards {counter, checksum, words[W]} in
+ * One process per emulated node (scripts/ncl_run.sh ncl_stress [options];
+ * bench/harness.h); each runs T threads that repeatedly acquire a random lock. Every lock guards {counter, checksum, words[W]} in
  * the cached data region. Checks:
  *   - mutual exclusion: an uncached occupant word per lock must be 0 on entry
  *     and still ours on exit;
@@ -14,6 +14,8 @@
  *
  * With --backend emu, --skip-wb / --skip-inv must make this test FAIL;
  * that is the check that the emulator actually models non-coherence.
+ * Node 0 gathers the per-node results, checks the final data and prints the
+ * verdict; --timeout is enforced by the launcher.
  */
 #define _GNU_SOURCE
 #include <getopt.h>
@@ -22,11 +24,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "../bench/harness.h"
 #include "ncl/lock.h"
 #include "ncl/cpus.h"
 
@@ -46,15 +47,12 @@ static unsigned max_delay_ns = 200;
 static size_t stride;
 static uint64_t delay_cycles;
 
-/* User-line layout: [0] start flag, [1..nlocks] occupant, then per node
- * RES_PER_NODE result lines. */
-enum { RES_ACQ, RES_VIOL, RES_CKSUM, RES_PER_NODE };
-static ncl_line_t *start_line(void) { return ncl_user_line(0); }
-static ncl_line_t *occ_line(int l) { return ncl_user_line(1 + (size_t)l); }
-static ncl_line_t *res_line(int n, int k)
-{
-    return ncl_user_line(1 + (size_t)nlocks + (size_t)n * RES_PER_NODE + (size_t)k);
-}
+/* User lines [0..nlocks): occupant of each lock. */
+static ncl_line_t *occ_line(int l) { return ncl_user_line((size_t)l); }
+
+struct node_result {
+    uint64_t acq, viol, cksum_err;
+};
 
 static struct lockdata *ld(int l) { return ncl_data_ptr((ncl_off_t)l * stride); }
 
@@ -110,8 +108,7 @@ static void *worker_main(void *arg)
         ncl_pin_self(ncl_cpu_slot(w->node * nthreads + w->idx));
     }
 
-    while (!ncl_uc_load(start_line()))
-        ncl_cpu_relax();
+    harness_wait_start();
 
     for (long it = 0; it < iters; it++) {
         int l = (int)(xorshift(&rng) % (uint64_t)nlocks);
@@ -162,6 +159,7 @@ static int node_main(int node)
         ws[i].idx = i;
         pthread_create(&ws[i].tid, NULL, worker_main, &ws[i]);
     }
+    harness_start();
     uint64_t acq = 0, viol = 0, ck = 0;
     for (int i = 0; i < nthreads; i++) {
         pthread_join(ws[i].tid, NULL);
@@ -174,11 +172,6 @@ static int node_main(int node)
     ncl_node_stats(&st);
     viol += st.srv.errors;       /* server-detected protocol violations */
     viol += st.ho.stale_announce; /* resurrected announce words (2b) */
-    ncl_uc_store(res_line(node, RES_ACQ), acq);
-    ncl_uc_store(res_line(node, RES_VIOL), viol);
-    ncl_uc_store(res_line(node, RES_CKSUM), ck);
-    ncl_fence();
-
     printf("node %2d: acq=%lu viol=%lu cksum_err=%lu", node, (unsigned long)acq,
            (unsigned long)viol, (unsigned long)ck);
     for (int p = 0; p < NCL_PATH__COUNT; p++)
@@ -215,6 +208,8 @@ static int node_main(int node)
                (unsigned long)st.srv.errors, (unsigned long)st.srv.top_acquires);
     printf("\n");
     fflush(stdout);
+    struct node_result res = {acq, viol, ck};
+    harness_put_result(&res); /* after printing: node 0 prints the total last */
     free(ws);
     return 0;
 }
@@ -270,8 +265,9 @@ static void usage(const char *argv0)
             "                4 = leaf-first tree release, 8 = classic wait clears j before our ticket\n"
             "  --bakery-arity K  bakery: tree of K-way nodes (0 = flat)\n"
             "  --bakery-poll pred|all  bakery wait: predecessor poll (default) or all blockers\n"
-            "  --bakery-wait strict|classic  bakery: wait while j is choosing (default), or not\n"
-            "                once j was seen not choosing after our ticket was visible\n"
+            "  --bakery-wait classic|strict  bakery: once j was seen not choosing after our ticket\n"
+            "                was visible, wait on its ticket only (classic, default), or wait\n"
+            "                while j is choosing on every read (strict)\n"
             "  --bakery-delay NS  DEBUG: bakery spins between reading tickets and publishing its own\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
@@ -284,8 +280,9 @@ static void usage(const char *argv0)
             "  --cpus LIST   CPUs for pinned threads, e.g. 0-59,120-179 (default: this\n"
             "                process's affinity, e.g. from numactl --cpunodebind)\n"
             "  --wb MODE     writeback instruction: clflushopt (default) | clwb\n"
-            "  --timeout S   kill the nodes and FAIL after S seconds (default 0 = none)\n",
-            argv0);
+            "  --timeout S   the launcher kills the nodes and FAILs after S seconds (0 = none)\n"
+            HARNESS_USAGE,
+            argv0, argv0);
 }
 
 int main(int argc, char **argv)
@@ -325,6 +322,7 @@ int main(int argc, char **argv)
         {"bakery-arity", required_argument, 0, 20},
         {"bakery-wait", required_argument, 0, 21},
         {"help", no_argument, 0, 'h'},
+        HARNESS_LONGOPTS,
         {0, 0, 0, 0},
     };
     int c;
@@ -452,9 +450,18 @@ int main(int argc, char **argv)
             break;
         case 1: cfg.debug_skip_data_wb = 1; break;
         case 2: cfg.debug_skip_data_inv = 1; break;
-        default: usage(argv[0]); return c == 'h' ? 0 : 2;
+        default: {
+            int h = harness_opt(c, optarg);
+            if (h > 0)
+                break;
+            if (h == 0)
+                usage(argv[0]);
+            return c == 'h' ? 0 : 2;
+        }
         }
     }
+    if (harness_check(argc, argv, "ncl_stress") < 0)
+        return 2;
     if (wait_set && (cfg.mode != NCL_MODE_HANDOFF || cfg.alg == NCL_ALG_SERVER)) {
         fprintf(stderr, "--wait applies to -M handoff with a gate algorithm (lamport, tournament, "
                         "hybrid, ak); the server chain already waits on its own slot\n");
@@ -471,20 +478,45 @@ int main(int argc, char **argv)
     cfg.threads_per_node = nthreads;
     cfg.nlocks = nlocks;
     cfg.data_size = stride * (size_t)nlocks;
-    cfg.user_meta_lines = 1 + (size_t)nlocks + (size_t)nnodes * RES_PER_NODE;
+    cfg.user_meta_lines = (size_t)nlocks;
 
     if (cfg.backend == NCL_BACKEND_UC && access(getenv("NCL_UC_DEV") ? getenv("NCL_UC_DEV")
                                                                       : "/dev/ncl_uc", F_OK)) {
         fprintf(stderr, "stress: uc backend requested but driver not loaded; skipping\n");
         return 77; /* ctest SKIP_RETURN_CODE */
     }
-    if (ncl_sys_create(&cfg) < 0)
+    if (harness.role == HR_QUERY)
+        return harness_query(nnodes, cfg.backend, timeout_s);
+    if (harness_open(&cfg, sizeof(struct node_result)) < 0)
         return 2;
-    printf("mem: %s\n", ncl_mem_describe());
-    if (pin) {
-        int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
-        ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
-        printf("cpus: %s\n", ncl_cpus_describe());
+    if (harness.role == HR_INIT) {
+        printf("mem: %s\n", ncl_mem_describe());
+        if (pin) {
+            int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
+            ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
+            printf("cpus: %s\n", ncl_cpus_describe());
+        }
+        for (int l = 0; l < nlocks; l++) {
+            if (ncl_lock_set_data(l, (ncl_off_t)l * stride, stride) < 0)
+                return 2;
+            if (cfg.alg_per_lock &&
+                ncl_lock_set_alg(l, l % 2 ? NCL_ALG_TOURNAMENT : NCL_ALG_LAMPORT) < 0)
+                return 2;
+            struct lockdata *d = ld(l);
+            d->checksum = checksum(d);
+        }
+        ncl_sys_publish();
+        printf("stress: alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d participants=%d "
+               "locks=%d iters/thread=%ld words=%d delay<=%uns lat=%uns%s%s%s%s%s%s%s\n",
+               ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), ncl_mode_name(cfg.mode),
+               cfg.no_submutex ? "+no_submutex" : "", nnodes, nthreads, ncl_participants(),
+               nlocks, iters, nwords, max_delay_ns, cfg.dev_lat_ns, precise ? " precise-hints" : "",
+               cfg.debug_skip_data_wb ? " SKIP-WB" : "", cfg.debug_skip_data_inv ? " SKIP-INV" : "",
+               cfg.debug_skip_meta_wb ? " SKIP-META-WB" : "",
+               cfg.debug_skip_meta_inv ? " SKIP-META-INV" : "",
+               cfg.emu_word_wb ? " EMU-WORD-WB" : "", cfg.debug_no_grant_wait ? " NO-GRANT-WAIT" : "");
+        ncl_sys_destroy();
+        return 0;
     }
     delay_cycles = ncl_ns_to_cycles(max_delay_ns);
     ncl_debug_reset_delay = ncl_ns_to_cycles(reset_delay_ns);
@@ -493,85 +525,21 @@ int main(int argc, char **argv)
     ncl_debug_mode_delay = ncl_ns_to_cycles(mode_delay_ns);
     ncl_debug_bakery_delay = ncl_ns_to_cycles(bakery_delay_ns);
 
-    for (int l = 0; l < nlocks; l++) {
-        if (ncl_lock_set_data(l, (ncl_off_t)l * stride, stride) < 0)
-            return 2;
-        if (cfg.alg_per_lock &&
-            ncl_lock_set_alg(l, l % 2 ? NCL_ALG_TOURNAMENT : NCL_ALG_LAMPORT) < 0)
-            return 2;
-        struct lockdata *d = ld(l);
-        d->checksum = checksum(d);
-        ncl_data_writeback(d, stride);
+    int rc = node_main(harness.node);
+    if (rc || harness.node != 0) {
+        ncl_sys_destroy();
+        return rc;
     }
 
-    printf("stress: alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d participants=%d "
-           "locks=%d iters/thread=%ld words=%d delay<=%uns lat=%uns%s%s%s%s%s%s%s\n",
-           ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), ncl_mode_name(cfg.mode),
-           cfg.no_submutex ? "+no_submutex" : "", nnodes, nthreads, ncl_participants(),
-           nlocks, iters, nwords, max_delay_ns, cfg.dev_lat_ns, precise ? " precise-hints" : "",
-           cfg.debug_skip_data_wb ? " SKIP-WB" : "", cfg.debug_skip_data_inv ? " SKIP-INV" : "",
-           cfg.debug_skip_meta_wb ? " SKIP-META-WB" : "",
-           cfg.debug_skip_meta_inv ? " SKIP-META-INV" : "",
-           cfg.emu_word_wb ? " EMU-WORD-WB" : "", cfg.debug_no_grant_wait ? " NO-GRANT-WAIT" : "");
-    fflush(stdout);
-
-    pid_t *pids = calloc((size_t)nnodes, sizeof *pids);
-    for (int n = 0; n < nnodes; n++) {
-        pid_t p = fork();
-        if (p < 0) {
-            perror("fork");
-            return 2;
-        }
-        if (p == 0)
-            _exit(node_main(n));
-        pids[n] = p;
-    }
-    ncl_uc_store(start_line(), 1);
-    ncl_fence();
-
-    int bad_exit = 0, timed_out = 0;
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int n = 0; n < nnodes; n++) {
-        int status;
-        if (timeout_s > 0 && !timed_out) {
-            /* Watchdog: a lost message or invisible store hangs rather than
-             * corrupting data; count that as a failure. */
-            pid_t r;
-            while ((r = waitpid(pids[n], &status, WNOHANG)) == 0) {
-                struct timespec t1;
-                clock_gettime(CLOCK_MONOTONIC, &t1);
-                if (t1.tv_sec - t0.tv_sec >= timeout_s) {
-                    fprintf(stderr, "stress: timeout after %d s: killing nodes -> FAIL\n",
-                            timeout_s);
-                    for (int k = 0; k < nnodes; k++)
-                        kill(pids[k], SIGKILL);
-                    timed_out = 1;
-                    break;
-                }
-                usleep(10000);
-            }
-            if (r == 0)
-                waitpid(pids[n], &status, 0);
-        } else {
-            waitpid(pids[n], &status, 0);
-        }
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            if (!timed_out)
-                fprintf(stderr, "node %d exited abnormally (status %#x)\n", n, status);
-            bad_exit = 1;
-        }
-    }
-    if (timed_out) {
-        printf("total: TIMEOUT -> FAIL\n");
-        return 1;
-    }
-
+    /* Node 0: gather the per-node results (all nodes are past ncl_node_detach,
+     * so no more acquisitions) and check the final data. */
     uint64_t acq = 0, viol = 0, ck = 0, sum = 0, final_ck_bad = 0;
     for (int n = 0; n < nnodes; n++) {
-        acq += ncl_uc_load(res_line(n, RES_ACQ));
-        viol += ncl_uc_load(res_line(n, RES_VIOL));
-        ck += ncl_uc_load(res_line(n, RES_CKSUM));
+        struct node_result r;
+        harness_get_result(n, &r);
+        acq += r.acq;
+        viol += r.viol;
+        ck += r.cksum_err;
     }
     for (int l = 0; l < nlocks; l++) {
         struct lockdata *d = ld(l);
@@ -581,13 +549,11 @@ int main(int argc, char **argv)
             final_ck_bad++;
     }
     uint64_t expect = (uint64_t)nnodes * (uint64_t)nthreads * (uint64_t)iters;
-    int ok = !bad_exit && viol == 0 && ck == 0 && final_ck_bad == 0 && sum == expect &&
-             acq == expect;
+    int ok = viol == 0 && ck == 0 && final_ck_bad == 0 && sum == expect && acq == expect;
     printf("total: expected=%lu acquired=%lu counter_sum=%lu mutex_violations=%lu "
            "checksum_errors=%lu final_bad_checksums=%lu -> %s\n",
            (unsigned long)expect, (unsigned long)acq, (unsigned long)sum, (unsigned long)viol,
            (unsigned long)ck, (unsigned long)final_ck_bad, ok ? "PASS" : "FAIL");
     ncl_sys_destroy();
-    free(pids);
     return ok ? 0 : 1;
 }

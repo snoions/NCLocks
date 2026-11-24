@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -78,11 +79,17 @@ static int bind_region(void *p, size_t len, int node, const char *what)
 /* Fault every page of [p, p+len) in (writing the zero it already holds) and
  * check that each one landed on `node` (node < 0: just report the first
  * page's node). Returns the node of the first page, or -2 on a mismatch. */
+static int attaching; /* ncl_mem_init with cfg->attach: never write while mapping */
+
 static int touch_and_check(char *p, size_t len, int node, const char *what)
 {
     size_t pg = (size_t)sysconf(_SC_PAGESIZE), n = len / pg;
-    for (size_t i = 0; i < n; i++)
-        *(volatile char *)(p + i * pg) = *(volatile char *)(p + i * pg);
+    for (size_t i = 0; i < n; i++) {
+        if (attaching) /* read fault: the creator allocated (and placed) every page */
+            (void)*(volatile char *)(p + i * pg);
+        else
+            *(volatile char *)(p + i * pg) = *(volatile char *)(p + i * pg);
+    }
     enum { CH = 512 };
     void *pages[CH];
     int status[CH];
@@ -114,7 +121,7 @@ static int touch_and_check(char *p, size_t len, int node, const char *what)
 /* Bind (if node >= 0) and verify one shared region. */
 static int place_region(char *p, size_t len, int node, const char *what)
 {
-    if (node >= 0 && bind_region(p, len, node, what) < 0)
+    if (node >= 0 && !attaching && bind_region(p, len, node, what) < 0)
         return -1;
     int got = touch_and_check(p, len, node, what);
     if (got == -2)
@@ -239,7 +246,16 @@ static int map_uc_meta(uintptr_t base, size_t len)
     const char *path = getenv("NCL_UC_DEV") ? getenv("NCL_UC_DEV") : NCL_UC_DEV_PATH;
     int accept_any = getenv("NCL_UC_ACCEPT_ANY_MEMTYPE") != NULL;
 
-    int fd = open(path, O_RDWR | O_CLOEXEC);
+    int fd;
+    if (getenv("NCL_UC_FD")) { /* the launcher's open file of the driver */
+        fd = fcntl(atoi(getenv("NCL_UC_FD")), F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) {
+            fprintf(stderr, "ncl: uc backend: NCL_UC_FD=%s: %s\n", getenv("NCL_UC_FD"),
+                    strerror(errno));
+            return -1;
+        }
+    } else
+        fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         int e = errno;
         fprintf(stderr, "ncl: uc backend: cannot open %s: %s\n", path, strerror(e));
@@ -277,7 +293,7 @@ static int map_uc_meta(uintptr_t base, size_t len)
         return -1;
     }
     uint64_t zlen = len;
-    if (ioctl(fd, NCL_UC_IOC_ZERO, &zlen) < 0) {
+    if (!attaching && ioctl(fd, NCL_UC_IOC_ZERO, &zlen) < 0) {
         perror("ncl: NCL_UC_IOC_ZERO");
         return -1;
     }
@@ -349,12 +365,30 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
     /* memfd layout: [meta (unused by UC backend)] [scan (unused by uniform UC)] [data] */
     size_t meta_all = ncl_mem.meta_size + ncl_mem.scan_size;
     size_t dev_size = meta_all + ncl_mem.data_size;
-    int fd = memfd_create("ncl-device", 0);
-    if (fd < 0) {
-        perror("ncl: memfd_create");
-        return -1;
+    attaching = cfg->path && cfg->attach;
+    int fd;
+    if (!cfg->path) {
+        fd = memfd_create("ncl-device", 0);
+        if (fd < 0) {
+            perror("ncl: memfd_create");
+            return -1;
+        }
+    } else {
+        fd = open(cfg->path, attaching ? O_RDWR | O_CLOEXEC : O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            fprintf(stderr, "ncl: open %s: %s\n", cfg->path, strerror(errno));
+            return -1;
+        }
     }
-    if (ftruncate(fd, (off_t)dev_size) < 0) {
+    if (attaching) {
+        struct stat sb;
+        if (fstat(fd, &sb) < 0 || (size_t)sb.st_size != dev_size) {
+            fprintf(stderr, "ncl: %s is %lld bytes, expected %zu: not created with the same "
+                            "configuration\n", cfg->path, (long long)sb.st_size, dev_size);
+            close(fd);
+            return -1;
+        }
+    } else if (ftruncate(fd, 0) < 0 || ftruncate(fd, (off_t)dev_size) < 0) { /* zeroed */
         perror("ncl: ftruncate");
         close(fd);
         return -1;
@@ -404,8 +438,8 @@ int ncl_mem_init(const struct ncl_mem_cfg *cfg)
     }
 
     if (cfg->backend == NCL_BACKEND_EMU) {
-        /* Node view = private anonymous memory (the node's "cache"); each
-         * forked node gets its own copy-on-write image. */
+        /* Node view = private anonymous memory (the node's "cache"), one per
+         * node process. */
         ncl_mem.data = map_fixed(data_va, ncl_mem.data_size, prot,
                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, "data (node view)");
         if (!ncl_mem.data)
@@ -489,12 +523,43 @@ void ncl_mem_fini(void)
     ncl_mem.uc_fd = -1;
 }
 
+/* Flush (write back + invalidate) every line of [p, p+len) from this CPU's caches. */
+static void flush_range(const char *p, size_t len)
+{
+    for (size_t o = 0; o < len; o += NCL_CACHELINE)
+        ncl__flushopt(p + o);
+    ncl_fence();
+}
+
+/* Cached views of the shared regions in this process: cached-flush metadata
+ * (meta + scan, one mapping), uc's split scan region, and data (all but coherent). */
+static int meta_cached(void) { return ncl_mem.backend == NCL_BACKEND_CACHED_FLUSH; }
+static int scan_cached(void) { return ncl_mem.split && ncl_mem.backend == NCL_BACKEND_UC; }
+
 void ncl_mem_node_attach(void)
 {
-    if (ncl_mem.backend == NCL_BACKEND_EMU)
-        ncl_data_invalidate(ncl_mem.data, ncl_mem.data_size);
+    if (ncl_mem.backend == NCL_BACKEND_COHERENT)
+        return;
+    if (meta_cached())
+        flush_range(ncl_mem.meta, ncl_mem.meta_size + ncl_mem.scan_size);
+    if (scan_cached())
+        flush_range(ncl_mem.scan, ncl_mem.scan_size);
+    ncl_data_invalidate(ncl_mem.data, ncl_mem.data_size);
     if (ncl_mem.backend == NCL_BACKEND_EMU && ncl_mem.split)
         emu_copy_lines(ncl_mem.scan, ncl_mem.scan_dev, ncl_mem.scan_size);
+}
+
+void ncl_mem_publish(void)
+{
+    if (ncl_mem.backend == NCL_BACKEND_COHERENT)
+        return;
+    if (meta_cached())
+        flush_range(ncl_mem.meta, ncl_mem.meta_size + ncl_mem.scan_size);
+    if (scan_cached())
+        flush_range(ncl_mem.scan, ncl_mem.scan_size);
+    if (ncl_mem.backend == NCL_BACKEND_EMU && ncl_mem.split)
+        emu_copy_lines(ncl_mem.scan_dev, ncl_mem.scan, ncl_mem.scan_size);
+    ncl_data_writeback(ncl_mem.data, ncl_mem.data_size);
 }
 
 const char *ncl_backend_name(ncl_backend_t b)

@@ -9,7 +9,7 @@
 
 #define NCL_MAGIC 0x4e434c4f434b5331ull /* "NCLOCKS1" */
 
-/* Static configuration, at meta offset 0. Read-mostly: written by the parent
+/* Static configuration, at meta offset 0. Read-mostly: written by the creator
  * before any node starts, never modified afterwards. */
 struct ncl_hdr {
     uint64_t magic;
@@ -147,7 +147,7 @@ int ncl_mode_parse(const char *s, ncl_mode_t *out)
     return 0;
 }
 
-int ncl_sys_create(const struct ncl_sys_cfg *c)
+static int sys_open(const struct ncl_sys_cfg *c, const char *path, int attach)
 {
     struct ncl_sys_cfg resolved = *c;
     if (resolved.handoff_opts == NCL_HO_DEFAULT) {
@@ -303,12 +303,39 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
         .base_addr = c->base_addr,
         .dev_lat_ns = c->dev_lat_ns,
         .mem_node = c->mem_node,
+        .path = path,
+        .attach = attach,
     };
-    ncl_cpus_init(); /* before nodes fork and threads pin (default = our affinity) */
+    ncl_cpus_init(); /* before threads pin (default = this process's affinity) */
     if (ncl_mem_init(&mc) < 0)
         return -1;
 
-    /* memfd starts zeroed: all flags/turns/x/y = 0 = initial state. */
+    if (attach) {
+        /* Same command line, same layout: check it against the creator's. */
+        ncl_mem_node_attach(); /* drop stale cached copies before reading the header */
+        hdr = (struct ncl_hdr *)ncl_meta_ptr(0);
+        if (hdr->magic != NCL_MAGIC) {
+            fprintf(stderr, "ncl: %s: shared region not initialized\n", path);
+            goto bad;
+        }
+        if (hdr->cfg.app_tag != c->app_tag || hdr->participants != P ||
+            hdr->lines_per_lock != lines_per_lock || hdr->scan_per_lock != scan_per_lock ||
+            hdr->cfg.nnodes != c->nnodes || hdr->cfg.nlocks != c->nlocks ||
+            hdr->cfg.alg != c->alg || hdr->cfg.mode != c->mode ||
+            hdr->cfg.backend != c->backend || hdr->srv.grant_off != srv.grant_off) {
+            fprintf(stderr, "ncl: %s was created with a different configuration (command "
+                            "line); every node must be started with the creator's\n", path);
+            goto bad;
+        }
+        cfg = hdr->cfg;
+        return 0;
+    bad:
+        hdr = NULL;
+        ncl_mem_fini();
+        return -1;
+    }
+
+    /* The region starts zeroed: all flags/turns/x/y = 0 = initial state. */
     hdr = (struct ncl_hdr *)ncl_meta_ptr(0);
     hdr->cfg = *c;
     hdr->participants = P;
@@ -337,6 +364,10 @@ int ncl_sys_create(const struct ncl_sys_cfg *c)
     cfg = *c;
     return 0;
 }
+
+int ncl_sys_create(const struct ncl_sys_cfg *c, const char *path) { return sys_open(c, path, 0); }
+int ncl_sys_attach(const struct ncl_sys_cfg *c, const char *path) { return sys_open(c, path, 1); }
+void ncl_sys_publish(void) { ncl_mem_publish(); }
 
 void ncl_sys_destroy(void)
 {

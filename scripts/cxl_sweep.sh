@@ -105,6 +105,7 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BENCH=${BENCH:-$ROOT/build/ncl_bench}
+LAUNCH=$ROOT/scripts/ncl_run.sh # one process per node (ncl_bench, ncl_kv)
 OUT=${OUT:-$ROOT/results/cxl_$(date +%Y%m%d_%H%M)}
 REPS=${REPS:-3}
 SECS=${SECS:-3}
@@ -180,7 +181,7 @@ run() {
   local csv=$1 rep=$2 cfg=$3; shift 3
   local o e
   e=$(mktemp)
-  o=$(timeout "$RUN_TIMEOUT" "${NUMA[@]}" "${RUNBIN:-$BENCH}" "$@" 2>"$e")
+  o=$(timeout "$RUN_TIMEOUT" "${NUMA[@]}" "$LAUNCH" "${RUNBIN:-$BENCH}" "$@" 2>"$e")
   local rc=$?
   if grep -q WARNING "$e"; then
     cat "$e" >>"$ERR"
@@ -202,7 +203,7 @@ preflight() {
   [ -x "$BENCH" ] || die "$BENCH not built"
   local want o
   want=$(cat /sys/devices/system/node/node"$CPUNODE"/cpulist)
-  o=$("${NUMA[@]}" "$BENCH" -a tournament -b uc --mem-node "$MEMNODE" -n 2 -s 0.5 -W 0.1 2>&1) ||
+  o=$("${NUMA[@]}" "$LAUNCH" "$BENCH" -a tournament -b uc --mem-node "$MEMNODE" -n 2 -s 0.5 -W 0.1 2>&1) ||
     die "uc preflight run failed: $o"
   echo "$o" | grep -E '^(mem|cpus):'
   echo "$o" | grep -q "^cpus: $want\$" || die "pinned CPUs are not node $CPUNODE's ($want)"

@@ -18,7 +18,7 @@
  *                         as a stand-in when the driver is unavailable. On a
  *                         coherent host it cannot expose missing flushes.
  *   NCL_BACKEND_EMU       Software non-coherence emulator. Hot metadata lives
- *                         on the "device" (shared memfd, physically WB) and
+ *                         on the "device" (shared file, physically WB) and
  *                         is accessed with single 8-byte relaxed atomics, so
  *                         it BEHAVES like uncached memory (no node-private
  *                         copy) but has cached timing. The data
@@ -105,9 +105,18 @@ struct ncl_mem_cfg {
     int mem_node;          /* NUMA node + 1 for the shared (device) regions; 0 = the
                               NCL_MEM_NODE environment variable if set, else default
                               placement. Node-private memory is never bound. */
+    /* The "device": a shared file every node process maps at base_addr.
+     * path == NULL: an anonymous memfd (one process only). attach == 0: create
+     * (truncate) and zero it, bind it to mem_node, zero the uc pool. attach == 1:
+     * map an existing one of exactly this size and only verify placement. */
+    const char *path;
+    int attach;
 };
 
-/* Per-process view of the region. Filled by ncl_mem_init, inherited by fork. */
+/* Per-process view of the region. Filled by ncl_mem_init in each process.
+ * UC: the driver is opened, unless env NCL_UC_FD names an inherited open file
+ * of it (scripts/ncl_run.sh holds one for the whole experiment: the driver
+ * allows one open file at a time). */
 struct ncl_mem {
     ncl_backend_t backend;
     char *meta;            /* hot metadata + static config */
@@ -150,9 +159,13 @@ const char *ncl_mem_describe(void);
 /* NUMA node of the shared regions (bound, else observed; -1 = unknown). */
 int ncl_mem_node(void);
 
-/* Called in each node process after fork: drops any inherited node-view data
- * (EMU) by re-reading the device copy. */
+/* Called in each node process before it starts: drops this process's
+ * node-view copies (cached lines; EMU private views) by re-reading the device. */
 void ncl_mem_node_attach(void);
+/* Creator, after initializing shared state with plain stores: write back every
+ * cached line of the shared regions (meta and scan if cached, data) so other
+ * processes, and other hosts, see it. */
+void ncl_mem_publish(void);
 
 const char *ncl_backend_name(ncl_backend_t b);
 int ncl_backend_parse(const char *s, ncl_backend_t *out);
@@ -235,8 +248,8 @@ static inline void ncl__flushopt(const void *p) { (void)p; }
 static inline void ncl__wb(const void *p) { (void)p; }
 #endif
 
-/* Writeback instruction for data/metadata writebacks. Set before
- * ncl_mem_init's callers fork (inherited). Returns -1 (with a message) if the
+/* Writeback instruction for data/metadata writebacks. Set in every process
+ * (same command line). Returns -1 (with a message) if the
  * CPU lacks clwb. */
 enum { NCL_WB_CLFLUSHOPT = 0, NCL_WB_CLWB = 1 };
 int ncl_wb_mode_set(int mode);

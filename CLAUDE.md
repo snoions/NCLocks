@@ -63,8 +63,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   FAIL. `--bakery-arity K` (g5b): a tree of K-way bakery nodes instead (fewer lines read per
   acquisition; the flat bakery hits the CXL device's read bandwidth at 16-32 nodes),
   released root to leaf (`--debug-bakery 4` = leaf first, must FAIL). `--bakery-wait classic`
-  (g3): once a blocker was seen not choosing after our ticket was visible, wait on its ticket
-  only (default `strict` = the spec's pseudocode; `--debug-bakery 8` with classic must FAIL).
+  (g3, default): once a blocker was seen not choosing after our ticket was visible, wait on
+  its ticket only (`strict` = the spec's first pseudocode; `--debug-bakery 8` with classic
+  must FAIL).
   CSV columns `bakery_arity`, `bakery_wait`; sweep phases `bakery`, `kvbakery`, `bktree`,
   `kvbktree`, `bkwait`, `kvbkwait`. Not model-checked.
   Biased tournaments (§4g g1, g2, g7, g8) are not implemented. Phase 2b is deprioritized
@@ -150,17 +151,25 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
 - Not yet implemented: home migration/NACK (2c), partial-write
   stress test (§5), skewed/phased access in `ncl_bench`, LiTL interposition.
 
-Emulated nodes are forked processes sharing a memfd mapped at a fixed VA
-(`MAP_FIXED_NOREPLACE`). Process-private memory is node-local memory.
+Emulated nodes are separate processes, launched by `scripts/ncl_run.sh` (no fork; preparing
+for nodes on separate hosts). They share only a file (`/dev/shm/ncl.*`, the "device")
+mapped at a fixed VA (`MAP_FIXED_NOREPLACE`) and, for `-b uc`, the driver (the launcher holds
+its single open file and passes it as `NCL_UC_FD`). Every process gets the same command line
+plus a role (`bench/harness.h`): `--query` (plan: node count, timeout), `--shm F --init`
+(create and set up the region, write it back, exit), `--shm F --node I`. The creator stores a
+fingerprint of the command line, and attaching nodes check it. Nodes meet at a start barrier
+in the region (no shared clock), publish result blobs in reserved data-region slots, and node
+0 reports. Running a binary without a role prints a pointer to the launcher.
+Process-private memory is node-local memory.
 
 ## Build & test
 
 ```
 cmake -S . -B build && cmake --build build -j   # -DNCL_STATS=OFF: counters compiled out (docs/backends.md)
-cd build && ctest -j4                              # stress matrix + emu negative tests; uc skipped w/o driver
-./ncl_stress -a hybrid -b emu -n 8 -t 2 -i 200000  # single stress run
-./ncl_bench -a lamport -b uc -n 8 -s 2 -c 200          # closed loop
-./ncl_bench -a lamport -b uc -n 8 -c 200 -r 500k        # open loop, Poisson
+cd build && ctest -j4                              # stress matrix + emu negative tests (via the launcher); uc skipped w/o driver
+../scripts/ncl_run.sh ./ncl_stress -a hybrid -b emu -n 8 -t 2 -i 200000  # single stress run
+../scripts/ncl_run.sh ./ncl_bench -a lamport -b uc -n 8 -s 2 -c 200      # closed loop
+../scripts/ncl_run.sh ./ncl_bench -a lamport -b uc -n 8 -c 200 -r 500k   # open loop, Poisson
 scripts/sweep_load.sh -b uc -n 8 -c 200 > sweep.csv     # latency vs offered load
 ```
 Build and load the kernel module with `cd kmod && make && sudo insmod ncl_uc.ko`; the `uc`

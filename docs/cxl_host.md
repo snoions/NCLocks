@@ -48,9 +48,9 @@ correctness is still checked by `emu`.
    For uc-on-DRAM comparison runs, reload with `nid=0`.
 4. Correctness first: `cd build && ctest -j8`, then emu at the new scale:
    ```
-   numactl --cpunodebind=0 --membind=0 ./ncl_stress -a hybrid -b emu -n 16 -t 3 -i 200000 --mem-node 2 --timeout 600
-   numactl --cpunodebind=0 --membind=0 ./ncl_stress -a tournament -b emu -n 16 -t 2 -i 100000 --mem-node 2 --skip-wb   # must FAIL
-   numactl --cpunodebind=0 --membind=0 ./ncl_stress -a server -b uc -n 16 -t 2 -p -i 100000 --mem-node 2
+   numactl --cpunodebind=0 --membind=0 ../scripts/ncl_run.sh ./ncl_stress -a hybrid -b emu -n 16 -t 3 -i 200000 --mem-node 2 --timeout 600
+   numactl --cpunodebind=0 --membind=0 ../scripts/ncl_run.sh ./ncl_stress -a tournament -b emu -n 16 -t 2 -i 100000 --mem-node 2 --skip-wb   # must FAIL
+   numactl --cpunodebind=0 --membind=0 ../scripts/ncl_run.sh ./ncl_stress -a server -b uc -n 16 -t 2 -p -i 100000 --mem-node 2
    ```
 5. Latency sanity check. `ncl_memlat` follows `NCL_MEM_NODE` for its memfd regions, and
    uses the driver's pool for uc metadata:

@@ -25,9 +25,10 @@ built before `nid` existed and reports its pool node as -1.
 Use `memtype=wc` or `memtype=wb` only for deliberate comparison runs. The
 library refuses them unless `NCL_UC_ACCEPT_ANY_MEMTYPE=1` is set.
 
-Only one process tree can have the device open at a time, so one experiment
-runs at a time. Nodes are forked children and inherit the open device and its
-mapping.
+Only one open file of the device can exist at a time, so one experiment runs
+at a time. `scripts/ncl_run.sh` opens it once and passes it to every node process
+(`NCL_UC_FD`); each process maps it itself. The pool's contents persist between
+mappings: the creator process zeroes it (`NCL_UC_IOC_ZERO`), the nodes do not.
 
 ## Why the driver converts the pages first
 

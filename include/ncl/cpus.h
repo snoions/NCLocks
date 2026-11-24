@@ -6,9 +6,9 @@
  * keeps every pinned thread on node 0 without a list, and on a host without
  * restrictions the placement is the old one (CPU k % ncpu).
  *
- * Initialize in the parent (ncl_sys_create does it), before nodes fork and
- * before any thread pins itself: the default list is read from the calling
- * thread's affinity.
+ * Initialize in every process (ncl_sys_create / ncl_sys_attach do it) before
+ * any thread pins itself: the default list is read from the calling thread's
+ * affinity, the same in every node process the launcher starts.
  */
 #ifndef NCL_CPUS_H
 #define NCL_CPUS_H

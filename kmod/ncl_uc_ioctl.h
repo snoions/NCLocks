@@ -6,10 +6,8 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #else
-#include <stdint.h>
+#include <linux/types.h> /* __u64, __s32 (as <sys/stat.h> may define them) */
 #include <sys/ioctl.h>
-typedef uint64_t __u64;
-typedef int32_t __s32;
 #endif
 
 #define NCL_UC_DEV_PATH "/dev/ncl_uc"

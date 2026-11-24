@@ -5,9 +5,11 @@
  * Table: K fixed-size records (key, version, value) striped over L locks;
  * stripe(k) = hash(k) mod L, and each stripe's records sit contiguously in
  * the data region, which is the lock's registered data range. YCSB A/B/C/F
- * never insert, so the key -> record index is static: the parent builds it
- * before the nodes fork and each node keeps its own copy (read-mostly
- * metadata, design §2).
+ * never insert, so the key -> record index is static: every node process
+ * builds the same one from the command line and keeps its own copy
+ * (read-mostly metadata, design §2). Nodes are separate processes
+ * (scripts/ncl_run.sh ncl_kv [options], bench/harness.h); the creator loads the
+ * table and node 0 reports.
  *
  * Operations: read (copy the value), update (write a new value), and
  * read-modify-write (F). Workloads: A 50/50 read/update, B 95/5, C read only,
@@ -27,7 +29,7 @@
  * per-lock choice (or a reactive lock) can gain.
  *
  * Verification: a record's value words are a function of (key, version), so
- * every read checks for stale or torn data (errors); at the end the parent
+ * every read checks for stale or torn data (errors); at the end node 0
  * reads the device copy and checks every record and that the versions sum to
  * the number of updates. Any error fails the run (exit 1).
  */
@@ -39,11 +41,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <x86intrin.h>
 
+#include "harness.h"
 #include "hist.h"
 #include "ncl/cpus.h"
 #include "ncl/lock.h"
@@ -63,7 +65,7 @@ static uint64_t cs_cycles;
 static double cyc_per_ns;
 static int algmap_top = -1; /* --algmap top:H; -1 = every lock uses -a */
 
-/* Static index, built by the parent and inherited by every node. */
+/* Static index, built identically by every process from the command line. */
 static int32_t *key_stripe;   /* [K] */
 static uint64_t *key_off;     /* [K] data-region offset of the record */
 static uint64_t *stripe_off, *stripe_len; /* [L] */
@@ -238,9 +240,7 @@ static void *worker_main(void *arg)
     uint64_t rng = splitmix64(((uint64_t)w->node << 32) | (uint64_t)w->idx) | 1;
     if (pin)
         ncl_pin_self(ncl_cpu_slot(w->node * nthreads + w->idx));
-    uint64_t start_ns;
-    while (!(start_ns = ncl_uc_load(ncl_user_line(0))))
-        ncl_cpu_relax();
+    uint64_t start_ns = harness_wait_start();
     while (now_ns() < start_ns)
         ncl_cpu_relax();
     const uint64_t t0 = __rdtsc();
@@ -286,36 +286,7 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
-static int write_full(int fd, const void *buf, size_t len)
-{
-    const char *p = buf;
-    while (len) {
-        ssize_t k = write(fd, p, len);
-        if (k < 0 && errno == EINTR)
-            continue;
-        if (k <= 0)
-            return -1;
-        p += k;
-        len -= (size_t)k;
-    }
-    return 0;
-}
-static int read_full(int fd, void *buf, size_t len)
-{
-    char *p = buf;
-    while (len) {
-        ssize_t k = read(fd, p, len);
-        if (k < 0 && errno == EINTR)
-            continue;
-        if (k <= 0)
-            return -1;
-        p += k;
-        len -= (size_t)k;
-    }
-    return 0;
-}
-
-static int node_main(int node, int wfd)
+static int node_main(int node)
 {
     if (ncl_node_attach(node) < 0)
         return 2;
@@ -325,6 +296,7 @@ static int node_main(int node, int wfd)
         ws[i].idx = i;
         pthread_create(&ws[i].tid, NULL, worker_main, &ws[i]);
     }
+    harness_start();
     struct result *tot = calloc(1, sizeof *tot);
     for (int i = 0; i < nthreads; i++) {
         pthread_join(ws[i].tid, NULL);
@@ -351,9 +323,10 @@ static int node_main(int node, int wfd)
     tot->switches = st.base.react_up + st.base.react_down;
     tot->slow_mode_reads = st.base.react_slow_mode_reads;
     tot->lamport_slow = st.path[NCL_PATH_LAMPORT_SLOW];
-    int rc = write_full(wfd, tot, sizeof *tot) < 0 ? 3 : 0;
-    close(wfd);
-    return rc;
+    harness_put_result(tot);
+    free(tot);
+    free(ws);
+    return 0;
 }
 
 /* ---- setup ----------------------------------------------------------------- */
@@ -404,7 +377,7 @@ static void usage(const char *a0)
             "                the highest expected load use the tournament, the rest Lamport\n"
             "                (-a reactive: they start in tournament mode; --react off pins them)\n"
             "  --bakery-arity K  -a bakery: tree of K-way nodes (0 = flat, default)\n"
-            "  --bakery-wait strict|classic  -a bakery wait rule (as ncl_bench)\n"
+            "  --bakery-wait classic|strict  -a bakery wait rule (as ncl_bench; classic default)\n"
             "  -M MODE -K CAP -b BACKEND -U LAYOUT --wb clwb --mem-node N --cpus LIST: as ncl_bench\n"
             "  --react U:D[:W] -a reactive: to the tournament when >= U of the last 16 global\n"
             "                acquisitions met another node, back when <= D of the last 64, after >= W\n"
@@ -419,8 +392,9 @@ static void usage(const char *a0)
             "  -m            no node-local submutex: every thread is a global participant\n"
             "                (Phase 1 only; with -b coherent -a pthread: one plain mutex per stripe)\n"
             "  -P            don't pin    -C one CSV row    -H CSV header\n"
-            "  --debug skip-inv|skip-wb|no-local-refresh|no-dirty-wb: DEBUG, must FAIL on emu\n",
-            a0);
+            "  --debug skip-inv|skip-wb|no-local-refresh|no-dirty-wb: DEBUG, must FAIL on emu\n"
+            HARNESS_USAGE,
+            a0, a0);
 }
 
 #define CSV_HEADER                                                                             \
@@ -451,6 +425,7 @@ int main(int argc, char **argv)
                                  {"raw-layout", no_argument, 0, 1010},
                                  {"bakery-arity", required_argument, 0, 1011},
                                  {"bakery-wait", required_argument, 0, 1012},
+                                 HARNESS_LONGOPTS,
                                  {0, 0, 0, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "n:t:l:k:V:w:d:z:F:a:M:K:b:U:c:s:W:r:mPCHh", lo, NULL)) != -1) {
@@ -524,9 +499,18 @@ int main(int argc, char **argv)
             if (!strcmp(optarg, "clwb")) { if (ncl_wb_mode_set(NCL_WB_CLWB) < 0) return 2; }
             else if (strcmp(optarg, "clflushopt")) { usage(argv[0]); return 2; }
             break;
-        default: usage(argv[0]); return c == 'h' ? 0 : 2;
+        default: {
+            int h = harness_opt(c, optarg);
+            if (h > 0)
+                break;
+            if (h == 0)
+                usage(argv[0]);
+            return c == 'h' ? 0 : 2;
+        }
         }
     }
+    if (harness_check(argc, argv, "ncl_kv") < 0)
+        return 2;
     if (nnodes < 1 || nnodes > NCL_MAX_NODES || nthreads < 1 || nlocks < 1 || nkeys < 1 ||
         !strchr("ABCF", workload) || theta <= 0 || theta >= 1 || affinity < 0 || affinity > 1 ||
         warmup >= secs || algmap_top > nlocks) {
@@ -588,7 +572,6 @@ int main(int argc, char **argv)
     cfg.threads_per_node = nthreads;
     cfg.nlocks = nlocks;
     cfg.data_size = off;
-    cfg.user_meta_lines = 1;
     cfg.precise_data = !full;
     cfg.server_pin = pin ? NCL_SRV_PIN_NEXT : NCL_SRV_PIN_NONE;
     if (cfg.backend == NCL_BACKEND_UC && access(getenv("NCL_UC_DEV") ? getenv("NCL_UC_DEV")
@@ -596,64 +579,53 @@ int main(int argc, char **argv)
         fprintf(stderr, "kv: uc backend requested but driver not loaded; skipping\n");
         return 77; /* ctest SKIP_RETURN_CODE */
     }
-    if (ncl_sys_create(&cfg) < 0)
+    if (harness.role == HR_QUERY)
+        return harness_query(nnodes, cfg.backend, 0);
+    if (harness_open(&cfg, sizeof(struct result)) < 0)
         return 2;
     const size_t lines_per_lock = ncl_lines_per_lock();
-    if (pin) {
-        int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
-        ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
-    }
     int ntour = cfg.alg == NCL_ALG_TOURNAMENT ? nlocks : 0;
-    for (int s = 0; s < nlocks; s++) {
-        if (ncl_lock_set_data(s, (ncl_off_t)stripe_off[s], stripe_len[s]) < 0)
-            return 2;
-    }
-    if (algmap_top >= 0) {
+    if (algmap_top >= 0)
         ntour = algmap_top;
+    if (harness.role == HR_INIT) {
+        if (pin) {
+            int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
+            ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
+        }
+        for (int s = 0; s < nlocks; s++) {
+            if (ncl_lock_set_data(s, (ncl_off_t)stripe_off[s], stripe_len[s]) < 0)
+                return 2;
+        }
         for (int i = 0; i < algmap_top; i++)
             if ((react_map ? ncl_lock_set_reactive_mode(order[i], 1)
                            : ncl_lock_set_alg(order[i], NCL_ALG_TOURNAMENT)) < 0)
                 return 2;
+        /* Load phase: version 0, written back to the device. */
+        for (long k = 0; k < nkeys; k++) {
+            struct record *p = rec(k);
+            p->key = (uint64_t)k;
+            p->version = 0;
+            for (size_t i = 0; i < vwords; i++)
+                p->value[i] = vword((uint64_t)k, 0, i);
+        }
+        ncl_sys_publish();
+        ncl_sys_destroy();
+        return 0;
     }
-    /* Load phase: version 0, written back to the device. */
-    for (long k = 0; k < nkeys; k++) {
-        struct record *p = rec(k);
-        p->key = (uint64_t)k;
-        p->version = 0;
-        for (size_t i = 0; i < vwords; i++)
-            p->value[i] = vword((uint64_t)k, 0, i);
-    }
-    ncl_data_writeback(ncl_mem.data, off);
     cs_cycles = ncl_ns_to_cycles(cs_ns);
     cyc_per_ns = (double)ncl_ns_to_cycles(1000000) / 1e6;
 
-    pid_t *pids = calloc((size_t)nnodes, sizeof *pids);
-    int *rfd = calloc((size_t)nnodes, sizeof *rfd);
-    for (int n = 0; n < nnodes; n++) {
-        int pfd[2];
-        if (pipe(pfd) < 0) { perror("pipe"); return 2; }
-        pid_t p = fork();
-        if (p < 0) { perror("fork"); return 2; }
-        if (p == 0) {
-            close(pfd[0]);
-            _exit(node_main(n, pfd[1]));
-        }
-        close(pfd[1]);
-        rfd[n] = pfd[0];
-        pids[n] = p;
+    int rc = node_main(harness.node);
+    if (rc || harness.node != 0) {
+        ncl_sys_destroy();
+        return rc;
     }
-    ncl_uc_store(ncl_user_line(0), now_ns() + 50000000ull);
-    ncl_fence();
 
+    /* Node 0: gather every node's result. */
     struct result *tot = calloc(1, sizeof *tot), *nr = malloc(sizeof *nr);
     uint64_t node_done[NCL_MAX_NODES] = {0};
-    int bad = 0;
     for (int n = 0; n < nnodes; n++) {
-        if (read_full(rfd[n], nr, sizeof *nr) < 0) {
-            fprintf(stderr, "node %d: no result\n", n);
-            bad = 1;
-            continue;
-        }
+        harness_get_result(n, nr);
         for (int o = 0; o < OP__N; o++)
             tot->ops[o] += nr->ops[o];
         tot->completed += nr->completed;
@@ -671,17 +643,6 @@ int main(int argc, char **argv)
         tot->lamport_slow += nr->lamport_slow;
         for (int h = 0; h < H__N; h++)
             hist_merge(&tot->h[h], &nr->h[h]);
-        close(rfd[n]);
-    }
-    for (int n = 0; n < nnodes; n++) {
-        int st;
-        waitpid(pids[n], &st, 0);
-        if (!WIFEXITED(st) || WEXITSTATUS(st))
-            bad = 1;
-    }
-    if (bad) {
-        fprintf(stderr, "a node failed\n");
-        return 1;
     }
 
     /* Final check against the device copy. */

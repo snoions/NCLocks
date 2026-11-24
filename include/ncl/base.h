@@ -242,7 +242,7 @@ int ncl_top_other_flag(struct ncl_base *b, int side); /* flag[1-side] (one load)
 const char *ncl_alg_name(ncl_alg_t a);
 int ncl_alg_parse(const char *s, ncl_alg_t *out);
 
-/* REACTIVE switch thresholds (set before nodes fork), per lock and node, over
+/* REACTIVE switch thresholds (set in every process), per lock and node, over
  * this node's global acquisitions of the lock: to the tournament when at least
  * ncl_react_up of the last 16 met another node (<= 16); back to Lamport when
  * at most ncl_react_down of the last 64 did (<= 64), after at least
@@ -284,9 +284,9 @@ extern uint64_t ncl_debug_bakery_delay;
  * (default, design §4g g6), 1 = re-read every remaining blocker on each poll
  * (ablation). */
 extern int ncl_bakery_poll_all;
-/* BAKERY wait rule (--bakery-wait): 0 = strict (default; wait while j is
- * choosing, on every read), 1 = classic (once j was seen not choosing after our
- * ticket was visible, only its ticket matters; design §4g g3). */
+/* BAKERY wait rule (--bakery-wait): 1 = classic (default; once j was seen not
+ * choosing after our ticket was visible, only its ticket matters; design §4g
+ * g3), 0 = strict (wait while j is choosing, on every read). */
 extern int ncl_bakery_wait_classic;
 /* BAKERY tree arity (design §4g, g5): 0 (default) or >= P = one flat node over
  * all P participants; 2 <= k < P = a tree of k-way merged-bakery nodes (each
