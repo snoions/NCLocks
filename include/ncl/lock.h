@@ -278,8 +278,8 @@ struct ncl_node_stats {
 extern int ncl_retain_poll_us, ncl_retain_lease_us;
 /* Command-line helper shared by the binaries: --retain-check acquire|release|both|none
  * (sets ncl_retain_check), --retain-poll US|off, --retain-lease US, --retain-max N,
- * --retain-penalty P (0 = always keep). opt: "check", "poll", "lease", "max",
- * "penalty". 0 or -1 (message printed). */
+ * --retain-probe P (learned keep height, 0 = always keep). opt: "check", "poll",
+ * "lease", "max", "probe". 0 or -1 (message printed). */
 int ncl_retain_opt(const char *opt, const char *arg);
 /* "both/poll10/lease1000/max0"-style description for reports ("-" if !cfg.retain). */
 const char *ncl_retain_describe(char *buf, size_t n);

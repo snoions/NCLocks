@@ -479,7 +479,7 @@ int ncl_retain_opt(const char *opt, const char *arg)
     if (!strcmp(opt, "poll")) ncl_retain_poll_us = (int)v;
     else if (!strcmp(opt, "lease")) ncl_retain_lease_us = (int)v;
     else if (!strcmp(opt, "max")) ncl_retain_max = (int)v;
-    else if (!strcmp(opt, "penalty")) ncl_retain_penalty = (int)v;
+    else if (!strcmp(opt, "probe")) ncl_retain_probe = (int)v;
     else return -1;
     return 0;
 }
@@ -496,8 +496,8 @@ const char *ncl_retain_describe(char *buf, size_t n)
         snprintf(poll, sizeof poll, "off");
     else
         snprintf(poll, sizeof poll, "%d", ncl_retain_poll_us);
-    snprintf(buf, n, "%s/poll%s/lease%d/max%d/pen%d", ck[ncl_retain_check & 3], poll,
-             ncl_retain_lease_us, ncl_retain_max, ncl_retain_penalty);
+    snprintf(buf, n, "%s/poll%s/lease%d/max%d/probe%d", ck[ncl_retain_check & 3], poll,
+             ncl_retain_lease_us, ncl_retain_max, ncl_retain_probe);
     return buf;
 }
 
@@ -508,11 +508,11 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static void sweep_drop(int l, int lease)
+static void sweep_drop(int l, int lease, int waiter)
 {
     struct ncl_local_lock *L = &local[l];
     if (NCL_UNLIKELY(ncl_debug_retain & 1)) {
-        ncl_tour_drop(&L->base, my_node, 1, !lease); /* UNSAFE: races a re-entering thread */
+        ncl_tour_drop(&L->base, my_node, 1, waiter, &sweep_st); /* UNSAFE: races a re-entering thread */
     } else {
         if (!ncl_sub_trylock(&L->sub, &sweep_q)) {
             NCL_STAT(sweep_st.ret_sweep_busy++);
@@ -522,7 +522,7 @@ static void sweep_drop(int l, int lease)
             fprintf(stderr, "ncl: sweeper: free submutex with the global lock held\n");
             abort();
         }
-        ncl_tour_drop(&L->base, my_node, 1, !lease);
+        ncl_tour_drop(&L->base, my_node, 1, waiter, &sweep_st);
         ncl_sub_unlock(&L->sub);
     }
     if (lease)
@@ -538,6 +538,7 @@ static void *sweeper_main(void *arg)
     ncl_line_t *ls[CHUNK];
     uint64_t v[CHUNK];
     int lk[CHUNK]; /* lock of each line */
+    int lv[CHUNK]; /* its level */
     const uint64_t lease_ns = (uint64_t)ncl_retain_lease_us * 1000u;
     while (!atomic_load_explicit(&sweeper_stop, memory_order_relaxed)) {
         int n = 0, last_waiter = -1;
@@ -552,8 +553,8 @@ static void *sweeper_main(void *arg)
                 ncl_uc_load_many(ls, n, v);
                 for (int x = 0; x < n; x++)
                     if (v[x] && lk[x] != last_waiter) {
-                        last_waiter = lk[x];
-                        sweep_drop(lk[x], 0);
+                        last_waiter = lk[x]; /* lines are level 1 first: the lowest waiter */
+                        sweep_drop(lk[x], 0, lv[x]);
                     }
                 n = 0;
             }
@@ -561,14 +562,16 @@ static void *sweeper_main(void *arg)
                 continue;
             if (now - atomic_load_explicit(&local[l].base.kept_since, memory_order_relaxed) >=
                 lease_ns) {
-                sweep_drop(l, 1);
+                sweep_drop(l, 1, 0);
                 continue;
             }
             if (k > CHUNK)
                 k = CHUNK;
             ncl_tour_kept_lines(&local[l].base, my_node, k, ls + n);
-            for (int x = 0; x < k; x++)
+            for (int x = 0; x < k; x++) {
                 lk[n + x] = l;
+                lv[n + x] = x + 1;
+            }
             n += k;
         }
         if (ncl_retain_poll_us > 0) {
@@ -653,7 +656,7 @@ void ncl_node_detach(void)
         for (int l = 0; l < cfg.nlocks; l++)
             if (atomic_load_explicit(&local[l].base.kept_levels, memory_order_relaxed)) {
                 ncl_sub_lock(&local[l].sub, &sweep_q);
-                ncl_tour_drop(&local[l].base, my_node, 1, 0);
+                ncl_tour_drop(&local[l].base, my_node, 1, 0, NULL);
                 ncl_sub_unlock(&local[l].sub);
             }
     ncl_uc_store(done_line(my_node), 1);

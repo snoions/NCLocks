@@ -157,7 +157,7 @@ BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bak
 BKWAIT_K=${BKWAIT_K:-"0 2 4"}                     # phases bkwait / kvbkwait
 G1_NT=${G1_NT:-"16x1 16x3 32x2"}                 # phase g1bound
 G1_THINK=${G1_THINK:-"0 2000 10000"}             # phases g1bound, g1: closed-loop think time, ns
-G1_VARIANTS=${G1_VARIANTS:-"retain retain_always"} # phase g1: retention variants (g1_variant)
+G1_VARIANTS=${G1_VARIANTS:-"retain retain_acq retain_always"} # phase g1: retention variants (g1_variant)
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
 # U:D[:W]: up when >= U of the last 16 contended; down when <= D of the last 64, after
@@ -821,7 +821,7 @@ g1_variant() {
   case $1 in
     retain) echo "-a tournament --retain" ;;
     retain_acq) echo "-a tournament --retain --retain-check acquire" ;;
-    retain_always) echo "-a tournament --retain --retain-penalty 0" ;;
+    retain_always) echo "-a tournament --retain --retain-probe 0" ;;
     *) die "unknown G1_VARIANTS entry $1" ;;
   esac
 }

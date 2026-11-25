@@ -205,6 +205,10 @@ static int node_main(int node)
                (unsigned long)sb.ret_acq_drops, (unsigned long)sb.ret_rel_drops,
                (unsigned long)sb.ret_sweep_drops, (unsigned long)sb.ret_lease_drops,
                (unsigned long)sb.ret_sweep_busy);
+    if (sb.ret_cap_lowers || sb.ret_cap_raises || sb.ret_policy_skips)
+        printf(" ret_cap_lowers=%lu ret_cap_raises=%lu ret_policy_skips=%lu",
+               (unsigned long)sb.ret_cap_lowers, (unsigned long)sb.ret_cap_raises,
+               (unsigned long)sb.ret_policy_skips);
     if (st.ho.stale_announce)
         printf(" STALE_ANNOUNCE=%lu", (unsigned long)st.ho.stale_announce);
     if (st.global_releases != st.acquires)
@@ -283,7 +287,8 @@ static void usage(const char *argv0)
             "                cross-lock deadlock, must hang with several locks)\n"
             "  --retain-lease US  sweeper drops kept levels this long after they were kept (1000)\n"
             "  --retain-max N  at most N locks with kept levels per node (0 = no limit)\n"
-            "  --retain-penalty P  adaptive keep policy (16; 0 = always keep)\n"
+            "  --retain-probe P  learned keep height: first probe interval in releases\n"
+            "                (16; 0 = always keep depth-1 levels)\n"
             "  --debug-retain BITS  retain, UNSAFE: 1 = sweeper drops without the submutex,\n"
             "                2 = release drops only the waiter's level (not contiguous)\n"
             "  --retain-delay NS  DEBUG: acquirer spins between reading its kept levels and climbing\n"
@@ -346,7 +351,7 @@ int main(int argc, char **argv)
         {"retain-max", required_argument, 0, 26},
         {"debug-retain", required_argument, 0, 27},
         {"retain-delay", required_argument, 0, 28},
-        {"retain-penalty", required_argument, 0, 29},
+        {"retain-probe", required_argument, 0, 29},
         {"help", no_argument, 0, 'h'},
         HARNESS_LONGOPTS,
         {0, 0, 0, 0},
@@ -441,7 +446,7 @@ int main(int argc, char **argv)
         case 26: if (ncl_retain_opt("max", optarg) < 0) return 2; break;
         case 27: ncl_debug_retain = atoi(optarg); break;
         case 28: retain_delay_ns = (unsigned)atoi(optarg); break;
-        case 29: if (ncl_retain_opt("penalty", optarg) < 0) return 2; break;
+        case 29: if (ncl_retain_opt("probe", optarg) < 0) return 2; break;
         case 21:
             if (!strcmp(optarg, "classic")) ncl_bakery_wait_classic = 1;
             else if (!strcmp(optarg, "strict")) ncl_bakery_wait_classic = 0;

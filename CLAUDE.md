@@ -75,9 +75,10 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   acquire checks (`--retain-check`) and a per-node sweeper thread (`--retain-poll`,
   `--retain-lease`, `--retain-max`), which drops only after try-locking the lock's submutex
   (the submutex is the lease; `ncl_sub_trylock`). The sweeper is required for liveness
-  (cross-lock deadlock without it). Adaptive keep policy, `--retain-penalty` (default 16; 0 =
-  keep at every release): without it, many locks without reuse collapse (waiters wait for
-  sweepers). Phase 1 and 2a, needs the submutex. `--debug-retain 1|2` and `--retain-poll off`
+  (cross-lock deadlock without it). Learned keep height, `--retain-probe` (default 16; 0 =
+  keep depth-1 levels at every release): a waiter on level w caps the lock's kept levels at
+  w-1, probed upward with exponential backoff; cap 0 skips the release check. Without it,
+  many locks without reuse collapse (waiters wait for sweepers). Phase 1 and 2a, needs the submutex. `--debug-retain 1|2` and `--retain-poll off`
   must FAIL. `ncl_bench --active LIST`: only those nodes acquire (CSV column `active`); sweep
   phases `g1bound` (go/no-go, measured: go) and `g1`; CSV columns `retain`, `ret_*_per_acq`. Phase 2b is deprioritized
   (no measured advantage): evaluate new locks in Phase 1 and 2a.

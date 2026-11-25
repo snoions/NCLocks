@@ -123,8 +123,10 @@ struct ncl_base {
      * sweeper reads them unlocked, but acts only after taking it). */
     _Atomic int kept_levels;     /* levels 1..kept_levels (leaf side) still held */
     _Atomic uint64_t kept_since; /* CLOCK_MONOTONIC ns when they were kept (lease) */
-    int ret_credit;              /* ncl_retain_penalty > 0: keep levels only while >= 0 */
-    int ret_pen;                 /* current penalty (0 = ncl_retain_penalty) */
+    int keep_cap;                /* learned keep height: keep at most this many levels */
+    int keep_run;                /* global releases since the cap last changed */
+    int keep_need;               /* releases before the next probe (0 = not set up) */
+    int keep_probing;            /* the cap was raised and has not been lowered since */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -163,7 +165,9 @@ struct ncl_base_stats {
     uint64_t ret_lease_drops;   /* sweeper dropped on lease expiry */
     uint64_t ret_sweep_busy;    /* sweeper's try-lock of the submutex failed */
     uint64_t ret_sweep_polls;   /* sweeper polls that found kept levels to check */
-    uint64_t ret_policy_skips;  /* release kept nothing: the lock's credit is negative */
+    uint64_t ret_policy_skips;  /* release kept nothing, no release check: learned cap is 0 */
+    uint64_t ret_cap_lowers;    /* a waiter found on a kept (or to-be-kept) level lowered the cap */
+    uint64_t ret_cap_raises;    /* probes: the cap raised by one level */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -326,17 +330,17 @@ extern int ncl_retain;
 enum { NCL_RETAIN_CHECK_ACQUIRE = 1, NCL_RETAIN_CHECK_RELEASE = 2 };
 extern int ncl_retain_check; /* NCL_RETAIN_CHECK_* bits (default both) */
 extern int ncl_retain_max;   /* at most this many locks kept per node (0 = no limit) */
-/* Adaptive policy (0 = always keep): per lock, node-local, a credit that a hit
- * (an acquisition reusing kept levels) raises by 1 (up to 8), a drop forced by
- * a waiter (acquire check or sweeper) lowers by the current penalty, and every
- * global release that keeps nothing raises by 1 (so it probes again after
- * penalty releases); a release keeps levels only while the credit is >= 0. The
- * penalty starts at ncl_retain_penalty, doubles with every forced drop (up to
- * NCL_RETAIN_PENALTY_MAX) and returns to the start when the credit reaches 8
- * (a run of hits). Without reuse, a waiter on an idle node's kept levels waits
- * for its sweeper, which costs far more than a hit saves. */
-#define NCL_RETAIN_PENALTY_MAX 4096
-extern int ncl_retain_penalty;
+/* Learned keep height (0 = always keep depth - 1 levels): per lock, node-local,
+ * a cap on the levels a release keeps, starting at depth - 1. A waiter found on
+ * level w by the release check, the acquire check or the sweeper lowers the cap
+ * to w - 1 and doubles the probe interval (up to NCL_RETAIN_PROBE_MAX global
+ * releases); after that many releases without a lowering the cap rises by one
+ * level (a probe), and a probe that survives a whole interval halves it again
+ * (down to ncl_retain_probe). A cap of 0 keeps nothing and skips the release
+ * check. Without it, a waiter on an idle node's kept levels waits for its
+ * sweeper, and contenders meeting below the root lose all retention. */
+#define NCL_RETAIN_PROBE_MAX 4096
+extern int ncl_retain_probe;
 /* Locks with kept levels on this node (for ncl_retain_max). */
 extern _Atomic int ncl_retained_locks;
 /* DEBUG bits (ncl_stress --debug-retain), each UNSAFE: 1 = the sweeper drops
@@ -353,8 +357,8 @@ int ncl_tour_depth(const struct ncl_base *b);
 void ncl_tour_kept_lines(const struct ncl_base *b, int i, int kept, ncl_line_t **out);
 /* Holding the submutex: drop kept levels from kept_levels down to `lowest`
  * (>= 1), top-down, store-store ordered; kept_levels becomes lowest - 1.
- * waiter: the drop is for a waiter (charges the adaptive policy). */
-void ncl_tour_drop(struct ncl_base *b, int i, int lowest, int waiter);
+ * waiter: the level a waiter was seen on (lowers the learned cap), 0 = none. */
+void ncl_tour_drop(struct ncl_base *b, int i, int lowest, int waiter, struct ncl_base_stats *st);
 
 /* Exponential backoff for spin loops (pause iterations, capped). */
 extern unsigned ncl_backoff_cap;

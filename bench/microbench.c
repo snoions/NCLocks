@@ -409,8 +409,9 @@ static void usage(const char *argv0)
             "  --retain-poll US  sweeper poll period (10; 0 = yield)\n"
             "  --retain-lease US  drop kept levels this long after they were kept (1000)\n"
             "  --retain-max N  at most N locks with kept levels per node (0 = no limit)\n"
-            "  --retain-penalty P  adaptive policy: per-lock credit, +1 per hit, -P per drop\n"
-            "                forced by a waiter, keep only while >= 0 (16; 0 = always keep)\n"
+            "  --retain-probe P  learned keep height: a waiter on level w caps the kept\n"
+            "                levels at w-1; probe one level higher after P releases, doubling\n"
+            "                per lowering (16; 0 = always keep depth-1 levels)\n"
             "  --active LIST only these nodes run workers, e.g. 0,8 or 0-3 (default all); the\n"
             "                others take part in the lock structure but never acquire.\n"
             "                Fairness and open-loop rates count active nodes only\n"
@@ -426,7 +427,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll,bakery_wait,active,retain,ret_hits_per_acq,ret_skipped_per_acq,ret_drops_per_acq,ret_sweep_drops_per_acq,ret_policy_skips_per_acq"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll,bakery_wait,active,retain,ret_hits_per_acq,ret_skipped_per_acq,ret_drops_per_acq,ret_sweep_drops_per_acq,ret_policy_skips_per_acq,ret_cap_lowers_per_acq,ret_cap_raises_per_acq"
 
 int main(int argc, char **argv)
 {
@@ -451,7 +452,7 @@ int main(int argc, char **argv)
         {"retain-poll", required_argument, 0, 1013},
         {"retain-lease", required_argument, 0, 1014},
         {"retain-max", required_argument, 0, 1015},
-        {"retain-penalty", required_argument, 0, 1016},
+        {"retain-probe", required_argument, 0, 1016},
         {"wait", required_argument, 0, 1004},
         {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
@@ -555,7 +556,7 @@ int main(int argc, char **argv)
         case 1013: if (ncl_retain_opt("poll", optarg) < 0) return 2; break;
         case 1014: if (ncl_retain_opt("lease", optarg) < 0) return 2; break;
         case 1015: if (ncl_retain_opt("max", optarg) < 0) return 2; break;
-        case 1016: if (ncl_retain_opt("penalty", optarg) < 0) return 2; break;
+        case 1016: if (ncl_retain_opt("probe", optarg) < 0) return 2; break;
         case 1010:
             if (parse_active(optarg) < 0) {
                 fprintf(stderr, "--active: node list, e.g. 0,8 or 0-3\n");
@@ -746,7 +747,7 @@ int main(int argc, char **argv)
         snprintf(bak_arity, sizeof bak_arity, "%d", ncl_bakery_arity);
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s,%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s,%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -782,7 +783,8 @@ int main(int argc, char **argv)
                PER(tot->base.ret_acq_drops + tot->base.ret_rel_drops + tot->base.ret_sweep_drops +
                    tot->base.ret_lease_drops),
                PER(tot->base.ret_sweep_drops + tot->base.ret_lease_drops),
-               PER(tot->base.ret_policy_skips));
+               PER(tot->base.ret_policy_skips), PER(tot->base.ret_cap_lowers),
+               PER(tot->base.ret_cap_raises));
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -824,12 +826,13 @@ int main(int argc, char **argv)
         if (cfg.retain && all_paths) {
             double A = (double)all_paths;
             printf("retain %s: hits=%.1f%% levels_skipped/acq=%.2f drops/acq: acquire=%.3f "
-                   "release=%.3f sweeper=%.3f lease=%.3f cap_skips=%.3f policy_skips=%.3f sweeper_busy=%lu polls=%lu\n",
+                   "release=%.3f sweeper=%.3f lease=%.3f cap_skips=%.3f policy_skips=%.3f cap_lowers=%.4f cap_raises=%.4f sweeper_busy=%lu polls=%lu\n",
                    ncl_retain_describe(ret_buf, sizeof ret_buf), 100 * (double)b->ret_hits / A,
                    (double)b->ret_levels_skipped / A, (double)b->ret_acq_drops / A,
                    (double)b->ret_rel_drops / A, (double)b->ret_sweep_drops / A,
                    (double)b->ret_lease_drops / A, (double)b->ret_cap_skips / A,
-                   (double)b->ret_policy_skips / A,
+                   (double)b->ret_policy_skips / A, (double)b->ret_cap_lowers / A,
+                   (double)b->ret_cap_raises / A,
                    (unsigned long)b->ret_sweep_busy, (unsigned long)b->ret_sweep_polls);
         }
         if ((cfg.alg == NCL_ALG_AK || cfg.alg == NCL_ALG_AKSRV) && all_paths) {

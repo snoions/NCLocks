@@ -370,7 +370,7 @@ static void tournament_unlock_nofence(struct ncl_base *b, int i)
 int ncl_retain = 0;
 int ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE | NCL_RETAIN_CHECK_RELEASE;
 int ncl_retain_max = 0;
-int ncl_retain_penalty = 16;
+int ncl_retain_probe = 16;
 _Atomic int ncl_retained_locks;
 int ncl_debug_retain = 0;
 uint64_t ncl_debug_retain_delay = 0;
@@ -424,20 +424,54 @@ static void drop_levels(struct ncl_base *b, int i, int hi, int lo)
     }
 }
 
-static void charge(struct ncl_base *b)
+/* Learned keep height (holding the submutex). keep_need == 0: not set up. */
+static void keep_setup(struct ncl_base *b, int depth)
 {
-    if (ncl_retain_penalty <= 0)
-        return;
-    if (!b->ret_pen)
-        b->ret_pen = ncl_retain_penalty;
-    b->ret_credit -= b->ret_pen;
-    if (b->ret_credit < -2 * NCL_RETAIN_PENALTY_MAX)
-        b->ret_credit = -2 * NCL_RETAIN_PENALTY_MAX;
-    if (b->ret_pen < NCL_RETAIN_PENALTY_MAX)
-        b->ret_pen *= 2;
+    if (!b->keep_need) {
+        b->keep_cap = depth - 1;
+        b->keep_need = ncl_retain_probe;
+        b->keep_run = 0;
+        b->keep_probing = 0;
+    }
 }
 
-void ncl_tour_drop(struct ncl_base *b, int i, int lowest, int waiter)
+/* A waiter on level w: keep below it, probe again later. */
+static void keep_lower(struct ncl_base *b, int w, struct ncl_base_stats *st)
+{
+    if (ncl_retain_probe <= 0 || !b->keep_need || w < 1)
+        return;
+    if (w - 1 < b->keep_cap) {
+        b->keep_cap = w - 1;
+        if (st)
+            NCL_STAT(st->ret_cap_lowers++);
+    }
+    if (b->keep_need < NCL_RETAIN_PROBE_MAX)
+        b->keep_need *= 2;
+    b->keep_run = 0;
+    b->keep_probing = 0;
+}
+
+/* At every global release: the cap for this release. */
+static int keep_tick(struct ncl_base *b, int depth, struct ncl_base_stats *st)
+{
+    if (ncl_retain_probe <= 0)
+        return depth - 1;
+    keep_setup(b, depth);
+    if (++b->keep_run >= b->keep_need) {
+        b->keep_run = 0;
+        if (b->keep_probing && b->keep_need > ncl_retain_probe)
+            b->keep_need /= 2; /* the last probe held for a whole interval */
+        b->keep_probing = 0;
+        if (b->keep_cap < depth - 1) {
+            b->keep_cap++;
+            b->keep_probing = 1;
+            NCL_STAT(st->ret_cap_raises++);
+        }
+    }
+    return b->keep_cap;
+}
+
+void ncl_tour_drop(struct ncl_base *b, int i, int lowest, int waiter, struct ncl_base_stats *st)
 {
     int kept = atomic_load_explicit(&b->kept_levels, memory_order_relaxed);
     if (lowest < 1)
@@ -445,7 +479,7 @@ void ncl_tour_drop(struct ncl_base *b, int i, int lowest, int waiter)
     if (kept < lowest)
         return;
     if (waiter)
-        charge(b);
+        keep_lower(b, waiter, st);
     drop_levels(b, i, kept, lowest);
     ncl_fence(); /* the drop is visible before the submutex goes to a climber */
     set_kept(b, lowest - 1);
@@ -495,7 +529,7 @@ static void tournament_lock_retain(struct ncl_base *b, int i, struct ncl_base_st
             /* A waiter on kept level w: withdraw from l, drop j..w, climb again
              * from w (Peterson's turn lets the waiter go first). */
             NCL_STAT(st->ret_acq_drops++);
-            charge(b);
+            keep_lower(b, w, st);
             ncl_uc_store(fme, 0);
             ncl_fence_ss();
             drop_levels(b, i, j, w);
@@ -509,10 +543,6 @@ static void tournament_lock_retain(struct ncl_base *b, int i, struct ncl_base_st
     } else {
         ok = peterson_may_enter(fot, turn, side);
     }
-    if (b->ret_credit < 8)
-        b->ret_credit++; /* a hit */
-    else
-        b->ret_pen = 0; /* a run of hits: back to the starting penalty */
     set_kept(b, 0); /* held now: the whole path */
     if (!ok) {
         struct ncl_backoff bo;
@@ -532,12 +562,9 @@ static void tournament_unlock_retain(struct ncl_base *b, int i, struct ncl_base_
     if (depth == 0)
         return;
     ncl_uc_store(lvl_flag_me(b, i, depth), 0); /* the root: the lock is free */
-    int keep = depth - 1;
-    if (keep && ncl_retain_penalty > 0 && b->ret_credit < 0) {
-        NCL_STAT(st->ret_policy_skips++);
-        b->ret_credit++; /* probe again after enough releases */
-        keep = 0;
-    }
+    int keep = keep_tick(b, depth, st);
+    if (!keep && depth > 1)
+        NCL_STAT(st->ret_policy_skips++); /* learned: nothing to keep, no release check */
     if (keep && ncl_retain_max &&
         atomic_load_explicit(&ncl_retained_locks, memory_order_relaxed) >= ncl_retain_max) {
         NCL_STAT(st->ret_cap_skips++);
@@ -551,6 +578,7 @@ static void tournament_unlock_retain(struct ncl_base *b, int i, struct ncl_base_
         for (int k = 1; k <= keep; k++)
             if (v[k - 1]) {
                 NCL_STAT(st->ret_rel_drops++);
+                keep_lower(b, k, st);
                 if (NCL_UNLIKELY(ncl_debug_retain & 2)) {
                     /* UNSAFE: drop only the waiter's level, keep the ones above. */
                     ncl_fence_ss();
