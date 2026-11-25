@@ -92,7 +92,7 @@
 #              subsets (one, far2, far4, near2) against the plain tournament, reactive
 #              (REACT_BEST) and the bounds, now on the same CPUs as the subset they bound
 #              (--cpus: the bound's node k runs where the subset's k-th node runs). Variants
-#              G1_VARIANTS (retain = defaults: both checks, adaptive policy; retain_always =
+#              G1_VARIANTS (retain = defaults: both checks, learned keep height; retain_always =
 #              keep at every release; retain_acq = acquire check only), Phase 1
 #              and 2a, L=1, think G1_THINK, at G1_NT. Part all (think 0): every node active,
 #              L = 1, 16, 256: what retention costs when contended or spread over many locks.
