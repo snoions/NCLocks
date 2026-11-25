@@ -1121,3 +1121,71 @@ far2 and 0.9-1.7x for far4.
   handoff, on the critical path. g1 keeps nothing there (g2's case).
 - **Reactive mispicks near2.** It often runs the tournament where Lamport is faster (16x1
   P1 think 2 us: 239k vs 339k; 32x2 P1 think 10 us: 89k vs 239k), bimodal between runs.
+
+## Prefix retention (`g1`, 2026-11-24 22:32)
+
+`results/cxl_20261124_2232/`: `-a tournament --retain` (design §4g g1) with the default
+adaptive policy (`retain`, penalty 16) and keeping at every release (`retain_always`,
+penalty 0), against the plain tournament, reactive and the CPU-matched bounds (now on the
+subset's own CPUs) at the g1bound subsets, L=1, think 0 / 2 / 10 us; plus every node at
+L = 1, 16, 256. cf + clwb, CXL node 2, 2 reps (means), 792 runs, no failures. Median
+spread 2.3%; 40 of 396 cells spread more than 15%.
+
+**Retain (adaptive) at the subsets**, 18 cells each (3 N x T, Phase 1 and 2a, 3 think times):
+
+| subset | / tournament | / reactive | / best of both | / bound |
+|---|---|---|---|---|
+| one {0} | 1.08-2.60, median 1.82 | 0.89-1.30, median 1.04 | 0.89-1.30, median 1.04 | 0.70-1.00, median 0.89 |
+| far2 {0, N/2} | 1.16-2.62, median 1.74 | 0.99-2.70, median 1.48 | 0.99-2.62, median 1.48 | 0.85-1.30, median 0.95 |
+| far4 {0, N/4, N/2, 3N/4} | 0.96-1.37, median 1.02 | 0.92-1.31, median 1.12 | 0.92-1.19, median 1.01 | 0.76-1.11, median 0.89 |
+| near2 {0, 1} | 0.88-1.28, median 0.96 | 0.58-1.15, median 0.97 | 0.58-1.04, median 0.92 | (leaf meeting, nothing to keep) |
+
+Selected cells, k acquisitions/s (tournament / reactive / retain / retain_always / bound):
+
+| cell | one | far2 | far4 |
+|---|---|---|---|
+| 16x1 P1 think 0 | 126 / 248 / 324 / 313 / 396 | 249 / 231 / 512 / 508 / 451 | 490 / 422 / 492 / 476 / 513 |
+| 16x1 P1 think 2 us | 107 / 177 / 195 / 197 / 216 | 201 / 266 / 393 / 381 / 426 | 401 / 300 / 393 / 457 / 506 |
+| 16x3 2a think 2 us | 329 / 554 / 597 / 596 / 694 | 583 / 553 / 796 / 797 / 877 | 817 / 821 / 829 / 851 / 857 |
+| 32x2 P1 think 2 us | 106 / 256 / 266 / 256 / 365 | 169 / 165 / 444 / 446 / 371 | 288 / 330 / 394 / 419 / 419 |
+| 32x2 2a think 2 us | 192 / 409 / 424 / 371 / 484 | 322 / 274 / 688 / 684 / 709 | 495 / 529 / 624 / 623 / 695 |
+
+**Every node** (think 0), retain / retain_always relative to the plain tournament:
+
+| N x T, mode | L=1 | L=16 | L=256 |
+|---|---|---|---|
+| 16x1 P1 | -10% / -7% | -2% / -83% | -4% / -75% |
+| 16x3 P1 | -4% / -3% | -1% / -71% | -1% / -79% |
+| 32x2 P1 | -6% / -8% | -1% / -71% | -1% / -78% |
+| 16x1 2a | -8% / -10% | -2% / -84% | -4% / -76% |
+| 16x3 2a | -1% / -1% | -3% / -73% | -0% / -79% |
+| 32x2 2a | -0% / +1% | -0% / -72% | -1% / -78% |
+
+- **One and two far-apart contenders: retention delivers.** far2 is 1.16-2.62x the
+  tournament and 1.48x reactive (median), and is the best lock in every far2 cell but one (16x3 2a think 10 us, 1% under reactive); one
+  node is 1.82x the tournament and matches or beats reactive (median 1.04; 0.89 at 32x2 2a
+  think 10 us). Fairness is unchanged or better (32x2 P1 far2 think 2 us: min/max 0.81 vs
+  0.66). Counters: one hit per acquisition, depth-1 levels skipped, almost no drops.
+- **Gap to the bound for one node (median 0.89, 0.70 at 32x2 P1 think 0).** 16x1 P1
+  think 0: 3.1 vs 2.5 us per acquisition, ~0.6 us, one load round: the release check,
+  which reads depth-1 flags and finds nothing. far2 meets or exceeds its bound (up to
+  1.30x at 32x2; the `-n 2` bound has another lock layout, so read it as approximate).
+- **far4: the policy is all-or-nothing, and that loses the gain.** The four nodes meet at
+  level depth-1, so the right prefix is depth-2 levels. When the release check finds no
+  waiter, the node keeps depth-1 levels; a node then arrives at level depth-1 and is
+  freed by an acquire check or the sweeper, which charges the penalty, and the node stops
+  keeping anything (16x1 P1 think 2 us: 99% policy skips, 393k = tournament, while
+  retain_always reaches 457k; 32x2 P1 think 0: 56% skips). At think 10 us retain_always
+  loses (-11 to -21%: waiters wait for the sweeper), so neither fixed setting is right.
+- **near2 costs 4-12%** (median 0.96 of the tournament): nothing can be kept, but every
+  release pays the release check, which finds the sibling at level 1 and is not charged.
+- **Every node: the policy works where it must.** Keeping at every release collapses
+  (-71 to -84% at L=16 and 256, as on the dev box); the adaptive policy skips 90-99% of
+  keeps there and costs 0-4%. At L=1 it costs up to 10% (16x1 P1): again the release
+  check, which finds a waiter at level 1 each time.
+- **Next: learn the keep height instead of on/off.** Per lock, node-local: the lowest
+  level at which a waiter forced a drop (acquire check, sweeper) or the release check found
+  one caps the next keep below it, and the release check is skipped while the cap is 0
+  (re-probe occasionally). Expected: far4 at retain_always's level without its idle-node
+  losses, near2 and all-nodes L=1 at the tournament's cost. Separately, `retain_acq`
+  (no release check) measures how much of the one-node gap the release check is.
