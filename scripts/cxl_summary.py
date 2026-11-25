@@ -3,7 +3,7 @@
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
 Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt kv kvreact kviso
-kvbase klayout kstride kfix (default: those whose CSV exists).
+kvbase klayout kstride kfix g1bound g1 (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -108,6 +108,75 @@ def mt(d):
         r["p50"] = (r.p50 / 1e3).round(2)
         r["p99"] = (r.p99 / 1e3).round(1)
         out.append("open loop (MT_MAIN, Poisson): k/s achieved, lock p50 / p99 us\n" + r.round(3).to_string())
+    return "\n\n".join(out)
+
+
+def g1_variant(r):
+    """Label a g1/g1bound row: retain variants share alg=tournament, so use `retain`."""
+    ret = str(getattr(r, "retain", "-"))
+    if r.alg != "tournament" or ret in ("-", "nan"):
+        return r.alg
+    check, *_, pol = ret.split("/")
+    name = {"both": "retain", "acquire": "retain_acq"}.get(check, "retain_" + check)
+    if pol.endswith("pen0") or pol.endswith("probe0"):
+        name = "retain_always" if check == "both" else name + "_always"
+    elif pol.startswith("pen"):
+        name += "(onoff)"  # the first, on/off policy (before the learned keep height)
+    return name
+
+
+def g1(d):
+    """Phases g1, g1bound: throughput (k acq/s, median over reps) per variant at each
+    --active subset, the CPU-matched bounds, and every node at L = 1, 16, 256; then
+    each retain variant relative to the plain tournament and to the best of
+    tournament / reactive / lamport."""
+    d = d.copy()
+    d["variant"] = d.apply(g1_variant, axis=1)
+    d["subset"] = d.config.str.split(":").str[1]
+    d["NT"] = d.nodes.astype(str) + "x" + d.threads_per_node.astype(str)
+    d["mode"] = d["mode"].replace({"phase1": "P1", "local": "2a"})
+    d["think"] = (d.think_ns / 1000).map("{:g}us".format)
+    out = []
+    sub = d[~d.subset.isin(["all"]) & ~d.subset.str.startswith("bound")]
+    bnd = d[d.subset.str.startswith("bound")]
+    # A bound's NT is its own -n; key it by the T and the subset it bounds.
+    bmap = {"one": "bound1", "far2": "bound2", "far4": "bound4", "near2": "bound2", "near4": "bound4"}
+    key = ["mode", "NT", "think", "subset"]
+    t = sub.pivot_table(index=key, columns="variant", values="achieved_rps", aggfunc="median") / 1e3
+    if len(bnd):
+        b = bnd.groupby(["mode", "threads_per_node", "think", "subset"]).achieved_rps.median() / 1e3
+        t["bound"] = [b.get((m, int(nt.split("x")[1]), th, bmap.get(s, "")), float("nan"))
+                      for m, nt, th, s in t.index]
+    rets = [c for c in t.columns if c.startswith("retain")]
+    if len(sub):
+        out.append("k acq/s, median over reps (subsets; bound = CPU-matched tournament over the "
+                   "levels retention still climbs)\n" + t.round(0).to_string())
+        if rets:
+            base = [c for c in ("tournament", "reactive", "lamport") if c in t.columns]
+            rel = pd.DataFrame(index=t.index)
+            for c in rets:
+                rel[c + "/tour"] = t[c] / t["tournament"]
+                rel[c + "/best"] = t[c] / t[base].max(axis=1)
+                if "bound" in t.columns:
+                    rel[c + "/bound"] = t[c] / t["bound"]
+            out.append("ratios\n" + rel.round(2).to_string())
+            summ = rel.groupby(level="subset").agg(["min", "median", "max"]).round(2)
+            out.append("ratios by subset (min / median / max over cells)\n" + summ.T.to_string())
+    al = d[d.subset == "all"]
+    if len(al):
+        a = al.pivot_table(index=["mode", "NT", "locks"], columns="variant",
+                           values="achieved_rps", aggfunc="median") / 1e3
+        cols = list(a.columns)
+        for c in [c for c in cols if c.startswith("retain")]:
+            a[c + "/tour"] = a[c] / a["tournament"]
+        out.append("every node active, think 0 (k acq/s; ratios vs tournament)\n" + a.round(2).to_string())
+    cnt = [c for c in ("ret_hits_per_acq", "ret_skipped_per_acq", "ret_policy_skips_per_acq",
+                       "ret_cap_lowers_per_acq", "ret_cap_raises_per_acq") if c in d.columns]
+    rr = d[d.variant.str.startswith("retain")]
+    if len(rr) and cnt:
+        c = rr.groupby(["variant", "subset", "mode", "NT", "think"])[cnt].median()
+        c.columns = [x.replace("ret_", "").replace("_per_acq", "") for x in cnt]
+        out.append("retention counters per acquisition (median)\n" + c.round(4).to_string())
     return "\n\n".join(out)
 
 
@@ -343,7 +412,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix"]
+                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix", "g1bound", "g1"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -376,6 +445,8 @@ def main():
             print(kstride(d))
         elif ph == "kfix":
             print(kfix(d))
+        elif ph in ("g1", "g1bound"):
+            print(g1(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()
