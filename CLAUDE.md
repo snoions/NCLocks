@@ -71,8 +71,8 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   Biased tournaments g2, g7, g8 are not implemented.
 - `-a tournament --retain` (design §4g g1, not model-checked): prefix retention. A global
   release keeps the levels below the lowest one with a waiter (`kept_levels`, node-local); the
-  next acquisition starts above them. Waiters on kept levels are found by the release and
-  acquire checks (`--retain-check`) and a per-node sweeper thread (`--retain-poll`,
+  next acquisition starts above them. Waiters on kept levels are found by the acquire check (default;
+  `--retain-check both` adds the release check, measured not to pay) and a per-node sweeper thread (`--retain-poll`,
   `--retain-lease`, `--retain-max`), which drops only after try-locking the lock's submutex
   (the submutex is the lease; `ncl_sub_trylock`). The sweeper is required for liveness
   (cross-lock deadlock without it). Learned keep height, `--retain-probe` (default 16; 0 =

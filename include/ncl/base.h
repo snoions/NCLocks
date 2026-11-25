@@ -328,7 +328,7 @@ extern int ncl_bakery_arity;
  * sweeper. */
 extern int ncl_retain;
 enum { NCL_RETAIN_CHECK_ACQUIRE = 1, NCL_RETAIN_CHECK_RELEASE = 2 };
-extern int ncl_retain_check; /* NCL_RETAIN_CHECK_* bits (default both) */
+extern int ncl_retain_check; /* NCL_RETAIN_CHECK_* bits (default acquire) */
 extern int ncl_retain_max;   /* at most this many locks kept per node (0 = no limit) */
 /* Learned keep height (0 = always keep depth - 1 levels): per lock, node-local,
  * a cap on the levels a release keeps, starting at depth - 1. A waiter found on

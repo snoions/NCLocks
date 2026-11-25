@@ -368,7 +368,7 @@ static void tournament_unlock_nofence(struct ncl_base *b, int i)
  * i) >> (l - 1) in the heap-numbered tree; node pos >> 1, side pos & 1. */
 
 int ncl_retain = 0;
-int ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE | NCL_RETAIN_CHECK_RELEASE;
+int ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE; /* measured on CXL: the release check costs more than it saves */
 int ncl_retain_max = 0;
 int ncl_retain_probe = 16;
 _Atomic int ncl_retained_locks;

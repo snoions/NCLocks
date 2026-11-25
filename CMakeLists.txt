@@ -620,10 +620,12 @@ add_test(NAME kv_emu_bakery_classic_local COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_k
 # dropping without the submutex (--debug-retain 1), a non-contiguous drop
 # (--debug-retain 2), and no sweeper with several locks (cross-lock deadlock,
 # caught by --timeout).
-# Tests keep levels at every release (--retain-probe 0) so the retention paths
-# run on every acquisition; stress_retain_emu_adaptive runs the default learned
+# Tests keep levels at every release (--retain-probe 0, with both checks: with the
+# acquire check alone a waiter depends on the sweeper, slow when ctest oversubscribes
+# the CPUs) so the retention paths run on every acquisition; _check_acquire covers
+# the acquire-only default with it; stress_retain_emu_adaptive runs the default learned
 # keep height, and _probe1 the shortest probe interval (cap lowerings and probes).
-set(RETAIN_ARGS -a tournament --retain --retain-probe 0 -b emu -n 8 -t 2 -d 2000)
+set(RETAIN_ARGS -a tournament --retain --retain-probe 0 --retain-check both -b emu -n 8 -t 2 -d 2000)
 add_test(NAME stress_retain_emu
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${RETAIN_ARGS} -l 4 -i 30000 --timeout 200)
 add_test(NAME stress_retain_emu_adaptive
@@ -641,13 +643,13 @@ add_test(NAME stress_retain_emu_check_acquire
 add_test(NAME stress_retain_emu_check_release_max1
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${RETAIN_ARGS} -l 4 -i 20000 --retain-check release --retain-max 1 --timeout 200)
 add_test(NAME stress_retain_emu_n5_t3
-  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 -b emu -n 5 -t 3 -l 2 -i 20000 -d 2000 --timeout 200)
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 --retain-check both -b emu -n 5 -t 3 -l 2 -i 20000 -d 2000 --timeout 200)
 add_test(NAME stress_retain_emu_mix_algs
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${RETAIN_ARGS} -l 4 -i 20000 --mix-algs --timeout 200)
 add_test(NAME stress_retain_cached-flush_n8
-  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 -b cached-flush -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 --retain-check both -b cached-flush -n 8 -t 2 -l 2 -i 10000 --timeout 100)
 add_test(NAME stress_retain_uc_n8
-  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 -b uc -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 --retain-check both -b uc -n 8 -t 2 -l 2 -i 10000 --timeout 100)
 set_tests_properties(stress_retain_uc_n8 PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
 add_test(NAME retain_detects_sweeper_without_submutex
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${RETAIN_ARGS} -l 1 -i 20000 --retain-poll 0 --retain-lease 0 --retain-delay 2000 --debug-retain 1 --timeout 60)

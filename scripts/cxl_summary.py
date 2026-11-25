@@ -117,9 +117,10 @@ def g1_variant(r):
     if r.alg != "tournament" or ret in ("-", "nan"):
         return r.alg
     check, *_, pol = ret.split("/")
-    name = {"both": "retain", "acquire": "retain_acq"}.get(check, "retain_" + check)
+    # Labels name the checks (the default changed from both to acquire on 2026-11-25).
+    name = {"both": "retain_both", "acquire": "retain_acq"}.get(check, "retain_" + check)
     if pol.endswith("pen0") or pol.endswith("probe0"):
-        name = "retain_always" if check == "both" else name + "_always"
+        name += "_always"
     elif pol.startswith("pen"):
         name += "(onoff)"  # the first, on/off policy (before the learned keep height)
     return name

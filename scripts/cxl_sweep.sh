@@ -92,8 +92,9 @@
 #              subsets (one, far2, far4, near2) against the plain tournament, reactive
 #              (REACT_BEST) and the bounds, now on the same CPUs as the subset they bound
 #              (--cpus: the bound's node k runs where the subset's k-th node runs). Variants
-#              G1_VARIANTS (retain = defaults: both checks, learned keep height; retain_always =
-#              keep at every release; retain_acq = acquire check only), Phase 1
+#              G1_VARIANTS (retain = defaults: acquire check, learned keep height;
+#              retain_both = plus the release check; retain_always = keep at every
+#              release; retain_acq = explicit acquire check), Phase 1
 #              and 2a, L=1, think G1_THINK, at G1_NT. Part all (think 0): every node active,
 #              L = 1, 16, 256: what retention costs when contended or spread over many locks.
 #              CSV columns retain, ret_*_per_acq.
@@ -157,7 +158,7 @@ BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bak
 BKWAIT_K=${BKWAIT_K:-"0 2 4"}                     # phases bkwait / kvbkwait
 G1_NT=${G1_NT:-"16x1 16x3 32x2"}                 # phase g1bound
 G1_THINK=${G1_THINK:-"0 2000 10000"}             # phases g1bound, g1: closed-loop think time, ns
-G1_VARIANTS=${G1_VARIANTS:-"retain retain_acq retain_always"} # phase g1: retention variants (g1_variant)
+G1_VARIANTS=${G1_VARIANTS:-"retain retain_both retain_always"} # phase g1: retention variants (g1_variant)
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
 # U:D[:W]: up when >= U of the last 16 contended; down when <= D of the last 64, after
@@ -821,6 +822,7 @@ g1_variant() {
   case $1 in
     retain) echo "-a tournament --retain" ;;
     retain_acq) echo "-a tournament --retain --retain-check acquire" ;;
+    retain_both) echo "-a tournament --retain --retain-check both" ;;
     retain_always) echo "-a tournament --retain --retain-probe 0" ;;
     *) die "unknown G1_VARIANTS entry $1" ;;
   esac

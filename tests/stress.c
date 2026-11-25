@@ -282,7 +282,7 @@ static void usage(const char *argv0)
             "  --bakery-delay NS  DEBUG: bakery spins between reading tickets and publishing its own\n"
             "  --retain      tournament: prefix retention (design.md §4g g1) with a per-node sweeper\n"
             "  --retain-check both|acquire|release|none  where kept levels are checked for\n"
-            "                waiters (default both)\n"
+            "                waiters (default acquire)\n"
             "  --retain-poll US|off  sweeper poll period (10; 0 = yield; off = no sweeper: UNSAFE,\n"
             "                cross-lock deadlock, must hang with several locks)\n"
             "  --retain-lease US  sweeper drops kept levels this long after they were kept (1000)\n"

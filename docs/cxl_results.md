@@ -1189,3 +1189,59 @@ Selected cells, k acquisitions/s (tournament / reactive / retain / retain_always
   (re-probe occasionally). Expected: far4 at retain_always's level without its idle-node
   losses, near2 and all-nodes L=1 at the tournament's cost. Separately, `retain_acq`
   (no release check) measures how much of the one-node gap the release check is.
+
+## Prefix retention, learned keep height (`g1`, 2026-11-25 18:47)
+
+`results/cxl_20261125_1847/`: same grid as the previous section, with the learned keep
+height (`--retain-probe 16`) replacing the on/off policy. Variants: `retain_both`
+(the default then: acquire and release checks), `retain_acq` (acquire check only),
+`retain_both_always` (keep depth-1 levels at every release); plus the plain tournament,
+reactive and the CPU-matched bounds. 972 runs, 2 reps, no failures; median rep spread
+1.5-3.8% (reactive the highest). Tables: `scripts/cxl_summary.py results/cxl_20261125_1847 g1`.
+
+**Ratios over the 18 cells per subset (min / median / max):**
+
+| subset | retain_both / tour | retain_acq / tour | retain_both / reactive | retain_acq / reactive | retain_acq / bound |
+|---|---|---|---|---|---|
+| one {0} | 1.09 / 1.83 / 2.43 | 1.08 / 2.03 / 3.19 | 0.99 / 1.03 / 1.21 | 1.01 / 1.19 / 1.40 | 0.83 / 0.97 / 1.02 |
+| far2 {0, N/2} | 0.97 / 1.69 / 2.68 | 1.20 / 1.81 / 2.33 | 1.02 / 1.64 / 2.59 | 1.07 / 1.79 / 2.37 | 0.83 / 0.99 / 1.23 |
+| far4 | 0.98 / 1.15 / 1.53 | 1.00 / 1.20 / 1.49 | 0.99 / 1.15 / 1.49 | 1.02 / 1.20 / 1.63 | 0.87 / 0.98 / 1.16 |
+| near2 {0, 1} | 0.95 / 1.00 / 1.16 | 0.94 / 1.01 / 1.15 | 0.44 / 0.98 / 1.04 | 0.43 / 0.98 / 1.04 | (nothing to keep) |
+
+The previous run's on/off policy: far4 1.02, near2 0.96 of the tournament (median).
+
+Selected cells, k acq/s (tournament / reactive / retain_both / retain_acq / retain_both_always):
+
+| cell | one | far2 | far4 |
+|---|---|---|---|
+| 16x1 P1 think 0 | 131 / 256 / 309 / 358 / 313 | 249 / 222 / 519 / 526 / 480 | 474 / 461 / 489 / 494 / 482 |
+| 16x1 P1 think 2 us | 108 / 174 / 194 / 218 / 196 | 208 / 345 / 382 / 421 / 382 | 407 / 352 / 456 / 492 / 446 |
+| 16x3 2a think 2 us | 329 / 543 / 620 / 708 / 615 | 592 / 546 / 866 / 908 / 854 | 837 / 821 / 866 / 837 / 849 |
+| 32x2 P1 think 2 us | 106 / 252 / 258 / 339 / 265 | 213 / 184 / 439 / 427 / 483 | 293 / 315 / 448 / 436 / 449 |
+| 32x2 2a think 2 us | 195 / 399 / 447 / 472 / 448 | 324 / 261 / 556 / 599 / 578 | 471 / 537 / 595 / 643 / 703 |
+
+**Every node** (think 0), relative to the plain tournament: retain_both 0.96-1.02,
+retain_acq 0.96-1.02, keep-always 0.17-0.29 at L = 16, 256 (0.95-1.00 at L=1). Reactive
+was not run in this part.
+
+- **The learned height fixes the on/off policy's losses.** far4 settles at depth-2 kept
+  levels (2 of 4 skipped at N=16, 3 of 5 at N=32, a hit on every Phase 1 acquisition) and
+  probes the meeting level about once per 4096 releases (cap lowerings 0.0003/acq): 1.15x
+  the tournament (was 1.02). near2 and every node at L=1 settle at cap 0 and skip the
+  release check: 1.00 (was 0.96, and up to -10% at L=1).
+- **The release check costs more than it saves.** Without it (`retain_acq`) one node is
+  2.03x the tournament (vs 1.83) and 0.97 of the bound (vs 0.90); far2 and far4 reach
+  0.99 and 0.98 of their bounds. It loses nowhere measurable (every-node cells within
+  noise of retain_both). **Default changed to `--retain-check acquire`** (2026-11-25).
+  Caveat: with the acquire check alone a waiter on an idle node's kept levels depends on
+  the sweeper; on an oversubscribed host with keep-always (`--retain-probe 0`) that is
+  slow (dev box stress under ctest -j8: timeouts), the learned height avoids it.
+- **Against reactive** (retain_acq): faster in every cell of one, far2 and far4 (54 of
+  54, 16 / 18 / 16 of 18 by more than 5%), median 1.19x for one node (reactive runs
+  Lamport's fast path; retention's single root level is cheaper), 1.79x for far2 (reactive
+  climbs the full tree or retries Lamport's slow path), 1.20x for far4. Fairness is
+  better too (min/max at far2: worst cell 0.95 vs reactive 0.71; far4 0.88 vs 0.74).
+  near2 (leaf meeting): median 0.98, but reactive wins clearly where it picks Lamport for
+  two light contenders: 16x1 think 2 us 335k vs 145k (P1), 246k vs 144k (2a); think 10 us
+  144k vs 113k. Retention keeps nothing there; that is g2's case, or a reason to combine
+  the two (reactive's Lamport mode for leaf-meeting pairs, retention in tournament mode).

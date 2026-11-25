@@ -405,7 +405,7 @@ static void usage(const char *argv0)
             "                the levels below the lowest one with a waiter; a per-node\n"
             "                sweeper drops them on a waiter or lease expiry\n"
             "  --retain-check both|acquire|release|none  where kept levels are checked for\n"
-            "                waiters besides the sweeper (both)\n"
+            "                waiters besides the sweeper (acquire)\n"
             "  --retain-poll US  sweeper poll period (10; 0 = yield)\n"
             "  --retain-lease US  drop kept levels this long after they were kept (1000)\n"
             "  --retain-max N  at most N locks with kept levels per node (0 = no limit)\n"
