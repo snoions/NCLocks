@@ -138,21 +138,28 @@ struct ncl_base {
      * lease scan in src/lock.c, which acts only after try-locking the submutex). */
     _Atomic int my_slot;         /* -1: none */
     _Atomic uint64_t hot_last;   /* ncl_cycles() of this node's last global acquisition */
-    uint64_t hot_prev;           /* the one before (admission window) */
+    int hot_streak;              /* consecutive acquisitions within the window (admission) */
     int hot_path;                /* NCL_HOT_PATH_* of the acquisition holding the lock */
     int hot_slot_acq;            /* HOT path: the slot that acquisition climbed from */
     int hot_mode_seen;           /* hot_mode read at C's top (cold paths) */
     int hot_rwaited;             /* R's entry check had to wait */
+    int hot_at_r;                /* cold path through R: a hot node was at R (admission) */
+    int hot_eligible;            /* global releases left of a passed g1-cap test */
     int hot_rcold;               /* hot path: R's turn showed a cold entrant since the last
                                     hot one (read in H's first entry check) */
     unsigned hot_hist;           /* hot acquisitions: bit set = hot_rcold (last 16) */
     int hot_nhist;               /* hot acquisitions since the slot was claimed */
-    int hot_clear_cnt;           /* cold-through-R acquisitions without an R wait */
+    int hot_clear_cnt;           /* cold-through-R acquisitions with no hot node at R (a
+                                    clear check runs at each) */
     int hot_clear_hint;          /* this node freed a slot: run the clear check at once */
     int hot_keep0;               /* this release claimed a slot: keep no levels of C */
-    int hot_adm_skip;            /* admissible releases to skip (after a full table or a
-                                    cold-share eviction) */
+    int hot_adm_skip;            /* admissible releases to skip after a free (not when
+                                    joining a hot node met at R) */
     int hot_adm_backoff;         /* next skip length (doubles, <= NCL_HOT_BACKOFF_MAX) */
+    int hot_full_skip;           /* admissible releases to skip after a full table */
+    int hot_full_backoff;        /* its next length (reset by a successful claim) */
+    int hot_crowd;               /* last eviction found the table full: no join bypass */
+    int hot_since_free;          /* hot acquisitions since a free slot was last seen (<= 16) */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -205,6 +212,7 @@ struct ncl_base_stats {
     uint64_t hot_mode_sets;     /* g2: hot_mode set by a claimer */
     uint64_t hot_mode_clears;   /* g2: hot_mode cleared (every slot free) */
     uint64_t hot_clear_checks;  /* g2: slot-table reads by the clear check */
+    uint64_t hot_evict_waits;   /* g2: cold-share eviction postponed: a slot is free */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -396,12 +404,15 @@ extern uint64_t ncl_debug_retain_delay;
  * 2, 0 = off), set in every process before laying out locks (it changes the line
  * count). Admission: at a global release of a cold acquisition, if the node's g1
  * learned cap shows contenders meeting low enough that the hot path is shorter,
- * log2 k + 1 < depth - cap (ncl_hot_admit_always: skip this test), and its previous
- * acquisition was within ncl_hot_window_us. Eviction: cold share (in 8 of the last
- * 16 hot acquisitions a cold node had entered R since the previous hot one: other
- * nodes use the lock, and the slot makes them pay R; admissions then back off
- * exponentially), the lease (src/lock.c, piggybacked on global releases:
- * ncl_hot_lease_us), detach. */
+ * log2 k + 1 < depth - cap (sticky for 64 releases), or it met a hot node at R; and its
+ * last 4 gaps between acquisitions were within ncl_hot_window_us (default 100;
+ * ncl_hot_admit_always: skip the cap and R tests). Lease default 250 us. Eviction: cold share (at
+ * least half of the last min(n, 16) hot acquisitions, n >= 4 (n >= 16 while a slot
+ * is free: a group may be forming), saw a cold node: one
+ * had entered R since the previous hot acquisition, or was waiting at R; other nodes
+ * use the lock and the slot makes them pay R), the lease (src/lock.c, piggybacked on
+ * global releases: ncl_hot_lease_us), detach. Every free backs off admissions
+ * exponentially. */
 extern int ncl_hot_k, ncl_hot_window_us, ncl_hot_lease_us, ncl_hot_admit_always;
 extern uint64_t ncl_hot_window_cycles, ncl_hot_lease_cycles; /* set at attach */
 #define NCL_HOT_BACKOFF_MAX 4096

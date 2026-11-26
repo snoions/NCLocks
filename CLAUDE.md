@@ -72,9 +72,10 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
 - `-a tournament --retain --hot K` (design §4g g2, not model-checked): hot-slot subtree H
   (K slots) under a new root R, with g1 in the cold tree C. Cold nodes climb R only while
   `hot_mode` is set (read in C-top's entry-check batch); a node claims a slot (holding the
-  lock) only where g1's learned cap shows contenders meeting low; slots are freed only by
-  their owner (cold-share trigger via R's turn, lease piggybacked on global releases under
-  `ncl_sub_trylock`, detach). `--hot-window`, `--hot-lease`, `--hot-admit cap|always`;
+  lock) after 4 short reuse gaps, where g1's learned cap shows contenders meeting low
+  (sticky) or it met a hot node at R; slots are freed only by their owner (cold share: R's
+  turn and cold flag; lease piggybacked on global releases under `ncl_sub_trylock`;
+  detach), with admission backoff and a crowd mark. `--hot-window`, `--hot-lease`, `--hot-admit cap|always`;
   `--debug-hot 1|2|4|8|16` must FAIL (ctests `hot_detects_*`). Sweep phases `g2bound`,
   `g2bypass` (`--hot-probe`: the bypass's cost alone), `g2`.
 - `-a tournament --retain` (design §4g g1, not model-checked): prefix retention. A global

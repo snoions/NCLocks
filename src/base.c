@@ -389,7 +389,7 @@ int ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE; /* measured on CXL: the release
 int ncl_retain_max = 0;
 int ncl_retain_probe = 16;
 int ncl_tour_hot_probe;
-int ncl_hot_k, ncl_hot_window_us = 1000, ncl_hot_lease_us = 1000, ncl_hot_admit_always;
+int ncl_hot_k, ncl_hot_window_us = 100, ncl_hot_lease_us = 250, ncl_hot_admit_always;
 uint64_t ncl_hot_window_cycles, ncl_hot_lease_cycles;
 _Atomic int ncl_hot_held;
 int ncl_debug_hot;
@@ -1493,15 +1493,25 @@ static void hot_delay(void)
         ncl_lat_spin_cycles(ncl_debug_hot_delay);
 }
 
-/* Peterson at R from `side`; returns 1 if it waited. */
-static int r_lock(struct ncl_base *b, int side, struct ncl_base_stats *st)
+/* Peterson at R from `side`; returns 1 if it waited. *other_set: the other side's
+ * flag was set at the first entry check (a node of the other side is at R). */
+static int r_lock(struct ncl_base *b, int side, int *other_set, struct ncl_base_stats *st)
 {
-    int w = peterson_lock(R_FLAG(b, side), R_FLAG(b, 1 - side), R_TURN(b), (uint64_t)side);
-    if (w) {
-        NCL_STAT(st->hot_r_waits++);
-        st->contended++;
-    }
-    return w;
+    peterson_announce(R_FLAG(b, side), R_TURN(b), (uint64_t)side);
+    ncl_line_t *ls[2] = {R_FLAG(b, 1 - side), R_TURN(b)};
+    uint64_t v[2];
+    ncl_uc_load_many(ls, 2, v);
+    if (other_set)
+        *other_set = v[0] != 0;
+    if (!(v[0] && v[1] == (uint64_t)side))
+        return 0;
+    struct ncl_backoff bo;
+    ncl_backoff_init(&bo);
+    while (!peterson_may_enter(ls[0], ls[1], (uint64_t)side))
+        ncl_backoff(&bo);
+    NCL_STAT(st->hot_r_waits++);
+    st->contended++;
+    return 1;
 }
 
 /* Climb H from slot s. H's first entry check also reads R's turn (same batch: no
@@ -1530,14 +1540,16 @@ static void hot_climb(struct ncl_base *b, int s, struct ncl_base_stats *st)
     }
 }
 
-/* Skip the next admissible releases, doubling per call (full table, eviction). */
-static void hot_adm_backoff(struct ncl_base *b)
+/* Skip the next admissible releases, doubling per call: *skip / *backoff are the
+ * eviction pair (hot_adm_*) or the full-table pair (hot_full_*). */
+static void hot_backoff(int *skip, int *backoff)
 {
-    b->hot_adm_backoff = b->hot_adm_backoff ? b->hot_adm_backoff * 2 : 16;
-    if (b->hot_adm_backoff > NCL_HOT_BACKOFF_MAX)
-        b->hot_adm_backoff = NCL_HOT_BACKOFF_MAX;
-    b->hot_adm_skip = b->hot_adm_backoff;
+    *backoff = *backoff ? *backoff * 2 : 16;
+    if (*backoff > NCL_HOT_BACKOFF_MAX)
+        *backoff = NCL_HOT_BACKOFF_MAX;
+    *skip = *backoff;
 }
+static void hot_adm_backoff(struct ncl_base *b) { hot_backoff(&b->hot_adm_skip, &b->hot_adm_backoff); }
 
 /* H's levels of slot s, top-down, store-store ordered. */
 static void hot_unlock_h(struct ncl_base *b, int s)
@@ -1575,6 +1587,20 @@ static int hot_pick(const uint64_t *own, int k)
     return best;
 }
 
+/* Holding the global lock: is any slot free? (one batch of k lines) */
+static int hot_any_free(struct ncl_base *b)
+{
+    ncl_line_t *ls[32];
+    uint64_t own[32];
+    for (int s = 0; s < ncl_hot_k; s++)
+        ls[s] = &b->hot_owner[s];
+    ncl_uc_load_many(ls, ncl_hot_k, own);
+    for (int s = 0; s < ncl_hot_k; s++)
+        if (!own[s])
+            return 1;
+    return 0;
+}
+
 /* Holding the global lock (through C): claim a free slot for node i. */
 static int hot_claim(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
@@ -1594,9 +1620,10 @@ static int hot_claim(struct ncl_base *b, int i, struct ncl_base_stats *st)
     int s = hot_pick(own, ncl_hot_k);
     if (s < 0) {
         NCL_STAT(st->hot_full++);
-        hot_adm_backoff(b); /* don't re-read a full table at every release */
+        hot_backoff(&b->hot_full_skip, &b->hot_full_backoff); /* don't re-read it each time */
         return 0;
     }
+    b->hot_full_backoff = 0;
     if (NCL_UNLIKELY(ncl_debug_hot & 2))
         hot_delay(); /* widen read-table -> claim for the unlocked claimer */
     ncl_uc_store(&b->hot_owner[s], (uint64_t)i + 1);
@@ -1604,6 +1631,7 @@ static int hot_claim(struct ncl_base *b, int i, struct ncl_base_stats *st)
     atomic_store_explicit(&b->my_slot, s, memory_order_relaxed);
     b->hot_hist = 0;
     b->hot_nhist = 0;
+    b->hot_since_free = 16; /* until a free slot is seen, judge every sample */
     atomic_fetch_add_explicit(&ncl_hot_held, 1, memory_order_relaxed);
     NCL_STAT(st->hot_claims++);
     return 1;
@@ -1619,6 +1647,9 @@ void ncl_tour_hot_free(struct ncl_base *b, struct ncl_base_stats *st)
     ncl_fence();
     atomic_store_explicit(&b->my_slot, -1, memory_order_relaxed);
     b->hot_clear_hint = 1;
+    /* Every free (cold share, lease, detach) is evidence the slot did not pay off:
+     * back off admissions (reset after 64 hot acquisitions of a later slot). */
+    hot_adm_backoff(b);
     atomic_fetch_sub_explicit(&ncl_hot_held, 1, memory_order_relaxed);
 }
 
@@ -1644,31 +1675,46 @@ static void hot_clear_check(struct ncl_base *b, struct ncl_base_stats *st)
     NCL_STAT(st->hot_mode_clears++);
 }
 
-/* Admission (at a cold release, holding the lock): recent reuse, and g1's learned
- * cap shows contenders meeting low enough that H + R is shorter than the rest of C. */
-static int hot_admit(const struct ncl_base *b, int depth)
+/* Admission (at a cold release, holding the lock): recent reuse, and either g1's
+ * learned cap shows contenders meeting low enough that H + R is shorter than the
+ * rest of C, or a hot node was at R when we entered it (joining H, we would meet it
+ * there instead of climbing C and R; without this, a partner of a hot node stops
+ * qualifying once it no longer meets anyone in C, and a group never forms). */
+static int hot_admit(struct ncl_base *b, int depth)
 {
-    uint64_t now = atomic_load_explicit(&b->hot_last, memory_order_relaxed);
-    if (!b->hot_prev || now - b->hot_prev > ncl_hot_window_cycles)
-        return 0;
-    if (ncl_hot_admit_always)
-        return 1;
-    if (ncl_retain_probe <= 0 || !b->keep_need)
-        return 0;
-    return __builtin_ctz((unsigned)ncl_hot_k) + 1 < depth - b->keep_cap;
+    /* g1's cap test is sticky for 64 global releases: once a hot node leaves C, its
+     * partners stop meeting anyone there and their caps rise again; they must still
+     * be able to join. */
+    if (ncl_retain_probe > 0 && b->keep_need &&
+        __builtin_ctz((unsigned)ncl_hot_k) + 1 < depth - b->keep_cap)
+        b->hot_eligible = 64;
+    else if (b->hot_eligible > 0)
+        b->hot_eligible--;
+    if (b->hot_streak < 4)
+        return 0; /* 4 consecutive short gaps: sustained reuse, not a chance one */
+    return ncl_hot_admit_always || b->hot_eligible > 0 ||
+           (b->hot_path == NCL_HOT_PATH_COLD_R && b->hot_at_r);
 }
 
 static void tournament_lock_hot(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
-    b->hot_prev = atomic_load_explicit(&b->hot_last, memory_order_relaxed);
-    atomic_store_explicit(&b->hot_last, ncl_cycles(), memory_order_relaxed);
+    const uint64_t prev = atomic_load_explicit(&b->hot_last, memory_order_relaxed), now = ncl_cycles();
+    atomic_store_explicit(&b->hot_last, now, memory_order_relaxed);
+    if (prev && now - prev <= ncl_hot_window_cycles) {
+        if (b->hot_streak < 1000)
+            b->hot_streak++;
+    } else {
+        b->hot_streak = 0;
+    }
     int s = atomic_load_explicit(&b->my_slot, memory_order_relaxed);
     if (s >= 0) {
         if (NCL_UNLIKELY(ncl_debug_hot & 1))
             hot_delay(); /* widen choose-path -> climb against an unlocked lease free */
         b->hot_slot_acq = s; /* the release clears what this acquisition took */
         hot_climb(b, s, st);
-        b->hot_rwaited = r_lock(b, R_HOT, st);
+        int cold_at_r;
+        b->hot_rwaited = r_lock(b, R_HOT, &cold_at_r, st);
+        b->hot_rcold |= cold_at_r; /* a cold node waiting at R also counts */
         ncl_fence();
         b->hot_path = NCL_HOT_PATH_HOT;
         NCL_STAT(st->hot_acqs++);
@@ -1681,12 +1727,13 @@ static void tournament_lock_hot(struct ncl_base *b, int i, struct ncl_base_stats
     uint64_t mode = tournament_lock_retain(b, i, st);
     b->hot_mode_seen = mode != 0;
     if (mode) {
-        b->hot_rwaited = r_lock(b, R_COLD, st);
+        b->hot_rwaited = r_lock(b, R_COLD, &b->hot_at_r, st);
         ncl_fence();
         b->hot_path = NCL_HOT_PATH_COLD_R;
         NCL_STAT(st->hot_r_acqs++);
     } else {
         b->hot_path = NCL_HOT_PATH_COLD;
+        b->hot_at_r = 0;
     }
 }
 
@@ -1695,9 +1742,35 @@ static void tournament_unlock_hot(struct ncl_base *b, int i, struct ncl_base_sta
     if (b->hot_path == NCL_HOT_PATH_HOT) {
         int s = b->hot_slot_acq;
         b->hot_hist = ((b->hot_hist << 1) | (b->hot_rcold ? 1u : 0u)) & 0xffffu;
-        if (b->hot_nhist < 64 && ++b->hot_nhist == 64)
+        if (b->hot_nhist < 64 && ++b->hot_nhist == 64) {
             b->hot_adm_backoff = 0; /* the slot paid off for a while: admit freely again */
-        int evict = b->hot_nhist >= 16 && __builtin_popcount(b->hot_hist) >= 8;
+            b->hot_crowd = 0;
+        }
+        /* Cold share: at least half of the last min(n, 16) hot acquisitions saw a cold
+         * node (entered R since the previous hot one, or waiting there); decided from
+         * 4 on, so a slot on a lock others use costs them R only briefly. */
+        if (b->hot_since_free < 16)
+            b->hot_since_free++;
+        int n = b->hot_nhist < 16 ? b->hot_nhist : 16;
+        int evict = n >= 4 && 2 * __builtin_popcount(b->hot_hist & ((1u << n) - 1)) >= n;
+        if (evict) {
+            if (hot_any_free(b)) {
+                /* A free slot: the cold nodes we saw may be about to claim it (a group
+                 * forming); wait for 16 samples before deciding that they cannot. */
+                b->hot_since_free = 0;
+                b->hot_crowd = 0;
+                if (n < 16) {
+                    evict = 0;
+                    NCL_STAT(st->hot_evict_waits++);
+                }
+            } else {
+                /* Full: judge only the samples since the table filled (earlier ones
+                 * may show partners that have joined since). A crowd if it holds. */
+                int m = b->hot_since_free;
+                evict = m >= 4 && 2 * __builtin_popcount(b->hot_hist & ((1u << m) - 1)) >= m;
+                b->hot_crowd = evict;
+            }
+        }
         ncl_fence(); /* critical-section effects first */
         if (NCL_UNLIKELY(ncl_debug_hot & 4)) { /* UNSAFE: levels below before R */
             hot_unlock_h(b, s);
@@ -1709,10 +1782,11 @@ static void tournament_unlock_hot(struct ncl_base *b, int i, struct ncl_base_sta
             ncl_fence_ss();
             hot_unlock_h(b, s);
         }
-        if (evict) { /* cold share: other nodes use this lock; R taxes them */
+        if (evict) { /* cold share: other nodes use this lock; R taxes them. A crowd
+                      * (table full) gives up the join bypass, so its churn dies out
+                      * under the backoff. */
             ncl_fence();
             ncl_tour_hot_free(b, st);
-            hot_adm_backoff(b);
             NCL_STAT(st->hot_free_fair++);
         }
         return;
@@ -1720,7 +1794,14 @@ static void tournament_unlock_hot(struct ncl_base *b, int i, struct ncl_base_sta
     const int path = b->hot_path;
     int admit = atomic_load_explicit(&b->my_slot, memory_order_relaxed) < 0 &&
                 hot_admit(b, ncl_tour_depth(b));
-    if (admit && b->hot_adm_skip > 0) {
+    /* Joining a hot node met at R ignores the eviction backoff (direct evidence of
+     * a group; otherwise two partners evicted in turn stay out of step); the
+     * full-table backoff always applies. */
+    const int join = b->hot_path == NCL_HOT_PATH_COLD_R && b->hot_at_r && !b->hot_crowd;
+    if (admit && b->hot_full_skip > 0) {
+        b->hot_full_skip--;
+        admit = 0;
+    } else if (admit && !join && b->hot_adm_skip > 0) {
         b->hot_adm_skip--;
         admit = 0;
     }
@@ -1728,9 +1809,9 @@ static void tournament_unlock_hot(struct ncl_base *b, int i, struct ncl_base_sta
         if (hot_claim(b, i, st))
             b->hot_keep0 = 1;
     } else if (path == NCL_HOT_PATH_COLD_R) {
-        if (!b->hot_rwaited)
+        if (!b->hot_at_r) /* no hot node at R: hot_mode may be stale */
             b->hot_clear_cnt++;
-        if (b->hot_clear_cnt >= 16 || b->hot_clear_hint) {
+        if (b->hot_clear_cnt >= 1 || b->hot_clear_hint) {
             b->hot_clear_cnt = 0;
             b->hot_clear_hint = 0;
             hot_clear_check(b, st);
