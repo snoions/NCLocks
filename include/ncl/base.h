@@ -106,7 +106,8 @@ struct ncl_base {
     int ak_k;          /* AK, node-local, holder only: fast path's y.indx */
     int ak_slow2;      /* AK, node-local, holder only: slow path is SLOW 2 */
     pthread_mutex_t *mtx; /* PTHREAD: process-shared mutex in the lock's meta line */
-    ncl_line_t *mode;  /* REACTIVE: 0 = LAMPORT, 1 = TOURNAMENT (written by a holder) */
+    ncl_line_t *mode;  /* REACTIVE: 0 = LAMPORT, 1 = TOURNAMENT (written by a holder);
+                          TOURNAMENT ncl_tour_hot_probe: hot_mode (never written) */
     int rx_guess;      /* REACTIVE, node-local: mode last seen */
     int rx_held;       /* REACTIVE, holder: bit 0 = Lamport held, bit 1 = tournament */
     uint64_t rx_hist;  /* REACTIVE, holder: contended? per global acquisition (bit 0 = last) */
@@ -168,6 +169,7 @@ struct ncl_base_stats {
     uint64_t ret_policy_skips;  /* release kept nothing, no release check: learned cap is 0 */
     uint64_t ret_cap_lowers;    /* a waiter found on a kept (or to-be-kept) level lowered the cap */
     uint64_t ret_cap_raises;    /* probes: the cap raised by one level */
+    uint64_t hot_mode_set;      /* TOURNAMENT ncl_tour_hot_probe: hot_mode read nonzero (never) */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -341,6 +343,11 @@ extern int ncl_retain_max;   /* at most this many locks kept per node (0 = no li
  * sweeper, and contenders meeting below the root lose all retention. */
 #define NCL_RETAIN_PROBE_MAX 4096
 extern int ncl_retain_probe;
+/* g2's bypass test (design §4g g2 (a)), plain TOURNAMENT only: one more meta line
+ * per lock, hot_mode, read in the root's entry-check batch after the root's flag
+ * and turn (as reactive's mode read). Never written: the cost of the read alone.
+ * Set in every process before laying out locks (it changes the line count). */
+extern int ncl_tour_hot_probe;
 /* Locks with kept levels on this node (for ncl_retain_max). */
 extern _Atomic int ncl_retained_locks;
 /* DEBUG bits (ncl_stress --debug-retain), each UNSAFE: 1 = the sweeper drops

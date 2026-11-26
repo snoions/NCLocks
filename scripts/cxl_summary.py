@@ -3,7 +3,7 @@
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
 Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt kv kvreact kviso
-kvbase klayout kstride kfix g1bound g1 g2bound (default: those whose CSV exists).
+kvbase klayout kstride kfix g1bound g1 g2bound g2bypass (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -223,6 +223,29 @@ def g2bound(d):
     out.append("go criterion: near2 cells where max(hot2_k2, hot2_k4) >= 1.2x best: %d of %d "
                "(think 2us: %d of %d)" % ((g >= 1.2).sum(), len(g), (g2 >= 1.2).sum(), len(g2)))
     return "\n\n".join(out)
+
+
+def g2bypass(d):
+    """Phase g2bypass: the tournament reading hot_mode in the root's entry check
+    (--hot-probe) relative to the plain tournament."""
+    d = d.copy()
+    d["case"] = d.config.str.split(":").str[1]
+    d.loc[d.case == "all", "case"] = "all L" + d.locks.astype(str)
+    d["NT"] = d.nodes.astype(str) + "x" + d.threads_per_node.astype(str)
+    d["mode"] = d["mode"].replace({"phase1": "P1", "local": "2a"})
+    d["think"] = (d.think_ns / 1000).map("{:g}us".format)
+    t = d.pivot_table(index=["case", "mode", "NT", "think"], columns="hot_probe",
+                      values="achieved_rps", aggfunc="median") / 1e3
+    t.columns = ["plain", "probe"]
+    t["probe/plain"] = t.probe / t.plain
+    g = d.groupby(["case", "mode", "NT", "think", "hot_probe"]).achieved_rps
+    sp = ((g.max() - g.min()) / g.min()).groupby(["case", "mode", "NT", "think"]).max()
+    t["rep spread%"] = (sp * 100).round(1)
+    s = t["probe/plain"].groupby(level="case").agg(["min", "median", "max"])
+    return ("k acq/s, median over reps\n" + t.round(3).to_string()
+            + "\n\nprobe/plain by case\n" + s.round(3).to_string()
+            + "\n\nall cells: median %.3f, min %.3f, max %.3f"
+            % (t["probe/plain"].median(), t["probe/plain"].min(), t["probe/plain"].max()))
 
 
 def kfix(d):
@@ -457,7 +480,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix", "g1bound", "g1", "g2bound"]
+                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix", "g1bound", "g1", "g2bound", "g2bypass"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -494,6 +517,8 @@ def main():
             print(g1(d))
         elif ph == "g2bound":
             print(g2bound(d))
+        elif ph == "g2bypass":
+            print(g2bypass(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()

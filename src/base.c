@@ -75,7 +75,7 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
 {
     switch (alg) {
     case NCL_ALG_LAMPORT: return lam_lines(P);
-    case NCL_ALG_TOURNAMENT: return tree_lines(P) ? tree_lines(P) : 1;
+    case NCL_ALG_TOURNAMENT: return (ncl_tour_hot_probe ? 1 : 0) + (tree_lines(P) ? tree_lines(P) : 1);
     case NCL_ALG_HYBRID: return split_lines(P) + tree_lines(P) + top_lines();
     case NCL_ALG_SERVER: return 0;
     case NCL_ALG_FASTSRV: return split_lines(P) + top_lines();
@@ -117,8 +117,14 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
         b->lam = lines;
         b->lam_b = scan;
         break;
-    case NCL_ALG_TOURNAMENT:
-        b->tree = lines;
+    case NCL_ALG_TOURNAMENT: /* [hot_mode (ncl_tour_hot_probe)][tree] */
+        if (ncl_tour_hot_probe) {
+            b->mode = lines;
+            b->tree = lines + 1;
+        } else {
+            b->mode = NULL;
+            b->tree = lines;
+        }
         break;
     case NCL_ALG_HYBRID:
         b->split = lines;
@@ -371,6 +377,7 @@ int ncl_retain = 0;
 int ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE; /* measured on CXL: the release check costs more than it saves */
 int ncl_retain_max = 0;
 int ncl_retain_probe = 16;
+int ncl_tour_hot_probe;
 _Atomic int ncl_retained_locks;
 int ncl_debug_retain = 0;
 uint64_t ncl_debug_retain_delay = 0;
@@ -1394,7 +1401,12 @@ int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     case NCL_ALG_TOURNAMENT:
         if (ncl_retain)
             tournament_lock_retain(b, i, st);
-        else
+        else if (ncl_tour_hot_probe && b->mode) {
+            /* g2's bypass test: read hot_mode as the cold tree's top would. It is
+             * never set, so the lock behaves as the plain tournament. */
+            if (tournament_lock_mode(b, i, st))
+                NCL_STAT(st->hot_mode_set++);
+        } else
             tournament_lock(b, i, st);
         return NCL_PATH_TOURNAMENT;
     case NCL_ALG_REACTIVE: return reactive_lock(b, i, st);

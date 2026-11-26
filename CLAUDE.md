@@ -69,8 +69,10 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   CSV columns `bakery_arity`, `bakery_wait`; sweep phases `bakery`, `kvbakery`, `bktree`,
   `kvbktree`, `bkwait`, `kvbkwait`. Not model-checked.
   Biased tournaments g2, g7, g8 are not implemented. g2 (hot-slot subtree under an
-  asymmetric root, design §4g) is specified, with its go/no-go as sweep phase `g2bound`
-  (bounds: tournaments over the levels a g2 path climbs; `cxl_summary.py ... g2bound`).
+  asymmetric root, design §4g) is specified (revised after its go/no-go `g2bound`: R is
+  bypassed while no slot is held, admission only where g1 fails). `-a tournament
+  --hot-probe` reads one more line (`hot_mode`, never set) in the root's entry check: the
+  bypass's cost, sweep phase `g2bypass` (CSV column `hot_probe`).
 - `-a tournament --retain` (design §4g g1, not model-checked): prefix retention. A global
   release keeps the levels below the lowest one with a waiter (`kept_levels`, node-local); the
   next acquisition starts above them. Waiters on kept levels are found by the acquire check (default;

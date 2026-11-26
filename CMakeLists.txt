@@ -659,5 +659,11 @@ add_test(NAME retain_detects_no_sweeper_deadlock
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 -b emu -n 4 -t 1 -l 4 -i 20000 --retain-poll off --timeout 15)
 set_tests_properties(retain_detects_sweeper_without_submutex retain_detects_noncontiguous_drop
   retain_detects_no_sweeper_deadlock PROPERTIES WILL_FAIL TRUE)
+# g2's bypass test (design §4g g2 (a)): the tournament also reads hot_mode (never
+# set) in the root's entry check; it must stay a correct tournament.
+add_test(NAME stress_tournament_hot_probe_emu
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --hot-probe -b emu -n 8 -t 2 -l 2 -i 30000 -d 2000 --timeout 200)
+add_test(NAME stress_tournament_hot_probe_cached-flush_local
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --hot-probe -b cached-flush -n 8 -t 2 -l 2 -i 20000 -M local -K 4 --timeout 100)
 add_test(NAME bench_cached-flush_retain_active
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_bench> -a tournament --retain --retain-probe 0 -b cached-flush -n 8 -t 2 --active 0,4 -s 0.3 -W 0.1 -P -C)

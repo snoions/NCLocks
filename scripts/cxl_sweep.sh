@@ -107,6 +107,11 @@
 #              --active 0,1; near2), hot2_k4 (-n 8 --active 0,2: placed, meet at H's top;
 #              near2), hot4_k4 (-n 8 --active 0-3; near4). Cold-path cost (one extra level):
 #              cold1 (-n 2N --active 0; vs one), coldall (-n 2N --active 0..N-1; vs all).
+#   g2bypass   cost of g2's root bypass (design §4g g2 (a)): the tournament with --hot-probe
+#              (one more line, hot_mode, never set, read in the root's entry-check batch) vs
+#              the plain tournament, back to back, at G2_NT, Phase 1 and 2a, think
+#              G2BYPASS_THINK: every node at L = 1, 16, 256, and the subsets one, far2.
+#              CSV column hot_probe.
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
 # rep and config name; failures and warnings go to $OUT/errors.log. Runs are
@@ -167,7 +172,8 @@ BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bak
 BKWAIT_K=${BKWAIT_K:-"0 2 4"}                     # phases bkwait / kvbkwait
 G1_NT=${G1_NT:-"16x1 16x3 32x2"}                 # phase g1bound
 G1_THINK=${G1_THINK:-"0 2000 10000"}             # phases g1bound, g1: closed-loop think time, ns
-G2_NT=${G2_NT:-"16x1 16x3 32x2"}                 # phase g2bound
+G2_NT=${G2_NT:-"16x1 16x3 32x2"}                 # phases g2bound, g2bypass
+G2BYPASS_THINK=${G2BYPASS_THINK:-"0 2000"}       # phase g2bypass
 G1_VARIANTS=${G1_VARIANTS:-"retain retain_both retain_always"} # phase g1: retention variants (g1_variant)
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
@@ -907,6 +913,24 @@ g2bound() {
   done; done
 }
 
+g2bypass() {
+  local csv=$OUT/g2bypass.csv; header "$csv"
+  local MODES=("-M phase1" "-M local -K 64")
+  local m th set act h l pr
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for nt in $G2_NT; do nt_split "$nt"; h=$((N / 2))
+      for th in $G2BYPASS_THINK; do for m in "${MODES[@]}"; do
+        for l in 1 16 256; do for pr in "" --hot-probe; do
+          run "$csv" "$rep" "$c:all" -a tournament $pr $m -n "$N" -t "$T" -l "$l" -T "$th" ${CFG[$c]} "${COMMON[@]}"
+        done; done
+        for set in "one:0" "far2:0,$h"; do for pr in "" --hot-probe; do
+          run "$csv" "$rep" "$c:${set%%:*}" -a tournament $pr $m -n "$N" -t "$T" -l 1 -T "$th" --active "${set#*:}" ${CFG[$c]} "${COMMON[@]}"
+        done; done
+      done; done
+    done
+  done; done
+}
+
 PHASES=${*:-"preflight p1 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
@@ -940,6 +964,7 @@ for ph in $PHASES; do
     kvbkwait) kvbkwait ;;
     g1bound) g1bound ;;
     g2bound) g2bound ;;
+    g2bypass) g2bypass ;;
     g1) g1 ;;
     *) die "unknown phase $ph" ;;
   esac

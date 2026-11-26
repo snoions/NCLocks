@@ -292,6 +292,7 @@ static void usage(const char *argv0)
             "  --debug-retain BITS  retain, UNSAFE: 1 = sweeper drops without the submutex,\n"
             "                2 = release drops only the waiter's level (not contiguous)\n"
             "  --retain-delay NS  DEBUG: acquirer spins between reading its kept levels and climbing\n"
+            "  --hot-probe   -a tournament: also read hot_mode (never set) in the root's entry check\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
@@ -334,6 +335,7 @@ int main(int argc, char **argv)
         {"debug-no-grant-wait", no_argument, 0, 9},
         {"grant-delay", required_argument, 0, 10},
         {"mix-algs", no_argument, 0, 11},
+        {"hot-probe", no_argument, 0, 30},
         {"react", required_argument, 0, 12},
         {"debug-react", required_argument, 0, 13},
         {"lamport-delay", required_argument, 0, 14},
@@ -447,6 +449,7 @@ int main(int argc, char **argv)
         case 27: ncl_debug_retain = atoi(optarg); break;
         case 28: retain_delay_ns = (unsigned)atoi(optarg); break;
         case 29: if (ncl_retain_opt("probe", optarg) < 0) return 2; break;
+        case 30: ncl_tour_hot_probe = 1; break;
         case 21:
             if (!strcmp(optarg, "classic")) ncl_bakery_wait_classic = 1;
             else if (!strcmp(optarg, "strict")) ncl_bakery_wait_classic = 0;
