@@ -658,7 +658,7 @@ int main(int argc, char **argv)
         if (pin) {
             int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
             ncl_cpus_check(nnodes * nthreads + (srv && srv_place == NCL_SRV_PIN_NEXT ? nnodes : 0),
-                           nnodes, nthreads, srv && srv_place == NCL_SRV_PIN_SIBLING);
+                           nnodes, nthreads, srv && srv_place == NCL_SRV_PIN_SIBLING, active_mask);
         }
         for (int l = 0; l < nlocks; l++)
             if (footprint && ncl_lock_set_data(l, (ncl_off_t)l * stride, footprint) < 0)

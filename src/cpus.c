@@ -139,18 +139,38 @@ int ncl_smt_sibling(int cpu)
     return -1;
 }
 
-int ncl_cpus_check(int nslots, int nnodes, int threads_per_node, int sibling_servers)
+/* Slot k is used unless it is a worker slot of a node outside node_mask. */
+static int slot_used(int k, int nnodes, int threads_per_node, uint64_t node_mask)
+{
+    if (!node_mask || k >= nnodes * threads_per_node)
+        return 1;
+    int n = k / threads_per_node;
+    return n < 64 && ((node_mask >> n) & 1);
+}
+
+int ncl_cpus_check(int nslots, int nnodes, int threads_per_node, int sibling_servers,
+                   uint64_t node_mask)
 {
     ncl_cpus_init();
-    int warn = 0;
-    if (nslots > ncpus) {
+    int warn = 0, used = 0, shared = 0;
+    for (int k = 0; k < nslots; k++) {
+        if (!slot_used(k, nnodes, threads_per_node, node_mask))
+            continue;
+        used++;
+        for (int j = 0; j < k && !shared; j++) /* slots wrap: k and j share if k = j mod ncpus */
+            if (slot_used(j, nnodes, threads_per_node, node_mask) && ncl_cpu_slot(j) == ncl_cpu_slot(k))
+                shared = 1;
+    }
+    if (shared) {
         fprintf(stderr, "ncl: WARNING: %d pinned threads on %d CPUs (%s): CPUs are shared\n",
-                nslots, ncpus, ncl_cpus_describe());
+                used, ncpus, ncl_cpus_describe());
         warn++;
     }
     unsigned long long seen = 0; /* NUMA nodes 0..63 */
     int nodes = 0;
     for (int k = 0; k < nslots + (sibling_servers ? nnodes : 0); k++) {
+        if (k < nslots && !slot_used(k, nnodes, threads_per_node, node_mask))
+            continue;
         int c = k < nslots ? ncl_cpu_slot(k) : ncl_smt_sibling(ncl_cpu_slot((k - nslots) * threads_per_node));
         int n = c < 0 ? -1 : ncl_cpu_node(c);
         if (n >= 0 && n < 64 && !(seen & (1ull << n))) {

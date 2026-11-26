@@ -3,7 +3,7 @@
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
 Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt kv kvreact kviso
-kvbase klayout kstride kfix g1bound g1 (default: those whose CSV exists).
+kvbase klayout kstride kfix g1bound g1 g2bound (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -178,6 +178,50 @@ def g1(d):
         c = rr.groupby(["variant", "subset", "mode", "NT", "think"])[cnt].median()
         c.columns = [x.replace("ret_", "").replace("_per_acq", "") for x in cnt]
         out.append("retention counters per acquisition (median)\n" + c.round(4).to_string())
+    return "\n\n".join(out)
+
+
+def g2bound(d):
+    """Phase g2bound: g2's hot-path bounds vs the best existing lock (tournament,
+    reactive, g1) at the subsets they model, and the cold path's extra level."""
+    d = d.copy()
+    d["variant"] = d.apply(g1_variant, axis=1).replace({"retain_acq": "g1", "tournament": "tour",
+                                                         "reactive": "react"})
+    tag = d.config.str.split(":").str[1]
+    d["tag"] = tag.str.split("@").str[0]
+    d["N"] = tag.str.split("@").str[1].astype(int)
+    d["NT"] = d.N.astype(str) + "x" + d.threads_per_node.astype(str)
+    d["mode"] = d["mode"].replace({"phase1": "P1", "local": "2a"})
+    d["think"] = (d.think_ns / 1000).map("{:g}us".format)
+    bnd = d.tag.str.startswith(("hot", "cold"))
+    d.loc[bnd, "col"] = d.tag
+    d.loc[~bnd, "col"] = d.tag + ":" + d.variant
+    t = d.pivot_table(index=["mode", "NT", "think"], columns="col", values="achieved_rps",
+                      aggfunc="median") / 1e3
+    def best(sub):
+        return t[[c for c in t.columns if c.startswith(sub + ":")]].max(axis=1)
+    r = pd.DataFrame(index=t.index)
+    r["near2 hot2_k2/best"] = t["hot2_k2"] / best("near2")
+    r["near2 hot2_k4/best"] = t["hot2_k4"] / best("near2")
+    r["near4 hot4_k4/best"] = t["hot4_k4"] / best("near4")
+    r["one hot1_k2/best"] = t["hot1_k2"] / best("one")
+    r["far2 hot2_k4/best"] = t["hot2_k4"] / best("far2")
+    r["far4 hot4_k4/best"] = t["hot4_k4"] / best("far4")
+    r["cold1/one:tour"] = t["cold1"] / t["one:tour"]
+    r["coldall/all:tour"] = t["coldall"] / t["all:tour"]
+    cols = [c for c in ["near2:tour", "near2:react", "near2:g1", "hot2_k2", "hot2_k4",
+                        "near4:tour", "near4:react", "near4:g1", "hot4_k4",
+                        "one:tour", "one:react", "one:g1", "hot1_k2", "cold1",
+                        "far2:g1", "far4:g1", "all:tour", "coldall"] if c in t.columns]
+    out = ["k acq/s, median over reps (best = max of tournament, reactive, g1 at that subset)\n"
+           + t[cols].round(0).to_string(),
+           "ratios\n" + r.round(2).to_string(),
+           "ratios (min / median / max over cells)\n"
+           + r.agg(["min", "median", "max"]).T.round(2).to_string()]
+    g = r[["near2 hot2_k2/best", "near2 hot2_k4/best"]].max(axis=1)
+    g2 = g[g.index.get_level_values("think") == "2us"]
+    out.append("go criterion: near2 cells where max(hot2_k2, hot2_k4) >= 1.2x best: %d of %d "
+               "(think 2us: %d of %d)" % ((g >= 1.2).sum(), len(g), (g2 >= 1.2).sum(), len(g2)))
     return "\n\n".join(out)
 
 
@@ -413,7 +457,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix", "g1bound", "g1"]
+                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix", "g1bound", "g1", "g2bound"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -448,6 +492,8 @@ def main():
             print(kfix(d))
         elif ph in ("g1", "g1bound"):
             print(g1(d))
+        elif ph == "g2bound":
+            print(g2bound(d))
         else:
             print(closed(d, EXTRA.get(ph, ())).to_string())
         print()

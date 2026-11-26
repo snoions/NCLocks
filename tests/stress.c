@@ -532,7 +532,7 @@ int main(int argc, char **argv)
         printf("mem: %s\n", ncl_mem_describe());
         if (pin) {
             int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
-            ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
+            ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0, 0);
             printf("cpus: %s\n", ncl_cpus_describe());
         }
         for (int l = 0; l < nlocks; l++) {

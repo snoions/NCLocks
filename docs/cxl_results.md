@@ -1192,6 +1192,15 @@ Selected cells, k acquisitions/s (tournament / reactive / retain / retain_always
 
 ## Prefix retention, learned keep height (`g1`, 2026-11-25 18:47)
 
+> **Caveat for every `--active` run so far (g1bound, g1, both g1 sections):** inactive
+> nodes spun in `ncl_node_detach`'s barrier for the whole run (uncached loads of a done
+> line, no backoff; fixed 2026-11-25: spin, then 100 us sleeps). At N=16, `one` ran with
+> 15 such pollers, the bounds (`-n 2`, `-n 4`) with 0-3, so the subsets competed with
+> device reads and unpinned spinning processes that the bounds did not. Comparisons at one
+> subset share the effect; subset-vs-bound ratios may be biased against the subsets. On
+> the dev box (DRAM, 20 CPUs) `-n 8 --active 0` is unchanged (0.77M), while `-n 16
+> --active 0-7` in 2a went from 0.43M to 2.33M (oversubscribed). Re-run g1 to check.
+
 `results/cxl_20261125_1847/`: same grid as the previous section, with the learned keep
 height (`--retain-probe 16`) replacing the on/off policy. Variants: `retain_both`
 (the default then: acquire and release checks), `retain_acq` (acquire check only),

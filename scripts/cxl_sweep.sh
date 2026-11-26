@@ -98,6 +98,15 @@
 #              and 2a, L=1, think G1_THINK, at G1_NT. Part all (think 0): every node active,
 #              L = 1, 16, 256: what retention costs when contended or spread over many locks.
 #              CSV columns retain, ret_*_per_acq.
+#   g2bound    go/no-go for the hot-slot subtree (design §4g g2). At G2_NT, Phase 1 and 2a,
+#              L=1, think G1_THINK: references at the g1 subsets (one, near2, far2, near4,
+#              far4) for the tournament, reactive (REACT_BEST) and g1 (--retain); every node
+#              on the tournament (all). Bounds (config tag@N, N = the subset's node count):
+#              tournaments over just the levels a g2 path climbs, cold side idle, on the
+#              CPUs of the subset they model: hot1_k2 (-n 4 --active 0; one), hot2_k2 (-n 4
+#              --active 0,1; near2), hot2_k4 (-n 8 --active 0,2: placed, meet at H's top;
+#              near2), hot4_k4 (-n 8 --active 0-3; near4). Cold-path cost (one extra level):
+#              cold1 (-n 2N --active 0; vs one), coldall (-n 2N --active 0..N-1; vs all).
 #
 # One CSV per phase in $OUT (default results/cxl_<date>/), each row prefixed by
 # rep and config name; failures and warnings go to $OUT/errors.log. Runs are
@@ -158,6 +167,7 @@ BKTREE_K=${BKTREE_K:-"0 2 4 8"}                  # phases bktree / kvbktree: bak
 BKWAIT_K=${BKWAIT_K:-"0 2 4"}                     # phases bkwait / kvbkwait
 G1_NT=${G1_NT:-"16x1 16x3 32x2"}                 # phase g1bound
 G1_THINK=${G1_THINK:-"0 2000 10000"}             # phases g1bound, g1: closed-loop think time, ns
+G2_NT=${G2_NT:-"16x1 16x3 32x2"}                 # phase g2bound
 G1_VARIANTS=${G1_VARIANTS:-"retain retain_both retain_always"} # phase g1: retention variants (g1_variant)
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
@@ -862,6 +872,41 @@ g1() {
   done; done
 }
 
+g2bound() {
+  local csv=$OUT/g2bound.csv; header "$csv"
+  local MODES=("-M phase1" "-M local -K 64")
+  local VARS=("-a tournament" "-a reactive --react $REACT_BEST" "-a tournament --retain")
+  local m v th set act h q tag nn nodes cpus
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for nt in $G2_NT; do nt_split "$nt"; h=$((N / 2)); q=$((N / 4))
+      for th in $G1_THINK; do for m in "${MODES[@]}"; do
+        for set in "one:0" "near2:0,1" "far2:0,$h" "near4:0-3" "far4:0,$q,$h,$((h + q))"; do
+          act=${set#*:}
+          for v in "${VARS[@]}"; do
+            run "$csv" "$rep" "$c:${set%%:*}@$N" $v $m -n "$N" -t "$T" -l 1 -T "$th" --active "$act" ${CFG[$c]} "${COMMON[@]}"
+          done
+        done
+        run "$csv" "$rep" "$c:all@$N" -a tournament $m -n "$N" -t "$T" -l 1 -T "$th" ${CFG[$c]} "${COMMON[@]}"
+        # Hot-path bounds: 2k leaves, hot nodes on the first k (H), the second half idle
+        # (the cold side). Active nodes run on the CPUs of the subset they model; idle
+        # ones get other nodes' CPUs (every slot its own CPU).
+        for set in "hot1_k2:4:0:0 $h $((h + 1)) $((h + 2))" \
+                   "hot2_k2:4:0,1:0 1 $h $((h + 1))" \
+                   "hot2_k4:8:0,2:0 $h 1 $((h + 1)) $((h + 2)) $((h + 3)) $((h + 4)) $((h + 5))" \
+                   "hot4_k4:8:0-3:0 1 2 3 $h $((h + 1)) $((h + 2)) $((h + 3))"; do
+          IFS=: read -r tag nn act nodes <<<"$set"
+          cpus=$(cpus_of_nodes "$T" $nodes)
+          run "$csv" "$rep" "$c:$tag@$N" -a tournament $m -n "$nn" -t "$T" -l 1 -T "$th" --active "$act" --cpus "$cpus" ${CFG[$c]} "${COMMON[@]}"
+        done
+        # Cold-path bounds: the cold tree under a root whose hot side is idle. Node k
+        # keeps slot k, so the active nodes run where they do at -n N.
+        run "$csv" "$rep" "$c:cold1@$N" -a tournament $m -n $((2 * N)) -t "$T" -l 1 -T "$th" --active 0 ${CFG[$c]} "${COMMON[@]}"
+        run "$csv" "$rep" "$c:coldall@$N" -a tournament $m -n $((2 * N)) -t "$T" -l 1 -T "$th" --active "0-$((N - 1))" ${CFG[$c]} "${COMMON[@]}"
+      done; done
+    done
+  done; done
+}
+
 PHASES=${*:-"preflight p1 2a 2b base open"}
 for ph in $PHASES; do
   echo "== $ph ($(date +%T))"
@@ -894,6 +939,7 @@ for ph in $PHASES; do
     bkwait) bkwait ;;
     kvbkwait) kvbkwait ;;
     g1bound) g1bound ;;
+    g2bound) g2bound ;;
     g1) g1 ;;
     *) die "unknown phase $ph" ;;
   esac

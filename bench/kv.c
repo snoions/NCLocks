@@ -590,7 +590,7 @@ int main(int argc, char **argv)
     if (harness.role == HR_INIT) {
         if (pin) {
             int srv = cfg.alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(cfg.alg);
-            ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0);
+            ncl_cpus_check(nnodes * nthreads + (srv ? nnodes : 0), nnodes, nthreads, 0, 0);
         }
         for (int s = 0; s < nlocks; s++) {
             if (ncl_lock_set_data(s, (ncl_off_t)stripe_off[s], stripe_len[s]) < 0)

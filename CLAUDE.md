@@ -68,7 +68,9 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   must FAIL).
   CSV columns `bakery_arity`, `bakery_wait`; sweep phases `bakery`, `kvbakery`, `bktree`,
   `kvbktree`, `bkwait`, `kvbkwait`. Not model-checked.
-  Biased tournaments g2, g7, g8 are not implemented.
+  Biased tournaments g2, g7, g8 are not implemented. g2 (hot-slot subtree under an
+  asymmetric root, design §4g) is specified, with its go/no-go as sweep phase `g2bound`
+  (bounds: tournaments over the levels a g2 path climbs; `cxl_summary.py ... g2bound`).
 - `-a tournament --retain` (design §4g g1, not model-checked): prefix retention. A global
   release keeps the levels below the lowest one with a waiter (`kept_levels`, node-local); the
   next acquisition starts above them. Waiters on kept levels are found by the acquire check (default;
@@ -79,7 +81,8 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   keep depth-1 levels at every release): a waiter on level w caps the lock's kept levels at
   w-1, probed upward with exponential backoff; cap 0 skips the release check. Without it,
   many locks without reuse collapse (waiters wait for sweepers). Phase 1 and 2a, needs the submutex. `--debug-retain 1|2` and `--retain-poll off`
-  must FAIL. `ncl_bench --active LIST`: only those nodes acquire (CSV column `active`); sweep
+  must FAIL. `ncl_bench --active LIST`: only those nodes acquire (CSV column `active`; idle
+  nodes back off in the detach barrier and are left out of the CPU-sharing check); sweep
   phases `g1bound` (go/no-go, measured: go) and `g1`; CSV columns `retain`, `ret_*_per_acq`. Phase 2b is deprioritized
   (no measured advantage): evaluate new locks in Phase 1 and 2a.
 - `-a pthread`: reference baseline, a process-shared `pthread_mutex_t` (futex, i.e. coherent

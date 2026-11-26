@@ -12,6 +12,7 @@
  */
 #ifndef NCL_CPUS_H
 #define NCL_CPUS_H
+#include <stdint.h>
 
 /* "0-59,120-179". Returns 0, or -1 with a message. */
 int ncl_cpus_set(const char *list);
@@ -27,8 +28,10 @@ int ncl_cpu_node(int cpu);
 int ncl_smt_sibling(int cpu);
 /* Warn on stderr if `nslots` pinned threads exceed the list (CPUs shared) or
  * the CPUs they use (plus `sibling_of_workers` SMT siblings of slot n*T for
- * n < nnodes) span more than one NUMA node. Returns the number of warnings. */
-int ncl_cpus_check(int nslots, int nnodes, int threads_per_node, int sibling_servers);
+ * n < nnodes) span more than one NUMA node. node_mask: nodes whose worker slots
+ * are used (0 = all; ncl_bench --active). Returns the number of warnings. */
+int ncl_cpus_check(int nslots, int nnodes, int threads_per_node, int sibling_servers,
+                   uint64_t node_mask);
 /* "0-59,120-179" form of the list, for logs. */
 const char *ncl_cpus_describe(void);
 

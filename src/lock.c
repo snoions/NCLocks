@@ -661,9 +661,17 @@ void ncl_node_detach(void)
             }
     ncl_uc_store(done_line(my_node), 1);
     ncl_fence();
+    /* Back off: a node with nothing to do (ncl_bench --active) waits here for the whole
+     * run, and spinning would take a CPU and keep reading the device under the
+     * measurement. Its latency only delays teardown. */
     for (int n = 0; n < cfg.nnodes; n++)
-        while (!ncl_uc_load(done_line(n)))
-            ncl_cpu_relax();
+        for (unsigned spins = 0; !ncl_uc_load(done_line(n));)
+            if (++spins < 1024) {
+                ncl_cpu_relax();
+            } else {
+                struct timespec ts = {0, 100000}; /* 100 us */
+                nanosleep(&ts, NULL);
+            }
     if (is_server())
         ncl_srv_node_stop();
 }
