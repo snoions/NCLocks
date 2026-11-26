@@ -212,7 +212,6 @@ struct ncl_base_stats {
     uint64_t hot_mode_sets;     /* g2: hot_mode set by a claimer */
     uint64_t hot_mode_clears;   /* g2: hot_mode cleared (every slot free) */
     uint64_t hot_clear_checks;  /* g2: slot-table reads by the clear check */
-    uint64_t hot_evict_waits;   /* g2: cold-share eviction postponed: a slot is free */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))

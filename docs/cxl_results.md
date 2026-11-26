@@ -1378,3 +1378,46 @@ Every node, ratio to g1: L=1 0.91-1.02, L=16 0.91-0.98, L=256 **0.84-0.89**.
 - Fixes (2026-11-26): count a cold flag set at the hot node's R entry check as cold seen;
   decide eviction from 4 hot acquisitions (at least half saw a cold node); back off
   admission after every free, lease included; default window 100 us.
+
+## Hot-slot subtree after the policy fixes (`g2`, 2026-11-26 10:34)
+
+`results/cxl_20261126_1034/`: same sweep as 08:47 with the fixed policy (commit a1c6627:
+window 100 us, lease 250 us, cold share includes a cold flag at R, eviction from 4 hot
+acquisitions but postponed to 16 while a slot is free, sticky cap eligibility, join at R,
+crowd mark, 4-gap admission streak, clear check at every cold-R acquisition without a hot
+node). cf + clwb, 2 reps, 1044 runs, no failures.
+
+**Ratio to g1, min / median / max over 18 cells (08:47 medians in parentheses):**
+
+| subset | g2_k2 / g1 | g2_k4 / g1 |
+|---|---|---|
+| near2 {0,1} | 0.97 / **1.67** / 2.43 (1.66) | 1.06 / **1.69** / 2.32 (1.74) |
+| near4 {0-3} | 0.98 / 1.01 / 1.05 (1.04) | 0.97 / **1.39** / 1.94 (1.39) |
+| one {0} | 0.90 / 0.99 / 1.03 | 0.92 / 0.99 / 1.05 |
+| far2 | 0.95 / 0.99 / 1.04 | 0.91 / 0.99 / 1.09 |
+| far4 | 0.94 / 0.99 / 1.02 | 0.94 / 1.00 / 1.02 |
+
+Every node, ratio to g1 and min/max fairness:
+
+| L | 08:47 ratio | 10:34 ratio | 08:47 fairness | 10:34 fairness (g1) |
+|---|---|---|---|---|
+| 1 | 0.91-1.02 | 0.97-1.01 | **0.12-0.49** | 0.89-1.00 (0.97-1.00) |
+| 16 | 0.91-0.98 | **0.90-0.99** | 0.88-0.96 | 0.89-0.96 (0.87-0.96) |
+| 256 | **0.84-0.89** | 0.99-1.00 | 0.86-0.95 | 0.89-0.95 (0.88-0.93) |
+
+- **Fixed:** one-lock fairness (hot path on 0-4% of acquisitions instead of 30-50%) and
+  L=256 (R climbed on 0.01% of acquisitions instead of 63-87%; claims 0.0001/acq).
+  near2 and near4-at-k4 keep their gains; fairness 1.00 at every subset.
+- **near4 with k=2 now stays out** (1.01, was 1.04 median and up to 1.75): the old gain
+  came from two of the four nodes holding both slots, at fairness 0.40-0.72.
+- **Left: L=16, 0.90 at 32x2** (both modes, both reps; 0.95-0.98 at 16x1/16x3). 9% of
+  acquisitions climb R for 0.4% on the hot path; p99 39 -> 74 us. g1's retention counters
+  are identical with and without g2, so the cost is the R level. With one slot of k held
+  (one hot node per lock), eviction waited for 16 hot samples, about 160 cold acquisitions
+  through R per tenure (dev box: 0.6% hot vs 7% cold-via-R). Dev box, 16x1 L=16:
+  checking for a stale `hot_mode` 7.5x less often changes nothing (8.35 vs 8.30 M/s);
+  evicting at once while a slot is free gives -2.5% instead of -4% (cold-via-R 2.3%), and
+  groups still form (6/6 runs for {0,1} k2/k4 and {0-3} k4). Adopted: no postponement
+  (design.md §4g).
+- Single cells below 0.93: one at 2a 32x2 think 0 (0.90 / 0.92), g1 itself is 1.22x the
+  tournament there and varies 1460-1563 between reps; far2 k4 at 2a 16x1 think 0 (0.91).

@@ -1755,14 +1755,11 @@ static void tournament_unlock_hot(struct ncl_base *b, int i, struct ncl_base_sta
         int evict = n >= 4 && 2 * __builtin_popcount(b->hot_hist & ((1u << n) - 1)) >= n;
         if (evict) {
             if (hot_any_free(b)) {
-                /* A free slot: the cold nodes we saw may be about to claim it (a group
-                 * forming); wait for 16 samples before deciding that they cannot. */
+                /* A free slot: not a crowd; evict now. (Waiting up to 16 samples for
+                 * partners to claim it cost the cold nodes ~10 R climbs per sample at
+                 * L=16, and partners join anyway: sticky eligibility, join at R.) */
                 b->hot_since_free = 0;
                 b->hot_crowd = 0;
-                if (n < 16) {
-                    evict = 0;
-                    NCL_STAT(st->hot_evict_waits++);
-                }
             } else {
                 /* Full: judge only the samples since the table filled (earlier ones
                  * may show partners that have joined since). A crowd if it holds. */
