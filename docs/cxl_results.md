@@ -1340,3 +1340,41 @@ one 0.949 / 1.000 / 1.024. All 60 cells: median 0.993.
   beyond rep spread: the worst, 8.0% at spread 3.8%, is 4.2% beyond). The cost to locks
   without hot nodes is ~1%, except up to 8% on one lock hammered by 32 nodes in Phase 1,
   against 41% for an always-present R.
+
+## Hot-slot subtree, first implementation (`g2`, 2026-11-26 08:47)
+
+`results/cxl_20261126_0847/`: `-a tournament --retain --hot K` (design §4g g2: g1 in the
+cold tree, K hot slots; `g2_k2`, `g2_k4`) vs g1 (`--retain`), the tournament and reactive
+at the g1 subsets (Phase 1 and 2a, L=1, think 0 / 2 / 10 us), and every node at L = 1, 16,
+256 (think 0). Defaults: window 1 ms, lease 1 ms, cold-share eviction at 8 of the last 16
+hot acquisitions. cf + clwb, 2 reps, 1044 runs, no failures. Tables:
+`scripts/cxl_summary.py results/cxl_20261126_0847 g2`.
+
+**Ratio to g1, min / median / max over 18 cells:**
+
+| subset | g2_k2 / g1 | g2_k4 / g1 | g2_k2 / best existing | g2_k4 / best existing |
+|---|---|---|---|---|
+| near2 {0,1} | 1.05 / **1.66** / 2.46 | 1.06 / **1.74** / 2.43 | 0.94 / 1.64 / 2.49 | 0.84 / 1.70 / 2.41 |
+| near4 {0-3} | 0.99 / 1.04 / 1.75 | 1.05 / **1.39** / 1.88 | 0.96 / 1.04 / 1.71 | 1.04 / 1.40 / 1.84 |
+| one {0} | 0.95 / 0.99 / 1.02 | 0.96 / 1.00 / 1.06 | | |
+| far2 | 0.97 / 1.00 / 1.13 | 0.95 / 0.99 / 1.09 | | |
+| far4 | 0.96 / 0.99 / 1.04 | 0.96 / 0.99 / 1.02 | | |
+
+Every node, ratio to g1: L=1 0.91-1.02, L=16 0.91-0.98, L=256 **0.84-0.89**.
+
+- **The target case works.** Leaf-meeting pairs 1.66x g1 (1.64x the best existing lock),
+  fairness 1.00; four adjacent nodes need k=4 (1.39x; k=2 holds only two of them). Where g1
+  already works (one, far2, far4) g2 is never admitted and costs nothing measurable.
+- **Every node on one lock: unfair.** About half the acquisitions take the hot path and the
+  hot nodes take most of the lock: min/max fairness 0.12-0.25 in most cells (g1 ~1.0).
+  near4 with k=2 likewise (0.40-0.72). The cold-share trigger reads R's `turn`, the side
+  of R's last *announcer*; under contention that is the hot node itself (the arriving H
+  winner announces after the waiting cold node and is the victim), so a cold node waiting
+  at R is never seen.
+- **Many locks, little reuse (L=256): -11 to -16%.** 3-15% of releases claim a slot and
+  63-87% of acquisitions climb R. A node acquires a given lock about once per ms, so the
+  1 ms lease keeps freeing slots, the 1 ms window keeps re-admitting, lease frees do not
+  back off admission, and every claim sets `hot_mode` again. L=16: -2 to -9%.
+- Fixes (2026-11-26): count a cold flag set at the hot node's R entry check as cold seen;
+  decide eviction from 4 hot acquisitions (at least half saw a cold node); back off
+  admission after every free, lease included; default window 100 us.
