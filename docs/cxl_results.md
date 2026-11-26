@@ -1254,3 +1254,60 @@ was not run in this part.
   two light contenders: 16x1 think 2 us 335k vs 145k (P1), 246k vs 144k (2a); think 10 us
   144k vs 113k. Retention keeps nothing there; that is g2's case, or a reason to combine
   the two (reactive's Lamport mode for leaf-meeting pairs, retention in tournament mode).
+
+## Hot-slot subtree go/no-go (`g2bound`, 2026-11-26 06:49)
+
+`results/cxl_20261126_0649/`: design §4g g2's bounds, tournaments over just the levels a
+g2 path climbs with the other side idle, on the CPUs of the subset they model (`hot1_k2`
+`-n 4 --active 0`, `hot2_k2` `-n 4 --active 0,1`, `hot2_k4` `-n 8 --active 0,2`, `hot4_k4`
+`-n 8 --active 0-3`), and the cold path's extra level (`cold1` `-n 2N --active 0` vs the
+tournament's `one`; `coldall` `-n 2N --active 0..N-1` vs every node on the tournament).
+References at the g1 subsets: tournament, reactive, g1 (`--retain`, acquire check). cf +
+clwb, 2 reps, 792 runs, no failures; idle nodes now back off in the detach barrier. Tables:
+`scripts/cxl_summary.py results/cxl_20261126_0649 g2bound`.
+
+**Bound / best existing lock (tournament, reactive, g1), min / median / max over 18 cells:**
+
+| case | ratio |
+|---|---|
+| near2 {0,1}: hot2_k2 | 0.94 / 1.71 / 2.33 (>= 1.2 in 12 of 18; 5 of 6 at think 2 us) |
+| near2: hot2_k4 (placed) | 0.84 / 1.67 / 2.44 |
+| near4 {0-3}: hot4_k4 | 1.03 / 1.39 / 1.85 |
+| one {0}: hot1_k2 | 0.63 / 0.80 / 1.00 |
+| far2: hot2_k4 | 0.46 / 0.63 / 1.00 |
+| far4: hot4_k4 | 0.54 / 0.58 / 1.01 |
+| **cold path, one node: cold1 / tournament** | 0.82 / 0.88 / 1.02 |
+| **cold path, every node: coldall / tournament** | **0.53 / 0.59 / 0.98** |
+
+Selected cells, k acq/s (near2 tournament / reactive / g1 / hot2_k2; all tournament /
+coldall): 16x1 P1 think 0: 117 / 149 / 143 / 257; 474 / 264. 32x2 P1 think 2 us: 110 /
+108 / 111 / 228; 445 / 264. 16x3 2a think 2 us: 347 / 350 / 367 / 591; 778 / 543.
+
+- **The hot path delivers where g1 cannot.** Leaf-meeting pairs get 1.71x the best existing
+  lock (median), four adjacent nodes 1.39x. The criterion (>= 1.2x in most near2 cells at
+  think 2 us) is met. Not at 16x1 think 10 us (0.94; light load, reactive's Lamport).
+  Placement (k=4, meeting at H's top) is no better than k=2 here (1.67 vs 1.71): one more
+  level offsets the shorter post-handoff climb.
+- **Where g1 works, g1 is better.** One node: hot1_k2 is 0.80 of the best (g1 climbs the
+  root only, g2 an H level plus R); far2 0.63, far4 0.58. So g2 must not admit nodes that
+  g1 already serves.
+- **The structural cold level fails the criterion (<= ~10%).** Uncontended it costs 12%
+  (one level of ~5); when every node contends, 41% (median; 2a with cohort passing at
+  think 0 hides it: 0.97-0.98). Under contention the extra level is on the handoff's
+  critical path: after the cold tree's top is handed over, the waiter still climbs R
+  before entering (16x1 P1: 2.1 us per acquisition on the tournament, 3.8 us with the extra
+  level). **g2 as specified: no-go.** It would slow every contended lock by ~40% to speed up
+  leaf-meeting pairs.
+- **What would make it go** (design §4g g2, revision): bypass R while no slot is held, so
+  the cold level is paid only while hot nodes exist; and admit only nodes whose g1 cap shows
+  contenders meeting low (g1 cannot help them). Then the remaining cost is the mixed case,
+  hot nodes plus contending cold nodes, which the fairness trigger already returns to the
+  plain shape.
+
+**g1 rerun (same directory, `g1.csv`) after the barrier fix:** within noise of the 18:47 run
+(median change per subset and variant -2.4% to +4.3%), so the spinning idle nodes did not
+bias those results. Acquire check, learned height: one 1.98x the tournament (1.15x the best
+existing lock, 0.98 of the bound), far2 1.77x (1.46x, 1.00), far4 1.14x (1.14x, 1.00), near2
+1.00x; every node 0.93-1.00x. Keeping at every release with the acquire check alone is now
+clearly wrong at far4 (0.63x the tournament: waiters at the meeting level wait for the
+sweeper), which the learned height avoids.
