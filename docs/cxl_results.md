@@ -1311,3 +1311,32 @@ existing lock, 0.98 of the bound), far2 1.77x (1.46x, 1.00), far4 1.14x (1.14x, 
 1.00x; every node 0.93-1.00x. Keeping at every release with the acquire check alone is now
 clearly wrong at far4 (0.63x the tournament: waiters at the meeting level wait for the
 sweeper), which the learned height avoids.
+
+## Cost of g2's root bypass (`g2bypass`, 2026-11-26 07:58)
+
+`results/cxl_20261126_0758/`: `-a tournament --hot-probe` (one more line per lock,
+`hot_mode`, never written, read in the root's entry-check batch after the root's flag and
+turn: what a cold node pays in g2 while no hot slot is held, design §4g g2) vs the plain
+tournament, back to back; every node at L = 1, 16, 256 and the subsets one {0} and far2
+{0, N/2}; Phase 1 and 2a, think 0 and 2 us, 16x1 16x3 32x2. cf + clwb, 3 reps, 360 runs, no
+failures. `scripts/cxl_summary.py results/cxl_20261126_0758 g2bypass`.
+
+**probe / plain, min / median / max over 12 cells per case:** every node L=1 0.920 / 0.983 /
+1.004; L=16 0.969 / 0.991 / 1.029; L=256 0.984 / 0.993 / 1.005; far2 0.948 / 1.003 / 1.060;
+one 0.949 / 1.000 / 1.024. All 60 cells: median 0.993.
+
+- **Small almost everywhere.** Median 0.7%; spread locks (L=16, 256) and the subsets are
+  within rep spread (subset cells spread up to 14%, so their 5% swings both ways are noise).
+- **One systematic loss: a single lock contended by every node, Phase 1, growing with N.**
+  16x1 1.5%, 16x3 2.5%, 32x2 6-8% (think 0: 457k -> 418-434k, think 2 us: 471k ->
+  436-447k, lower in all 3 reps; rep spread 3.8% / 2.6%). In 2a the same cells are within
+  noise (0.98-1.00): cohort passing takes the root handoff off most acquisitions. The waiter
+  at the root polls three lines instead of two, and the poll that sees the release is on
+  the handoff's critical path; an ordered 3-line batch completes with the slowest load.
+  Any fresh `hot_mode` read must be ordered after the loads that grant entry, so the
+  alternative is a separate round (worse); folding it into the flag word does not work
+  (a flag can be older than the latest `hot_mode` change from our own side).
+- **Verdict: go for g2 with the bypass** (criterion: median <= 2%, no cell more than 5%
+  beyond rep spread: the worst, 8.0% at spread 3.8%, is 4.2% beyond). The cost to locks
+  without hot nodes is ~1%, except up to 8% on one lock hammered by 32 nodes in Phase 1,
+  against 41% for an always-present R.
