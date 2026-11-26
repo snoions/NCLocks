@@ -210,6 +210,8 @@ struct ncl_sys_cfg {
     int retain;             /* 1: TOURNAMENT prefix retention (design §4g g1; Phase 1 and
                                LOCAL, needs the submutex): a per-node sweeper thread drops
                                kept levels (ncl_retain_poll_us, ncl_retain_lease_us) */
+    int hot_slots;          /* > 0: TOURNAMENT hot-slot subtree with this many slots
+                               (design §4g g2; a power of 2; needs retain) */
     /* EMU split: write back only the stored word of a cached metadata line (the old
      * model). Default 0: write back the node's whole line, as hardware does. */
     int emu_word_wb;
@@ -283,6 +285,12 @@ extern int ncl_retain_poll_us, ncl_retain_lease_us;
 int ncl_retain_opt(const char *opt, const char *arg);
 /* "both/poll10/lease1000/max0"-style description for reports ("-" if !cfg.retain). */
 const char *ncl_retain_describe(char *buf, size_t n);
+/* --hot K (sets cfg->hot_slots; the caller passes its cfg), --hot-window US,
+ * --hot-lease US, --hot-admit cap|always, --debug-hot BITS, --hot-delay NS.
+ * opt: "slots", "window", "lease", "admit", "debug", "delay". 0 or -1. */
+int ncl_hot_opt(struct ncl_sys_cfg *cfg, const char *opt, const char *arg);
+/* "k2/win1000/lease1000/cap"-style description ("-" if off). */
+const char *ncl_hot_describe(char *buf, size_t n);
 
 /* MODE_HANDOFF: overlap the global release's data writeback with the
  * release path's leading metadata loads (default 1; set in every process). */

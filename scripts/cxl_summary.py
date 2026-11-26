@@ -3,7 +3,7 @@
 
 Usage: scripts/cxl_summary.py results/cxl_<date>/ [phase ...]
 Phases: p1 abl 2a 2b own ho locks base open dram conc open2b mt kv kvreact kviso
-kvbase klayout kstride kfix g1bound g1 g2bound g2bypass (default: those whose CSV exists).
+kvbase klayout kstride kfix g1bound g1 g2bound g2bypass g2 (default: those whose CSV exists).
 Closed loop: throughput in k acq/s (median over reps), node fairness (min/max
 completions, median) and the rep spread (max-min)/min in %. Open loop: achieved
 rate, unserved fraction and sojourn p50/p99 in us.
@@ -113,6 +113,9 @@ def mt(d):
 
 def g1_variant(r):
     """Label a g1/g1bound row: retain variants share alg=tournament, so use `retain`."""
+    hot = str(getattr(r, "hot", "-"))
+    if hot not in ("-", "nan"):
+        return "g2_" + hot.split("/")[0]  # g1 + g2 with K slots: g2_k2, g2_k4
     ret = str(getattr(r, "retain", "-"))
     if r.alg != "tournament" or ret in ("-", "nan"):
         return r.alg
@@ -148,15 +151,18 @@ def g1(d):
         b = bnd.groupby(["mode", "threads_per_node", "think", "subset"]).achieved_rps.median() / 1e3
         t["bound"] = [b.get((m, int(nt.split("x")[1]), th, bmap.get(s, "")), float("nan"))
                       for m, nt, th, s in t.index]
-    rets = [c for c in t.columns if c.startswith("retain")]
+    rets = [c for c in t.columns if c.startswith(("retain", "g2_"))]
     if len(sub):
         out.append("k acq/s, median over reps (subsets; bound = CPU-matched tournament over the "
                    "levels retention still climbs)\n" + t.round(0).to_string())
         if rets:
             base = [c for c in ("tournament", "reactive", "lamport") if c in t.columns]
             rel = pd.DataFrame(index=t.index)
+            g1c = "retain_acq" if "retain_acq" in t.columns else None
             for c in rets:
                 rel[c + "/tour"] = t[c] / t["tournament"]
+                if g1c and c.startswith("g2_"):
+                    rel[c + "/g1"] = t[c] / t[g1c]
                 rel[c + "/best"] = t[c] / t[base].max(axis=1)
                 if "bound" in t.columns:
                     rel[c + "/bound"] = t[c] / t["bound"]
@@ -168,12 +174,15 @@ def g1(d):
         a = al.pivot_table(index=["mode", "NT", "locks"], columns="variant",
                            values="achieved_rps", aggfunc="median") / 1e3
         cols = list(a.columns)
-        for c in [c for c in cols if c.startswith("retain")]:
+        for c in [c for c in cols if c.startswith(("retain", "g2_"))]:
             a[c + "/tour"] = a[c] / a["tournament"]
+            if c.startswith("g2_") and "retain_acq" in a.columns:
+                a[c + "/g1"] = a[c] / a["retain_acq"]
         out.append("every node active, think 0 (k acq/s; ratios vs tournament)\n" + a.round(2).to_string())
     cnt = [c for c in ("ret_hits_per_acq", "ret_skipped_per_acq", "ret_policy_skips_per_acq",
-                       "ret_cap_lowers_per_acq", "ret_cap_raises_per_acq") if c in d.columns]
-    rr = d[d.variant.str.startswith("retain")]
+                       "ret_cap_lowers_per_acq", "ret_cap_raises_per_acq", "hot_path_frac",
+                       "hot_r_frac", "hot_claims_per_acq", "hot_frees_per_acq") if c in d.columns]
+    rr = d[d.variant.str.startswith(("retain", "g2_"))]
     if len(rr) and cnt:
         c = rr.groupby(["variant", "subset", "mode", "NT", "think"])[cnt].median()
         c.columns = [x.replace("ret_", "").replace("_per_acq", "") for x in cnt]
@@ -480,7 +489,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     phases = sys.argv[2:] or ["p1", "abl", "2a", "2b", "own", "ho", "locks", "base", "open", "dram",
-                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix", "g1bound", "g1", "g2bound", "g2bypass"]
+                              "conc", "open2b", "mt", "kv", "kvreact", "kviso", "kvbase", "klayout", "kstride", "kfix", "g1bound", "g1", "g2bound", "g2bypass", "g2"]
     for ph in phases:
         f = os.path.join(root, ph + ".csv")
         if not os.path.exists(f):
@@ -513,7 +522,7 @@ def main():
             print(kstride(d))
         elif ph == "kfix":
             print(kfix(d))
-        elif ph in ("g1", "g1bound"):
+        elif ph in ("g1", "g1bound", "g2"):
             print(g1(d))
         elif ph == "g2bound":
             print(g2bound(d))

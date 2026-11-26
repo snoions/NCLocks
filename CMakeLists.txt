@@ -659,6 +659,43 @@ add_test(NAME retain_detects_no_sweeper_deadlock
   COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 -b emu -n 4 -t 1 -l 4 -i 20000 --retain-poll off --timeout 15)
 set_tests_properties(retain_detects_sweeper_without_submutex retain_detects_noncontiguous_drop
   retain_detects_no_sweeper_deadlock PROPERTIES WILL_FAIL TRUE)
+# g2 hot-slot subtree (design §4g g2, -a tournament --retain --hot K). Churn: every
+# cold release may claim (--hot-admit always), unused slots are freed at once by the
+# piggybacked lease (--hot-lease 0, several locks), so slots and hot_mode change
+# constantly. Must FAIL (window widened with --hot-delay): the lease free without
+# the submutex (1), claiming without the global lock (2), releasing R after the levels
+# below (4), reading hot_mode before C-top's flag and turn (8), clearing hot_mode
+# without reading the slots (16).
+set(HOT_ARGS -a tournament --retain --retain-probe 0 --hot 2 --hot-admit always --hot-lease 0 --hot-window 100000 -b emu -n 8 -t 2 -d 2000)
+add_test(NAME stress_hot_emu
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${HOT_ARGS} -l 4 -i 30000 --timeout 200)
+add_test(NAME stress_hot_emu_one_lock
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${HOT_ARGS} -l 1 -i 30000 --timeout 200)
+add_test(NAME stress_hot_emu_local
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${HOT_ARGS} -l 2 -i 30000 -M local -K 4 --timeout 200)
+add_test(NAME stress_hot_emu_k4
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${HOT_ARGS} --hot 4 -l 2 -i 20000 --timeout 200)
+add_test(NAME stress_hot_emu_delay
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${HOT_ARGS} -l 2 -i 20000 --hot-delay 2000 --timeout 200)
+add_test(NAME stress_hot_emu_default_policy
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --hot 2 -b emu -n 8 -t 2 -d 2000 -l 2 -i 30000 --timeout 200)
+add_test(NAME stress_hot_emu_n5_t3
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 --hot 2 --hot-admit always --hot-lease 0 -b emu -n 5 -t 3 -d 2000 -l 2 -i 20000 --timeout 200)
+add_test(NAME stress_hot_cached-flush_n8
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 --hot 2 --hot-admit always --hot-lease 0 -b cached-flush -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+add_test(NAME stress_hot_uc_n8
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> -a tournament --retain --retain-probe 0 --hot 2 --hot-admit always --hot-lease 0 -b uc -n 8 -t 2 -l 2 -i 10000 --timeout 100)
+set_tests_properties(stress_hot_uc_n8 PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ncl_uc_device)
+foreach(case "lease_without_submutex;1" "unlocked_claim;2" "r_released_late;4" "stale_hot_mode;8" "clear_without_check;16")
+  list(GET case 0 name)
+  list(GET case 1 bits)
+  add_test(NAME hot_detects_${name}
+    COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_stress> ${HOT_ARGS} -l 2 -i 20000 --hot-delay 2000 --debug-hot ${bits} --timeout 60)
+  set_tests_properties(hot_detects_${name} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+add_test(NAME bench_cached-flush_hot_active
+  COMMAND ${NCL_RUN} $<TARGET_FILE:ncl_bench> -a tournament --retain --hot 2 -b cached-flush -n 8 -t 2 --active 0,1 -s 0.3 -W 0.1 -P -C)
+
 # g2's bypass test (design §4g g2 (a)): the tournament also reads hot_mode (never
 # set) in the root's entry check; it must stay a correct tournament.
 add_test(NAME stress_tournament_hot_probe_emu

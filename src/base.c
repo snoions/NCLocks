@@ -75,7 +75,9 @@ size_t ncl_base_nlines(ncl_alg_t alg, int P)
 {
     switch (alg) {
     case NCL_ALG_LAMPORT: return lam_lines(P);
-    case NCL_ALG_TOURNAMENT: return (ncl_tour_hot_probe ? 1 : 0) + (tree_lines(P) ? tree_lines(P) : 1);
+    case NCL_ALG_TOURNAMENT:
+        return (ncl_tour_hot_probe ? 1 : 0) + (ncl_hot_k ? 4 * (size_t)ncl_hot_k + 1 : 0) +
+               (tree_lines(P) ? tree_lines(P) : 1);
     case NCL_ALG_HYBRID: return split_lines(P) + tree_lines(P) + top_lines();
     case NCL_ALG_SERVER: return 0;
     case NCL_ALG_FASTSRV: return split_lines(P) + top_lines();
@@ -117,12 +119,21 @@ void ncl_base_bind(struct ncl_base *b, ncl_alg_t alg, int P, ncl_line_t *lines, 
         b->lam = lines;
         b->lam_b = scan;
         break;
-    case NCL_ALG_TOURNAMENT: /* [hot_mode (ncl_tour_hot_probe)][tree] */
+    case NCL_ALG_TOURNAMENT: /* [hot_mode (ncl_tour_hot_probe)][tree], or (ncl_hot_k)
+                                [hot_mode][hot_owner[k]][R][H][tree] */
+        b->mode = NULL;
+        b->hot_mode = NULL;
+        atomic_store_explicit(&b->my_slot, -1, memory_order_relaxed);
         if (ncl_tour_hot_probe) {
             b->mode = lines;
             b->tree = lines + 1;
+        } else if (ncl_hot_k) {
+            b->hot_mode = lines;
+            b->hot_owner = lines + 1;
+            b->hot_r = b->hot_owner + ncl_hot_k;
+            b->hot_tree = b->hot_r + 3;
+            b->tree = b->hot_tree + 3 * (ncl_hot_k - 1);
         } else {
-            b->mode = NULL;
             b->tree = lines;
         }
         break;
@@ -378,6 +389,11 @@ int ncl_retain_check = NCL_RETAIN_CHECK_ACQUIRE; /* measured on CXL: the release
 int ncl_retain_max = 0;
 int ncl_retain_probe = 16;
 int ncl_tour_hot_probe;
+int ncl_hot_k, ncl_hot_window_us = 1000, ncl_hot_lease_us = 1000, ncl_hot_admit_always;
+uint64_t ncl_hot_window_cycles, ncl_hot_lease_cycles;
+_Atomic int ncl_hot_held;
+int ncl_debug_hot;
+uint64_t ncl_debug_hot_delay;
 _Atomic int ncl_retained_locks;
 int ncl_debug_retain = 0;
 uint64_t ncl_debug_retain_delay = 0;
@@ -492,42 +508,99 @@ void ncl_tour_drop(struct ncl_base *b, int i, int lowest, int waiter, struct ncl
     set_kept(b, lowest - 1);
 }
 
-/* Climb levels from..depth with plain Peterson. */
-static void climb(struct ncl_base *b, int i, int from, int depth, struct ncl_base_stats *st)
+/* Wait at level l (announced) until Peterson lets us in. At C's top with g2
+ * (ncl_hot_k), the entry check also reads hot_mode, ordered after the level's
+ * flag and turn (ncl_fence_ll; one round trip on cached-flush), exactly as
+ * reactive reads `mode` (tournament_lock_mode): the value of the successful
+ * check counts. Returns hot_mode (0 elsewhere). */
+static uint64_t level_wait(struct ncl_base *b, int i, int l, int depth, int waited,
+                           struct ncl_base_stats *st)
 {
-    for (int l = from; l <= depth; l++)
-        if (peterson_lock(lvl_flag_me(b, i, l), lvl_flag_other(b, i, l),
-                          T_TURN(b, lvl_pos(b, i, l) >> 1), (uint64_t)(lvl_pos(b, i, l) & 1)) &&
-            st)
+    const int pos = lvl_pos(b, i, l);
+    const uint64_t side = (uint64_t)(pos & 1);
+    ncl_line_t *fot = lvl_flag_other(b, i, l), *turn = T_TURN(b, pos >> 1);
+    struct ncl_backoff bo;
+    ncl_backoff_init(&bo);
+    if (!ncl_hot_k || l != depth) {
+        while (!peterson_may_enter(fot, turn, side)) {
+            waited = 1;
+            ncl_backoff(&bo);
+        }
+        if (waited && st)
             st->contended++;
+        return 0;
+    }
+    uint64_t stale = 0;
+    if (NCL_UNLIKELY(ncl_debug_hot & 8)) {
+        /* UNSAFE: hot_mode read before the entry check, so it can predate the
+         * release the check observes (a claim in between is missed). */
+        stale = ncl_uc_load(b->hot_mode);
+        if (ncl_debug_hot_delay)
+            ncl_lat_spin_cycles(ncl_debug_hot_delay);
+    }
+    for (;;) {
+        ncl_line_t *ls[3] = {fot, turn, b->hot_mode};
+        uint64_t v[3];
+        ncl_uc_load_many_ordered(ls, (ncl_debug_hot & 8) ? 2 : 3, v);
+        if (!(v[0] && v[1] == side)) {
+            if (waited && st)
+                st->contended++;
+            return (ncl_debug_hot & 8) ? stale : v[2];
+        }
+        waited = 1;
+        ncl_backoff(&bo);
+    }
 }
 
-static void tournament_lock_retain(struct ncl_base *b, int i, struct ncl_base_stats *st)
+/* Climb levels from..depth with plain Peterson. Returns hot_mode as read at C's
+ * top (level_wait), 0 if from > depth. */
+static uint64_t climb(struct ncl_base *b, int i, int from, int depth, struct ncl_base_stats *st)
+{
+    uint64_t mode = 0;
+    for (int l = from; l <= depth; l++) {
+        int pos = lvl_pos(b, i, l);
+        peterson_announce(lvl_flag_me(b, i, l), T_TURN(b, pos >> 1), (uint64_t)(pos & 1));
+        mode = level_wait(b, i, l, depth, 0, st);
+    }
+    return mode;
+}
+
+/* Returns hot_mode as read at C's top (g2), else 0. */
+static uint64_t tournament_lock_retain(struct ncl_base *b, int i, struct ncl_base_stats *st)
 {
     const int depth = ncl_tour_depth(b);
+    uint64_t mode;
     int j = atomic_load_explicit(&b->kept_levels, memory_order_relaxed);
     if (NCL_UNLIKELY(ncl_debug_retain_delay) && j)
         ncl_lat_spin_cycles(ncl_debug_retain_delay); /* widen read-kept -> climb */
     if (!j) {
-        climb(b, i, 1, depth, st);
+        mode = climb(b, i, 1, depth, st);
         ncl_fence();
-        return;
+        return mode;
     }
     NCL_STAT(st->ret_hits++);
     NCL_STAT(st->ret_levels_skipped += (uint64_t)j);
     const int l = j + 1, pos = lvl_pos(b, i, l);
     const uint64_t side = (uint64_t)(pos & 1);
     ncl_line_t *fme = lvl_flag_me(b, i, l), *fot = lvl_flag_other(b, i, l), *turn = T_TURN(b, pos >> 1);
+    const int top_mode = ncl_hot_k && l == depth && !(ncl_debug_hot & 8);
     peterson_announce(fme, turn, side);
-    int ok;
+    int ok, waited = 1;
+    mode = 0;
     if (ncl_retain_check & NCL_RETAIN_CHECK_ACQUIRE) {
-        /* Level l's entry check plus the kept levels' opposing flags, one batch. */
-        ncl_line_t *ls[34];
-        uint64_t v[34];
+        /* Level l's entry check plus the kept levels' opposing flags, one batch;
+         * at C's top with g2 also hot_mode, last, ordered after flag and turn. */
+        ncl_line_t *ls[35];
+        uint64_t v[35];
         ls[0] = fot;
         ls[1] = turn;
         ncl_tour_kept_lines(b, i, j, ls + 2);
-        ncl_uc_load_many(ls, j + 2, v);
+        if (top_mode) {
+            ls[j + 2] = b->hot_mode;
+            ncl_uc_load_many_ordered(ls, j + 3, v);
+        } else {
+            ncl_uc_load_many(ls, j + 2, v);
+        }
         int w = 0;
         for (int k = 1; k <= j && !w; k++)
             if (v[k + 1])
@@ -542,24 +615,28 @@ static void tournament_lock_retain(struct ncl_base *b, int i, struct ncl_base_st
             drop_levels(b, i, j, w);
             ncl_fence();
             set_kept(b, 0);
-            climb(b, i, w, depth, st);
+            mode = climb(b, i, w, depth, st);
             ncl_fence();
-            return;
+            return mode;
         }
         ok = !(v[0] && v[1] == side);
+        if (ok && top_mode)
+            mode = v[j + 2];
     } else {
-        ok = peterson_may_enter(fot, turn, side);
+        ok = !top_mode && peterson_may_enter(fot, turn, side);
+        waited = ok || !top_mode; /* top_mode: the check happens in level_wait */
+    }
+    if (ok && ncl_hot_k && l == depth && (ncl_debug_hot & 8)) {
+        ok = 0; /* DEBUG: take level_wait's stale hot_mode read */
+        waited = 0;
     }
     set_kept(b, 0); /* held now: the whole path */
-    if (!ok) {
-        struct ncl_backoff bo;
-        ncl_backoff_init(&bo);
-        st->contended++;
-        while (!peterson_may_enter(fot, turn, side))
-            ncl_backoff(&bo);
-    }
-    climb(b, i, l + 1, depth, st);
+    if (!ok)
+        mode = level_wait(b, i, l, depth, waited, st);
+    if (l < depth)
+        mode = climb(b, i, l + 1, depth, st);
     ncl_fence();
+    return mode;
 }
 
 static void tournament_unlock_retain(struct ncl_base *b, int i, struct ncl_base_stats *st)
@@ -570,6 +647,10 @@ static void tournament_unlock_retain(struct ncl_base *b, int i, struct ncl_base_
         return;
     ncl_uc_store(lvl_flag_me(b, i, depth), 0); /* the root: the lock is free */
     int keep = keep_tick(b, depth, st);
+    if (b->hot_keep0) { /* g2: this release claimed a hot slot; C is not used again */
+        b->hot_keep0 = 0;
+        keep = 0;
+    }
     if (!keep && depth > 1)
         NCL_STAT(st->ret_policy_skips++); /* learned: nothing to keep, no release check */
     if (keep && ncl_retain_max &&
@@ -1392,6 +1473,288 @@ static void bakery_unlock(struct ncl_base *b, int i)
     }
 }
 
+/* ---- (g2) hot-slot subtree under an asymmetric root ------------------------
+ * Design §4g g2, with g1 in the cold tree C. NOT model-checked. R: side 0 = H's
+ * winner, side 1 = C's winner; cold nodes take R only while hot_mode is set (read
+ * at C's top, level_wait). hot_owner[s] has one writer at a time: a claimer holding
+ * the global lock (0 -> i+1), or the owner freeing it under its submutex outside an
+ * acquisition (i+1 -> 0). hot_mode is written only by lock holders: set by a
+ * claimer before its slot, cleared by a holder that reads every slot free. */
+
+#define H_FLAG(b, k, s) (&(b)->hot_tree[3 * ((k) - 1) + (s)])
+#define H_TURN(b, k) (&(b)->hot_tree[3 * ((k) - 1) + 2])
+#define R_FLAG(b, s) (&(b)->hot_r[(s)])
+#define R_TURN(b) (&(b)->hot_r[2])
+enum { R_HOT = 0, R_COLD = 1 };
+
+static void hot_delay(void)
+{
+    if (ncl_debug_hot_delay)
+        ncl_lat_spin_cycles(ncl_debug_hot_delay);
+}
+
+/* Peterson at R from `side`; returns 1 if it waited. */
+static int r_lock(struct ncl_base *b, int side, struct ncl_base_stats *st)
+{
+    int w = peterson_lock(R_FLAG(b, side), R_FLAG(b, 1 - side), R_TURN(b), (uint64_t)side);
+    if (w) {
+        NCL_STAT(st->hot_r_waits++);
+        st->contended++;
+    }
+    return w;
+}
+
+/* Climb H from slot s. H's first entry check also reads R's turn (same batch: no
+ * extra round on cached-flush): the side of R's last entrant, so R_COLD means a
+ * cold node has entered R since the last hot acquisition (b->hot_rcold). */
+static void hot_climb(struct ncl_base *b, int s, struct ncl_base_stats *st)
+{
+    int pos = ncl_hot_k + s, k = pos >> 1, sd = pos & 1;
+    peterson_announce(H_FLAG(b, k, sd), H_TURN(b, k), (uint64_t)sd);
+    ncl_line_t *ls[3] = {H_FLAG(b, k, 1 - sd), H_TURN(b, k), R_TURN(b)};
+    uint64_t v[3];
+    ncl_uc_load_many(ls, 3, v);
+    b->hot_rcold = v[2] == R_COLD;
+    if (v[0] && v[1] == (uint64_t)sd) {
+        struct ncl_backoff bo;
+        ncl_backoff_init(&bo);
+        st->contended++;
+        while (!peterson_may_enter(ls[0], ls[1], (uint64_t)sd))
+            ncl_backoff(&bo);
+    }
+    for (pos >>= 1; pos > 1; pos >>= 1) {
+        k = pos >> 1;
+        sd = pos & 1;
+        if (peterson_lock(H_FLAG(b, k, sd), H_FLAG(b, k, 1 - sd), H_TURN(b, k), (uint64_t)sd))
+            st->contended++;
+    }
+}
+
+/* Skip the next admissible releases, doubling per call (full table, eviction). */
+static void hot_adm_backoff(struct ncl_base *b)
+{
+    b->hot_adm_backoff = b->hot_adm_backoff ? b->hot_adm_backoff * 2 : 16;
+    if (b->hot_adm_backoff > NCL_HOT_BACKOFF_MAX)
+        b->hot_adm_backoff = NCL_HOT_BACKOFF_MAX;
+    b->hot_adm_skip = b->hot_adm_backoff;
+}
+
+/* H's levels of slot s, top-down, store-store ordered. */
+static void hot_unlock_h(struct ncl_base *b, int s)
+{
+    int path[8], n = 0;
+    for (int pos = ncl_hot_k + s; pos > 1; pos >>= 1)
+        path[n++] = pos;
+    for (int d = n - 1; d >= 0; d--) {
+        ncl_uc_store(H_FLAG(b, path[d] >> 1, path[d] & 1), 0);
+        if (d)
+            ncl_fence_ss();
+    }
+}
+
+/* Placement: the free slot whose lowest common ancestor with every occupied slot
+ * is highest (hot nodes meet near H's top); -1 if none is free. */
+static int hot_pick(const uint64_t *own, int k)
+{
+    int best = -1, bscore = -1;
+    for (int s = 0; s < k; s++) {
+        if (own[s])
+            continue;
+        int score = 64;
+        for (int o = 0; o < k; o++)
+            if (own[o]) {
+                int lv = 32 - __builtin_clz((unsigned)(s ^ o)); /* LCA level in H */
+                if (lv < score)
+                    score = lv;
+            }
+        if (score > bscore) {
+            bscore = score;
+            best = s;
+        }
+    }
+    return best;
+}
+
+/* Holding the global lock (through C): claim a free slot for node i. */
+static int hot_claim(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    if (!b->hot_mode_seen) {
+        /* Before the slot: every cold node that wins C's top after our release
+         * reads it and enters R. */
+        ncl_uc_store(b->hot_mode, 1);
+        NCL_STAT(st->hot_mode_sets++);
+        b->hot_mode_seen = 1;
+        ncl_fence();
+    }
+    ncl_line_t *ls[32];
+    uint64_t own[32];
+    for (int s = 0; s < ncl_hot_k; s++)
+        ls[s] = &b->hot_owner[s];
+    ncl_uc_load_many(ls, ncl_hot_k, own);
+    int s = hot_pick(own, ncl_hot_k);
+    if (s < 0) {
+        NCL_STAT(st->hot_full++);
+        hot_adm_backoff(b); /* don't re-read a full table at every release */
+        return 0;
+    }
+    if (NCL_UNLIKELY(ncl_debug_hot & 2))
+        hot_delay(); /* widen read-table -> claim for the unlocked claimer */
+    ncl_uc_store(&b->hot_owner[s], (uint64_t)i + 1);
+    ncl_fence();
+    atomic_store_explicit(&b->my_slot, s, memory_order_relaxed);
+    b->hot_hist = 0;
+    b->hot_nhist = 0;
+    atomic_fetch_add_explicit(&ncl_hot_held, 1, memory_order_relaxed);
+    NCL_STAT(st->hot_claims++);
+    return 1;
+}
+
+void ncl_tour_hot_free(struct ncl_base *b, struct ncl_base_stats *st)
+{
+    (void)st;
+    int s = atomic_load_explicit(&b->my_slot, memory_order_relaxed);
+    if (s < 0)
+        return;
+    ncl_uc_store(&b->hot_owner[s], 0); /* our hot flags are clear: freed after a release */
+    ncl_fence();
+    atomic_store_explicit(&b->my_slot, -1, memory_order_relaxed);
+    b->hot_clear_hint = 1;
+    atomic_fetch_sub_explicit(&ncl_hot_held, 1, memory_order_relaxed);
+}
+
+/* Holding the global lock through R's cold side: clear hot_mode if every slot is
+ * free. Slots are freed only outside acquisitions and claimed only by holders, so
+ * no node is in H or on R's hot side now, and none gets there before the next
+ * claim, which sets hot_mode again. */
+static void hot_clear_check(struct ncl_base *b, struct ncl_base_stats *st)
+{
+    NCL_STAT(st->hot_clear_checks++);
+    if (!(ncl_debug_hot & 16)) { /* DEBUG 16: UNSAFE, clear without reading the slots */
+        ncl_line_t *ls[32];
+        uint64_t own[32];
+        for (int s = 0; s < ncl_hot_k; s++)
+            ls[s] = &b->hot_owner[s];
+        ncl_uc_load_many(ls, ncl_hot_k, own);
+        for (int s = 0; s < ncl_hot_k; s++)
+            if (own[s])
+                return;
+    }
+    ncl_uc_store(b->hot_mode, 0);
+    b->hot_mode_seen = 0;
+    NCL_STAT(st->hot_mode_clears++);
+}
+
+/* Admission (at a cold release, holding the lock): recent reuse, and g1's learned
+ * cap shows contenders meeting low enough that H + R is shorter than the rest of C. */
+static int hot_admit(const struct ncl_base *b, int depth)
+{
+    uint64_t now = atomic_load_explicit(&b->hot_last, memory_order_relaxed);
+    if (!b->hot_prev || now - b->hot_prev > ncl_hot_window_cycles)
+        return 0;
+    if (ncl_hot_admit_always)
+        return 1;
+    if (ncl_retain_probe <= 0 || !b->keep_need)
+        return 0;
+    return __builtin_ctz((unsigned)ncl_hot_k) + 1 < depth - b->keep_cap;
+}
+
+static void tournament_lock_hot(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    b->hot_prev = atomic_load_explicit(&b->hot_last, memory_order_relaxed);
+    atomic_store_explicit(&b->hot_last, ncl_cycles(), memory_order_relaxed);
+    int s = atomic_load_explicit(&b->my_slot, memory_order_relaxed);
+    if (s >= 0) {
+        if (NCL_UNLIKELY(ncl_debug_hot & 1))
+            hot_delay(); /* widen choose-path -> climb against an unlocked lease free */
+        b->hot_slot_acq = s; /* the release clears what this acquisition took */
+        hot_climb(b, s, st);
+        b->hot_rwaited = r_lock(b, R_HOT, st);
+        ncl_fence();
+        b->hot_path = NCL_HOT_PATH_HOT;
+        NCL_STAT(st->hot_acqs++);
+        return;
+    }
+    if (NCL_UNLIKELY(ncl_debug_hot & 2)) {
+        b->hot_mode_seen = 0; /* UNSAFE: claim without holding the global lock */
+        hot_claim(b, i, st);
+    }
+    uint64_t mode = tournament_lock_retain(b, i, st);
+    b->hot_mode_seen = mode != 0;
+    if (mode) {
+        b->hot_rwaited = r_lock(b, R_COLD, st);
+        ncl_fence();
+        b->hot_path = NCL_HOT_PATH_COLD_R;
+        NCL_STAT(st->hot_r_acqs++);
+    } else {
+        b->hot_path = NCL_HOT_PATH_COLD;
+    }
+}
+
+static void tournament_unlock_hot(struct ncl_base *b, int i, struct ncl_base_stats *st)
+{
+    if (b->hot_path == NCL_HOT_PATH_HOT) {
+        int s = b->hot_slot_acq;
+        b->hot_hist = ((b->hot_hist << 1) | (b->hot_rcold ? 1u : 0u)) & 0xffffu;
+        if (b->hot_nhist < 64 && ++b->hot_nhist == 64)
+            b->hot_adm_backoff = 0; /* the slot paid off for a while: admit freely again */
+        int evict = b->hot_nhist >= 16 && __builtin_popcount(b->hot_hist) >= 8;
+        ncl_fence(); /* critical-section effects first */
+        if (NCL_UNLIKELY(ncl_debug_hot & 4)) { /* UNSAFE: levels below before R */
+            hot_unlock_h(b, s);
+            hot_delay();
+            ncl_fence_ss();
+            ncl_uc_store(R_FLAG(b, R_HOT), 0);
+        } else {
+            ncl_uc_store(R_FLAG(b, R_HOT), 0);
+            ncl_fence_ss();
+            hot_unlock_h(b, s);
+        }
+        if (evict) { /* cold share: other nodes use this lock; R taxes them */
+            ncl_fence();
+            ncl_tour_hot_free(b, st);
+            hot_adm_backoff(b);
+            NCL_STAT(st->hot_free_fair++);
+        }
+        return;
+    }
+    const int path = b->hot_path;
+    int admit = atomic_load_explicit(&b->my_slot, memory_order_relaxed) < 0 &&
+                hot_admit(b, ncl_tour_depth(b));
+    if (admit && b->hot_adm_skip > 0) {
+        b->hot_adm_skip--;
+        admit = 0;
+    }
+    if (admit) {
+        if (hot_claim(b, i, st))
+            b->hot_keep0 = 1;
+    } else if (path == NCL_HOT_PATH_COLD_R) {
+        if (!b->hot_rwaited)
+            b->hot_clear_cnt++;
+        if (b->hot_clear_cnt >= 16 || b->hot_clear_hint) {
+            b->hot_clear_cnt = 0;
+            b->hot_clear_hint = 0;
+            hot_clear_check(b, st);
+        }
+    } else {
+        b->hot_clear_hint = 0; /* bypassed R: hot_mode is already 0 */
+    }
+    if (path != NCL_HOT_PATH_COLD_R) {
+        tournament_unlock_retain(b, i, st);
+        return;
+    }
+    ncl_fence();
+    if (NCL_UNLIKELY(ncl_debug_hot & 4)) { /* UNSAFE: C before R */
+        tournament_unlock_retain(b, i, st);
+        hot_delay();
+        ncl_fence_ss();
+        ncl_uc_store(R_FLAG(b, R_COLD), 0);
+    } else {
+        ncl_uc_store(R_FLAG(b, R_COLD), 0);
+        ncl_fence_ss();
+        tournament_unlock_retain(b, i, st);
+    }
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
 int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
@@ -1399,7 +1762,9 @@ int ncl_base_lock(struct ncl_base *b, int i, struct ncl_base_stats *st)
     switch (b->alg) {
     case NCL_ALG_LAMPORT: return lamport_lock(b, i, st);
     case NCL_ALG_TOURNAMENT:
-        if (ncl_retain)
+        if (ncl_retain && ncl_hot_k)
+            tournament_lock_hot(b, i, st);
+        else if (ncl_retain)
             tournament_lock_retain(b, i, st);
         else if (ncl_tour_hot_probe && b->mode) {
             /* g2's bypass test: read hot_mode as the cold tree's top would. It is
@@ -1429,6 +1794,10 @@ void ncl_base_unlock(struct ncl_base *b, int i, int path, struct ncl_base_stats 
     switch (b->alg) {
     case NCL_ALG_LAMPORT: lamport_unlock(b, i); break;
     case NCL_ALG_TOURNAMENT:
+        if (ncl_retain && ncl_hot_k) {
+            tournament_unlock_hot(b, i, st);
+            break;
+        }
         if (ncl_retain) {
             tournament_unlock_retain(b, i, st);
             break;

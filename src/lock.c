@@ -151,6 +151,7 @@ int ncl_mode_parse(const char *s, ncl_mode_t *out)
 
 static int sys_open(const struct ncl_sys_cfg *c, const char *path, int attach)
 {
+    ncl_hot_k = c->hot_slots; /* before the layout: it adds lines per lock */
     struct ncl_sys_cfg resolved = *c;
     if (resolved.handoff_opts == NCL_HO_DEFAULT) {
         /* Default: every --ho option that applies (docs/handoff.md). */
@@ -252,6 +253,13 @@ static int sys_open(const struct ncl_sys_cfg *c, const char *path, int attach)
     if (c->retain && ((c->alg != NCL_ALG_TOURNAMENT && !c->alg_per_lock) ||
                       c->mode == NCL_MODE_HANDOFF || c->no_submutex)) {
         fprintf(stderr, "ncl: retain: tournament, phase1 or local mode, with the submutex\n");
+        return -1;
+    }
+    if (c->hot_slots && (!c->retain || c->alg != NCL_ALG_TOURNAMENT || c->alg_per_lock ||
+                         ncl_tour_hot_probe || c->hot_slots < 2 || c->hot_slots > 32 ||
+                         (c->hot_slots & (c->hot_slots - 1)))) {
+        fprintf(stderr, "ncl: --hot K: -a tournament --retain, K a power of 2 in 2..32, "
+                        "not with --hot-probe or per-lock algorithms\n");
         return -1;
     }
     int server = c->alg == NCL_ALG_SERVER || ncl_alg_fastsrv_like(c->alg);
@@ -484,6 +492,44 @@ int ncl_retain_opt(const char *opt, const char *arg)
     return 0;
 }
 
+static unsigned hot_delay_ns;
+
+int ncl_hot_opt(struct ncl_sys_cfg *c, const char *opt, const char *arg)
+{
+    if (!strcmp(opt, "admit")) {
+        if (!strcmp(arg, "cap")) ncl_hot_admit_always = 0;
+        else if (!strcmp(arg, "always")) ncl_hot_admit_always = 1;
+        else {
+            fprintf(stderr, "--hot-admit: cap or always\n");
+            return -1;
+        }
+        return 0;
+    }
+    char *end;
+    long v = strtol(arg, &end, 10);
+    if (*end || v < 0 || v > 100000000) {
+        fprintf(stderr, "--%s: a number >= 0\n", !strcmp(opt, "slots") ? "hot" : opt);
+        return -1;
+    }
+    if (!strcmp(opt, "slots")) c->hot_slots = (int)v;
+    else if (!strcmp(opt, "window")) ncl_hot_window_us = (int)v;
+    else if (!strcmp(opt, "lease")) ncl_hot_lease_us = (int)v;
+    else if (!strcmp(opt, "debug")) ncl_debug_hot = (int)v;
+    else if (!strcmp(opt, "delay")) hot_delay_ns = (unsigned)v;
+    else return -1;
+    return 0;
+}
+
+const char *ncl_hot_describe(char *buf, size_t n)
+{
+    if (!cfg.hot_slots)
+        snprintf(buf, n, "-");
+    else
+        snprintf(buf, n, "k%d/win%d/lease%d/%s", cfg.hot_slots, ncl_hot_window_us,
+                 ncl_hot_lease_us, ncl_hot_admit_always ? "always" : "cap");
+    return buf;
+}
+
 const char *ncl_retain_describe(char *buf, size_t n)
 {
     if (!cfg.retain) {
@@ -585,6 +631,47 @@ static void *sweeper_main(void *arg)
     return NULL;
 }
 
+/* g2 lease eviction (design §4g g2 trigger 1), piggybacked on global releases: at
+ * most once per lease/4, one worker walks the locks where this node holds a hot slot
+ * and frees those it has not acquired for a lease, after try-locking their submutex
+ * (never blocks, so nesting it inside the released lock's submutex is safe). */
+static _Atomic uint64_t hot_scan_at;
+static _Atomic int hot_scanning;
+static _Atomic uint64_t hot_lease_frees; /* merged into ncl_node_stats */
+
+static void hot_lease_scan(int skip)
+{
+    if (!atomic_load_explicit(&ncl_hot_held, memory_order_relaxed))
+        return;
+    const uint64_t now = ncl_cycles(), lease = ncl_hot_lease_cycles;
+    if (now - atomic_load_explicit(&hot_scan_at, memory_order_relaxed) < lease / 4)
+        return;
+    if (atomic_exchange_explicit(&hot_scanning, 1, memory_order_acquire))
+        return;
+    atomic_store_explicit(&hot_scan_at, now, memory_order_relaxed);
+    static _Thread_local struct ncl_qnode q; /* scratch queue node of this worker */
+    for (int l = 0; l < cfg.nlocks; l++) {
+        struct ncl_base *b = &local[l].base;
+        if (l == skip || atomic_load_explicit(&b->my_slot, memory_order_relaxed) < 0 ||
+            now - atomic_load_explicit(&b->hot_last, memory_order_relaxed) <= lease)
+            continue;
+        if (NCL_UNLIKELY(ncl_debug_hot & 1)) {
+            ncl_tour_hot_free(b, NULL); /* UNSAFE: races a worker choosing the hot path */
+        } else {
+            if (!ncl_sub_trylock(&local[l].sub, &q))
+                continue; /* in use: keeps its slot */
+            if (local[l].global_held) {
+                fprintf(stderr, "ncl: hot lease: free submutex with the global lock held\n");
+                abort();
+            }
+            ncl_tour_hot_free(b, NULL);
+            ncl_sub_unlock(&local[l].sub);
+        }
+        atomic_fetch_add_explicit(&hot_lease_frees, 1, memory_order_relaxed);
+    }
+    atomic_store_explicit(&hot_scanning, 0, memory_order_release);
+}
+
 int ncl_node_attach(int node_id)
 {
     hdr = (struct ncl_hdr *)ncl_meta_ptr(0);
@@ -630,6 +717,10 @@ int ncl_node_attach(int node_id)
                           d[l].data_len);
     }
     ncl_retain = cfg.retain;
+    ncl_hot_k = cfg.hot_slots;
+    ncl_debug_hot_delay = ncl_ns_to_cycles(hot_delay_ns);
+    ncl_hot_window_cycles = ncl_ns_to_cycles((uint64_t)ncl_hot_window_us * 1000u);
+    ncl_hot_lease_cycles = ncl_ns_to_cycles((uint64_t)ncl_hot_lease_us * 1000u);
     if (cfg.retain && ncl_retain_poll_us >= 0) {
         atomic_store(&sweeper_stop, 0);
         if (pthread_create(&sweeper_tid, NULL, sweeper_main, NULL))
@@ -651,6 +742,14 @@ void ncl_node_detach(void)
         pthread_join(sweeper_tid, NULL);
         sweeper_on = 0;
     }
+    /* g2: give back hot slots (no node waits on them; capacity only). */
+    if (cfg.hot_slots)
+        for (int l = 0; l < cfg.nlocks; l++)
+            if (atomic_load_explicit(&local[l].base.my_slot, memory_order_relaxed) >= 0) {
+                ncl_sub_lock(&local[l].sub, &sweep_q);
+                ncl_tour_hot_free(&local[l].base, NULL);
+                ncl_sub_unlock(&local[l].sub);
+            }
     /* Drop every kept level: other nodes may be waiting on them. */
     if (cfg.retain)
         for (int l = 0; l < cfg.nlocks; l++)
@@ -1074,6 +1173,8 @@ void ncl_release(int lock, const struct ncl_range *hints, int nhints)
         handoff_release(L, L->holder);
     else
         ncl_base_unlock(&L->base, L->holder, L->path, &L->st.base);
+    if (cfg.hot_slots)
+        hot_lease_scan(lock);
     if (!cfg.no_submutex)
         ncl_sub_unlock(&L->sub);
 }
@@ -1108,6 +1209,7 @@ void ncl_node_stats(struct ncl_node_stats *out)
             ((uint64_t *)&out->ho)[k] += ((const uint64_t *)&s->ho)[k];
     }
     ncl_base_stats_add(&out->base, &sweep_st);
+    out->base.hot_free_lease += atomic_load(&hot_lease_frees);
     if (is_server())
         ncl_srv_stats(&out->srv);
 }

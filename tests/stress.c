@@ -205,6 +205,13 @@ static int node_main(int node)
                (unsigned long)sb.ret_acq_drops, (unsigned long)sb.ret_rel_drops,
                (unsigned long)sb.ret_sweep_drops, (unsigned long)sb.ret_lease_drops,
                (unsigned long)sb.ret_sweep_busy);
+    if (sb.hot_acqs || sb.hot_claims || sb.hot_r_acqs)
+        printf(" hot_acqs=%lu hot_r_acqs=%lu hot_claims=%lu hot_full=%lu hot_free_fair=%lu"
+               " hot_free_lease=%lu hot_mode_sets=%lu hot_mode_clears=%lu",
+               (unsigned long)sb.hot_acqs, (unsigned long)sb.hot_r_acqs,
+               (unsigned long)sb.hot_claims, (unsigned long)sb.hot_full,
+               (unsigned long)sb.hot_free_fair, (unsigned long)sb.hot_free_lease,
+               (unsigned long)sb.hot_mode_sets, (unsigned long)sb.hot_mode_clears);
     if (sb.ret_cap_lowers || sb.ret_cap_raises || sb.ret_policy_skips)
         printf(" ret_cap_lowers=%lu ret_cap_raises=%lu ret_policy_skips=%lu",
                (unsigned long)sb.ret_cap_lowers, (unsigned long)sb.ret_cap_raises,
@@ -293,6 +300,13 @@ static void usage(const char *argv0)
             "                2 = release drops only the waiter's level (not contiguous)\n"
             "  --retain-delay NS  DEBUG: acquirer spins between reading its kept levels and climbing\n"
             "  --hot-probe   -a tournament: also read hot_mode (never set) in the root's entry check\n"
+            "  --hot K       -a tournament --retain: hot-slot subtree, K slots (design.md §4g g2)\n"
+            "  --hot-window US / --hot-lease US / --hot-admit cap|always  as ncl_bench\n"
+            "  --debug-hot BITS  hot, UNSAFE: 1 = lease free without the submutex, 2 = claim\n"
+            "                without the global lock, 4 = release R after the levels below,\n"
+            "                8 = read hot_mode before C-top's flag and turn, 16 = clear\n"
+            "                hot_mode without reading the slots\n"
+            "  --hot-delay NS  DEBUG: spin in the --debug-hot windows\n"
             "  --mix-algs    per-lock algorithms: even locks lamport, odd locks tournament\n"
             "  --grant-delay NS  DEBUG: 2b releaser spins between its owner and grant stores\n"
             "  --reset-delay NS  DEBUG: (d) spin after the reset check's door read and after its scan\n"
@@ -336,6 +350,12 @@ int main(int argc, char **argv)
         {"grant-delay", required_argument, 0, 10},
         {"mix-algs", no_argument, 0, 11},
         {"hot-probe", no_argument, 0, 30},
+        {"hot", required_argument, 0, 31},
+        {"hot-window", required_argument, 0, 32},
+        {"hot-lease", required_argument, 0, 33},
+        {"hot-admit", required_argument, 0, 34},
+        {"debug-hot", required_argument, 0, 35},
+        {"hot-delay", required_argument, 0, 36},
         {"react", required_argument, 0, 12},
         {"debug-react", required_argument, 0, 13},
         {"lamport-delay", required_argument, 0, 14},
@@ -450,6 +470,12 @@ int main(int argc, char **argv)
         case 28: retain_delay_ns = (unsigned)atoi(optarg); break;
         case 29: if (ncl_retain_opt("probe", optarg) < 0) return 2; break;
         case 30: ncl_tour_hot_probe = 1; break;
+        case 31: if (ncl_hot_opt(&cfg, "slots", optarg) < 0) return 2; break;
+        case 32: if (ncl_hot_opt(&cfg, "window", optarg) < 0) return 2; break;
+        case 33: if (ncl_hot_opt(&cfg, "lease", optarg) < 0) return 2; break;
+        case 34: if (ncl_hot_opt(&cfg, "admit", optarg) < 0) return 2; break;
+        case 35: if (ncl_hot_opt(&cfg, "debug", optarg) < 0) return 2; break;
+        case 36: if (ncl_hot_opt(&cfg, "delay", optarg) < 0) return 2; break;
         case 21:
             if (!strcmp(optarg, "classic")) ncl_bakery_wait_classic = 1;
             else if (!strcmp(optarg, "strict")) ncl_bakery_wait_classic = 0;

@@ -68,11 +68,15 @@ Implemented so far (Phase 1 scaffold, C11 + CMake):
   must FAIL).
   CSV columns `bakery_arity`, `bakery_wait`; sweep phases `bakery`, `kvbakery`, `bktree`,
   `kvbktree`, `bkwait`, `kvbkwait`. Not model-checked.
-  Biased tournaments g2, g7, g8 are not implemented. g2 (hot-slot subtree under an
-  asymmetric root, design §4g) is specified (revised after its go/no-go `g2bound`: R is
-  bypassed while no slot is held, admission only where g1 fails). `-a tournament
-  --hot-probe` reads one more line (`hot_mode`, never set) in the root's entry check: the
-  bypass's cost, sweep phase `g2bypass` (CSV column `hot_probe`).
+  Biased tournaments g7, g8 are not implemented.
+- `-a tournament --retain --hot K` (design §4g g2, not model-checked): hot-slot subtree H
+  (K slots) under a new root R, with g1 in the cold tree C. Cold nodes climb R only while
+  `hot_mode` is set (read in C-top's entry-check batch); a node claims a slot (holding the
+  lock) only where g1's learned cap shows contenders meeting low; slots are freed only by
+  their owner (cold-share trigger via R's turn, lease piggybacked on global releases under
+  `ncl_sub_trylock`, detach). `--hot-window`, `--hot-lease`, `--hot-admit cap|always`;
+  `--debug-hot 1|2|4|8|16` must FAIL (ctests `hot_detects_*`). Sweep phases `g2bound`,
+  `g2bypass` (`--hot-probe`: the bypass's cost alone), `g2`.
 - `-a tournament --retain` (design §4g g1, not model-checked): prefix retention. A global
   release keeps the levels below the lowest one with a waiter (`kept_levels`, node-local); the
   next acquisition starts above them. Waiters on kept levels are found by the acquire check (default;

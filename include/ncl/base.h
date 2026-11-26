@@ -128,6 +128,31 @@ struct ncl_base {
     int keep_run;                /* global releases since the cap last changed */
     int keep_need;               /* releases before the next probe (0 = not set up) */
     int keep_probing;            /* the cap was raised and has not been lowered since */
+    /* TOURNAMENT with a hot-slot subtree (ncl_hot_k, design §4g g2). Shared lines:
+     * [hot_mode][hot_owner[k]][R: flag0 (hot), flag1 (cold), turn][H: 3 per node][tree]. */
+    ncl_line_t *hot_mode;        /* 1: cold nodes climb R; written only by a lock holder */
+    ncl_line_t *hot_owner;       /* hot_owner[s]: 0 = free, else owner + 1 */
+    ncl_line_t *hot_r;           /* R */
+    ncl_line_t *hot_tree;        /* H, heap-numbered nodes 1..k-1, leaves k..2k-1 */
+    /* Node-local, under the submutex (my_slot and hot_last_ns are read unlocked by the
+     * lease scan in src/lock.c, which acts only after try-locking the submutex). */
+    _Atomic int my_slot;         /* -1: none */
+    _Atomic uint64_t hot_last;   /* ncl_cycles() of this node's last global acquisition */
+    uint64_t hot_prev;           /* the one before (admission window) */
+    int hot_path;                /* NCL_HOT_PATH_* of the acquisition holding the lock */
+    int hot_slot_acq;            /* HOT path: the slot that acquisition climbed from */
+    int hot_mode_seen;           /* hot_mode read at C's top (cold paths) */
+    int hot_rwaited;             /* R's entry check had to wait */
+    int hot_rcold;               /* hot path: R's turn showed a cold entrant since the last
+                                    hot one (read in H's first entry check) */
+    unsigned hot_hist;           /* hot acquisitions: bit set = hot_rcold (last 16) */
+    int hot_nhist;               /* hot acquisitions since the slot was claimed */
+    int hot_clear_cnt;           /* cold-through-R acquisitions without an R wait */
+    int hot_clear_hint;          /* this node freed a slot: run the clear check at once */
+    int hot_keep0;               /* this release claimed a slot: keep no levels of C */
+    int hot_adm_skip;            /* admissible releases to skip (after a full table or a
+                                    cold-share eviction) */
+    int hot_adm_backoff;         /* next skip length (doubles, <= NCL_HOT_BACKOFF_MAX) */
     int reset_hint;    /* node-local: present[] index last seen set by a reset
                           check (-1 = none); written only by the lock holder
                           (or, for FASTSRV, the server) */
@@ -170,6 +195,16 @@ struct ncl_base_stats {
     uint64_t ret_cap_lowers;    /* a waiter found on a kept (or to-be-kept) level lowered the cap */
     uint64_t ret_cap_raises;    /* probes: the cap raised by one level */
     uint64_t hot_mode_set;      /* TOURNAMENT ncl_tour_hot_probe: hot_mode read nonzero (never) */
+    uint64_t hot_acqs;          /* g2: acquisitions through H (hot path) */
+    uint64_t hot_r_acqs;        /* g2: cold acquisitions through R (hot_mode set) */
+    uint64_t hot_r_waits;       /* g2: acquisitions (either side) that waited at R */
+    uint64_t hot_claims;        /* g2: slots claimed */
+    uint64_t hot_full;          /* g2: admission found no free slot */
+    uint64_t hot_free_fair;     /* g2: slots freed by the cold-share trigger */
+    uint64_t hot_free_lease;    /* g2: slots freed by the piggybacked lease */
+    uint64_t hot_mode_sets;     /* g2: hot_mode set by a claimer */
+    uint64_t hot_mode_clears;   /* g2: hot_mode cleared (every slot free) */
+    uint64_t hot_clear_checks;  /* g2: slot-table reads by the clear check */
 };
 
 #define NCL_BASE_STATS_N (sizeof(struct ncl_base_stats) / sizeof(uint64_t))
@@ -357,6 +392,32 @@ extern _Atomic int ncl_retained_locks;
  * spins between reading kept_levels and climbing. */
 extern int ncl_debug_retain;
 extern uint64_t ncl_debug_retain_delay;
+/* Hot-slot subtree (design §4g g2; needs ncl_retain). ncl_hot_k: slots (a power of
+ * 2, 0 = off), set in every process before laying out locks (it changes the line
+ * count). Admission: at a global release of a cold acquisition, if the node's g1
+ * learned cap shows contenders meeting low enough that the hot path is shorter,
+ * log2 k + 1 < depth - cap (ncl_hot_admit_always: skip this test), and its previous
+ * acquisition was within ncl_hot_window_us. Eviction: cold share (in 8 of the last
+ * 16 hot acquisitions a cold node had entered R since the previous hot one: other
+ * nodes use the lock, and the slot makes them pay R; admissions then back off
+ * exponentially), the lease (src/lock.c, piggybacked on global releases:
+ * ncl_hot_lease_us), detach. */
+extern int ncl_hot_k, ncl_hot_window_us, ncl_hot_lease_us, ncl_hot_admit_always;
+extern uint64_t ncl_hot_window_cycles, ncl_hot_lease_cycles; /* set at attach */
+#define NCL_HOT_BACKOFF_MAX 4096
+/* Locks with a slot held by this node (src/lock.c skips the lease scan at 0). */
+extern _Atomic int ncl_hot_held;
+enum { NCL_HOT_PATH_COLD = 0, NCL_HOT_PATH_COLD_R = 1, NCL_HOT_PATH_HOT = 2 };
+/* DEBUG bits (ncl_stress --debug-hot), each UNSAFE: 1 = the lease frees without
+ * try-locking the submutex (src/lock.c), 2 = claim at the start of a cold
+ * acquisition, without the global lock, 4 = release R after the levels below,
+ * 8 = read hot_mode before C-top's flag and turn, 16 = clear hot_mode without
+ * reading the slots. ncl_debug_hot_delay: cycles spun in each window. */
+extern int ncl_debug_hot;
+extern uint64_t ncl_debug_hot_delay;
+/* Holding the submutex, outside an acquisition: free this node's slot, if any. */
+void ncl_tour_hot_free(struct ncl_base *b, struct ncl_base_stats *st);
+
 /* Tree depth (levels; 0 when P = 1). */
 int ncl_tour_depth(const struct ncl_base *b);
 /* The opposing flags of levels 1..kept for participant i, out[l - 1] (kept <=

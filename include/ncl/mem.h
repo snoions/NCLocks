@@ -174,6 +174,7 @@ int ncl_backend_parse(const char *s, ncl_backend_t *out);
 
 void ncl_lat_spin_cycles(uint64_t cycles);
 uint64_t ncl_ns_to_cycles(uint64_t ns);
+uint64_t ncl_cycles(void); /* TSC on x86 (calibrated by ncl_ns_to_cycles), else ns */
 
 static inline void ncl_dev_delay(void)
 {

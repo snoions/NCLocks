@@ -153,6 +153,8 @@ static uint64_t cycles(void)
 #endif
 }
 
+uint64_t ncl_cycles(void) { return cycles(); }
+
 static void calibrate_tsc(void)
 {
 #if defined(__x86_64__)

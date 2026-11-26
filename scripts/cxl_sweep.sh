@@ -107,6 +107,11 @@
 #              --active 0,1; near2), hot2_k4 (-n 8 --active 0,2: placed, meet at H's top;
 #              near2), hot4_k4 (-n 8 --active 0-3; near4). Cold-path cost (one extra level):
 #              cold1 (-n 2N --active 0; vs one), coldall (-n 2N --active 0..N-1; vs all).
+#   g2         hot-slot subtree (-a tournament --retain --hot K, design §4g g2) at G2_NT,
+#              Phase 1 and 2a, L=1, think G1_THINK, at the subsets one, near2, far2, near4,
+#              far4: tournament, reactive (REACT_BEST), g1 (--retain) and g1+g2 for each K in
+#              G2_SLOTS; part all (think 0): every node at L = 1, 16, 256 (tournament, g1,
+#              g1+g2). CSV columns hot, hot_path_frac, hot_r_frac, hot_*_per_acq.
 #   g2bypass   cost of g2's root bypass (design §4g g2 (a)): the tournament with --hot-probe
 #              (one more line, hot_mode, never set, read in the root's entry-check batch) vs
 #              the plain tournament, back to back, at G2_NT, Phase 1 and 2a, think
@@ -174,6 +179,7 @@ G1_NT=${G1_NT:-"16x1 16x3 32x2"}                 # phase g1bound
 G1_THINK=${G1_THINK:-"0 2000 10000"}             # phases g1bound, g1: closed-loop think time, ns
 G2_NT=${G2_NT:-"16x1 16x3 32x2"}                 # phases g2bound, g2bypass
 G2BYPASS_THINK=${G2BYPASS_THINK:-"0 2000"}       # phase g2bypass
+G2_SLOTS=${G2_SLOTS:-"2 4"}                      # phase g2: hot slots K
 G1_VARIANTS=${G1_VARIANTS:-"retain retain_both retain_always"} # phase g1: retention variants (g1_variant)
 KV=${KV:-$ROOT/build/ncl_kv}
 KV_NT=${KV_NT:-16x3}
@@ -913,6 +919,30 @@ g2bound() {
   done; done
 }
 
+g2() {
+  local csv=$OUT/g2.csv; header "$csv"
+  local MODES=("-M phase1" "-M local -K 64")
+  local m v th set h q l k
+  for rep in $(seq "$REPS"); do for c in $MAIN_CFGS; do
+    for nt in $G2_NT; do nt_split "$nt"; h=$((N / 2)); q=$((N / 4))
+      for th in $G1_THINK; do for m in "${MODES[@]}"; do
+        for set in "one:0" "near2:0,1" "far2:0,$h" "near4:0-3" "far4:0,$q,$h,$((h + q))"; do
+          for v in "-a tournament" "-a reactive --react $REACT_BEST" "-a tournament --retain" \
+                   $(for k in $G2_SLOTS; do echo "-a@tournament@--retain@--hot@$k"; done); do
+            run "$csv" "$rep" "$c:${set%%:*}" ${v//@/ } $m -n "$N" -t "$T" -l 1 -T "$th" --active "${set#*:}" ${CFG[$c]} "${COMMON[@]}"
+          done
+        done
+      done; done
+      for m in "${MODES[@]}"; do for l in 1 16 256; do
+        for v in "-a tournament" "-a tournament --retain" \
+                 $(for k in $G2_SLOTS; do echo "-a@tournament@--retain@--hot@$k"; done); do
+          run "$csv" "$rep" "$c:all" ${v//@/ } $m -n "$N" -t "$T" -l "$l" ${CFG[$c]} "${COMMON[@]}"
+        done
+      done; done
+    done
+  done; done
+}
+
 g2bypass() {
   local csv=$OUT/g2bypass.csv; header "$csv"
   local MODES=("-M phase1" "-M local -K 64")
@@ -965,6 +995,7 @@ for ph in $PHASES; do
     g1bound) g1bound ;;
     g2bound) g2bound ;;
     g2bypass) g2bypass ;;
+    g2) g2 ;;
     g1) g1 ;;
     *) die "unknown phase $ph" ;;
   esac

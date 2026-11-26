@@ -412,6 +412,12 @@ static void usage(const char *argv0)
             "  --retain-probe P  learned keep height: a waiter on level w caps the kept\n"
             "                levels at w-1; probe one level higher after P releases, doubling\n"
             "                per lowering (16; 0 = always keep depth-1 levels)\n"
+            "  --hot K       -a tournament --retain: hot-slot subtree with K slots (design.md\n"
+            "                §4g g2): nodes whose g1 cap shows contenders meeting low claim a\n"
+            "                slot and acquire through a K-leaf subtree under a new root R\n"
+            "  --hot-window US  admission: previous acquisition within US (1000)\n"
+            "  --hot-lease US  free a slot unused for US (1000; piggybacked on releases)\n"
+            "  --hot-admit cap|always  admission test: g1's cap (default) or none\n"
             "  --hot-probe   -a tournament: read one more line (hot_mode, never set) in the\n"
             "                root's entry check: the cost of g2's root bypass (design.md §4g)\n"
             "  --active LIST only these nodes run workers, e.g. 0,8 or 0-3 (default all); the\n"
@@ -429,7 +435,7 @@ static void usage(const char *argv0)
     "no_submutex,mode,local_cap,spin_backoff,server_backoff,arrival,target_rps,offered_rps,achieved_rps,unserved_frac,"                          \
     "lock_mean,lock_p50,lock_p90,lock_p99,lock_p999,lock_max,"                             \
     "svc_mean,svc_p50,svc_p99,svc_p999,soj_p50,soj_p99,soj_p999,"                          \
-    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll,bakery_wait,active,retain,ret_hits_per_acq,ret_skipped_per_acq,ret_drops_per_acq,ret_sweep_drops_per_acq,ret_policy_skips_per_acq,ret_cap_lowers_per_acq,ret_cap_raises_per_acq,hot_probe"
+    "fast_frac,meta_memtype,meta_load_ns,node_min_max_ratio,server_place,scan_loads_per_acq,lamport_retries_per_acq,fast_release,announce,pick,global_handoff_frac,local_handoff_frac,missed_announce_per_acq,owner_polls_per_acq,gate_entries_per_acq,announce_loads_per_acq,chain_window,meta_batch,wb_overlap,meta_layout,mem_node,uc_pool_node,wb,cpus,wait,grant_polls_per_acq,ho_opts,gate_skips_per_acq,bakery_arity,bakery_poll,bakery_wait,active,retain,ret_hits_per_acq,ret_skipped_per_acq,ret_drops_per_acq,ret_sweep_drops_per_acq,ret_policy_skips_per_acq,ret_cap_lowers_per_acq,ret_cap_raises_per_acq,hot_probe,hot,hot_path_frac,hot_r_frac,hot_claims_per_acq,hot_frees_per_acq"
 
 int main(int argc, char **argv)
 {
@@ -456,6 +462,10 @@ int main(int argc, char **argv)
         {"retain-max", required_argument, 0, 1015},
         {"retain-probe", required_argument, 0, 1016},
         {"hot-probe", no_argument, 0, 1017},
+        {"hot", required_argument, 0, 1018},
+        {"hot-window", required_argument, 0, 1019},
+        {"hot-lease", required_argument, 0, 1020},
+        {"hot-admit", required_argument, 0, 1021},
         {"wait", required_argument, 0, 1004},
         {"ho", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
@@ -561,6 +571,10 @@ int main(int argc, char **argv)
         case 1015: if (ncl_retain_opt("max", optarg) < 0) return 2; break;
         case 1016: if (ncl_retain_opt("probe", optarg) < 0) return 2; break;
         case 1017: ncl_tour_hot_probe = 1; break;
+        case 1018: if (ncl_hot_opt(&cfg, "slots", optarg) < 0) return 2; break;
+        case 1019: if (ncl_hot_opt(&cfg, "window", optarg) < 0) return 2; break;
+        case 1020: if (ncl_hot_opt(&cfg, "lease", optarg) < 0) return 2; break;
+        case 1021: if (ncl_hot_opt(&cfg, "admit", optarg) < 0) return 2; break;
         case 1010:
             if (parse_active(optarg) < 0) {
                 fprintf(stderr, "--active: node list, e.g. 0,8 or 0-3\n");
@@ -749,13 +763,13 @@ int main(int argc, char **argv)
     for (char *q = cpus_csv; *q; q++)
         if (*q == ',')
             *q = ';';
-    char ret_buf[64];
+    char ret_buf[64], hot_buf[64];
     char bak_arity[16] = "-"; /* BAKERY: 0 = flat */
     if (cfg.alg == NCL_ALG_BAKERY)
         snprintf(bak_arity, sizeof bak_arity, "%d", ncl_bakery_arity);
     if (csv) {
         printf("%s,%s,%d,%d,%d,%u,%u,%zu,%u,%d,%s,%d,%u,%u,%s,%.0f,%.0f,%.0f,%.5f,"
-               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s,%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n",
+               "%.0f,%lu,%lu,%lu,%lu,%lu,%.0f,%lu,%lu,%lu,%lu,%lu,%lu,%.4f,%s,%.1f,%.3f,%s,%.3f,%.3f,%s,%s,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%s,%s,%s,%d,%d,%s,%s,%s,%.3f,%s,%.3f,%s,%s,%s,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%s,%.4f,%.4f,%.5f,%.5f\n",
                ncl_alg_name(cfg.alg), ncl_backend_name(cfg.backend), nnodes, nthreads, nlocks,
                cs_ns, think_ns, footprint, cfg.dev_lat_ns, cfg.no_submutex, ncl_mode_name(cfg.mode),
                cfg.mode != NCL_MODE_PHASE1 ? (cfg.local_cap > 0 ? cfg.local_cap : 64) : 0, ncl_backoff_cap,
@@ -792,7 +806,10 @@ int main(int argc, char **argv)
                    tot->base.ret_lease_drops),
                PER(tot->base.ret_sweep_drops + tot->base.ret_lease_drops),
                PER(tot->base.ret_policy_skips), PER(tot->base.ret_cap_lowers),
-               PER(tot->base.ret_cap_raises), ncl_tour_hot_probe);
+               PER(tot->base.ret_cap_raises), ncl_tour_hot_probe,
+               ncl_hot_describe(hot_buf, sizeof hot_buf), PER(tot->base.hot_acqs),
+               PER(tot->base.hot_r_acqs), PER(tot->base.hot_claims),
+               PER(tot->base.hot_free_fair + tot->base.hot_free_lease));
     } else {
         printf("alg=%s backend=%s mode=%s%s nodes=%d threads/node=%d locks=%d cs=%uns "
                "footprint=%zuB lat=%uns secs=%.2f warmup=%.2f\n",
@@ -842,6 +859,17 @@ int main(int argc, char **argv)
                    (double)b->ret_policy_skips / A, (double)b->ret_cap_lowers / A,
                    (double)b->ret_cap_raises / A,
                    (unsigned long)b->ret_sweep_busy, (unsigned long)b->ret_sweep_polls);
+        }
+        if (cfg.hot_slots && all_paths) {
+            double A = (double)all_paths;
+            printf("hot %s: hot=%.1f%% cold_via_R=%.1f%% R_waits=%.3f claims/acq=%.5f full=%lu "
+                   "frees: fair=%lu lease=%lu hot_mode sets=%lu clears=%lu (checks %lu)\n",
+                   ncl_hot_describe(hot_buf, sizeof hot_buf), 100 * (double)b->hot_acqs / A,
+                   100 * (double)b->hot_r_acqs / A, (double)b->hot_r_waits / A,
+                   (double)b->hot_claims / A, (unsigned long)b->hot_full,
+                   (unsigned long)b->hot_free_fair, (unsigned long)b->hot_free_lease,
+                   (unsigned long)b->hot_mode_sets, (unsigned long)b->hot_mode_clears,
+                   (unsigned long)b->hot_clear_checks);
         }
         if ((cfg.alg == NCL_ALG_AK || cfg.alg == NCL_ALG_AKSRV) && all_paths) {
             double A = (double)all_paths;
